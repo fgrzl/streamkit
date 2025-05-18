@@ -1,0 +1,19 @@
+package storage
+
+import (
+	"context"
+
+	"github.com/fgrzl/enumerators"
+	"github.com/fgrzl/streamkit/pkg/api"
+)
+
+type Storage interface {
+	GetClusterStatus() *api.ClusterStatus
+	GetSpaces(ctx context.Context) enumerators.Enumerator[string]
+	ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry]
+	GetSegments(ctx context.Context, space string) enumerators.Enumerator[string]
+	ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry]
+	Peek(ctx context.Context, space, segment string) (*api.Entry, error)
+	Produce(ctx context.Context, args *api.Produce, entries enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus]
+	Close() error
+}
