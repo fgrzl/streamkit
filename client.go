@@ -9,17 +9,20 @@ import (
 )
 
 type (
-	Entry          = api.Entry
-	Record         = api.Record
-	SegmentStatus  = api.SegmentStatus
-	ConsumeSpace   = api.ConsumeSpace
+	// Models
+	Entry         = api.Entry
+	Record        = api.Record
+	SegmentStatus = api.SegmentStatus
+
+	// Requests
 	Consume        = api.Consume
 	ConsumeSegment = api.ConsumeSegment
-	Produce        = api.Produce
-	GetSpaces      = api.GetSpaces
+	ConsumeSpace   = api.ConsumeSpace
 	GetSegments    = api.GetSegments
-	Peek           = api.Peek
+	GetSpaces      = api.GetSpaces
 	GetStatus      = api.GetStatus
+	Peek           = api.Peek
+	Produce        = api.Produce
 )
 
 type Client interface {

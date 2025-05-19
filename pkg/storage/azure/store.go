@@ -17,6 +17,8 @@ import (
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/internal"
+	"github.com/fgrzl/streamkit/internal/codec"
+	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streams/broker"
@@ -90,20 +92,16 @@ type AzureService struct {
 }
 
 type batchEntry struct {
-	Entry        *Entry
+	Entry        *api.Entry
 	EncodedValue []byte
 }
 
 // Ensure AzureService implements Service
-var _ storage.Storage = (*AzureService)(nil)
+var _ storage.Store = (*AzureService)(nil)
 
 // Public Methods
 
-func NewSharedKeyCredential(accountName, accountKey string) (*aztables.SharedKeyCredential, error) {
-	return aztables.NewSharedKeyCredential(accountName, accountKey)
-}
-
-func NewService(bus broker.Bus, opts *TableProviderOptions) (storage.Storage, error) {
+func NewService(bus broker.Bus, opts *TableProviderOptions) (storage.Store, error) {
 	client, err := getClient(opts)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ErrClientCreation, err)
@@ -125,10 +123,6 @@ func NewService(bus broker.Bus, opts *TableProviderOptions) (storage.Storage, er
 	return s, nil
 }
 
-func (s *AzureService) GetClusterStatus() *api.ClusterStatus {
-	return &api.ClusterStatus{NodeCount: 1}
-}
-
 func (s *AzureService) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
 	query := buildQuery(
 		lexkey.EncodeFirst(api.INVENTORY, api.SPACES).ToHexString(),
@@ -145,7 +139,7 @@ func (s *AzureService) GetSpaces(ctx context.Context) enumerators.Enumerator[str
 	})
 }
 
-func (s *AzureService) ConsumeSpace(ctx context.Context, args *ConsumeSpace) enumerators.Enumerator[*Entry] {
+func (s *AzureService) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
 	ts := timestamp.GetTimestamp()
 	bounds := calculateTimeBounds(ts, args.MinTimestamp, args.MaxTimestamp)
 
@@ -173,7 +167,7 @@ func (s *AzureService) GetSegments(ctx context.Context, space string) enumerator
 	})
 }
 
-func (s *AzureService) ConsumeSegment(ctx context.Context, args *ConsumeSegment) enumerators.Enumerator[*Entry] {
+func (s *AzureService) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry] {
 	ts := timestamp.GetTimestamp()
 	bounds := calculateSegmentBounds(ts, args)
 
@@ -190,11 +184,11 @@ func (s *AzureService) ConsumeSegment(ctx context.Context, args *ConsumeSegment)
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
-	entries := enumerators.Map(entities, func(e *Entity) (*Entry, error) {
+	entries := enumerators.Map(entities, func(e *Entity) (*api.Entry, error) {
 		return decodeEntry(e.Value)
 	})
 
-	return enumerators.TakeWhile(entries, func(e *Entry) bool {
+	return enumerators.TakeWhile(entries, func(e *api.Entry) bool {
 		return e.Sequence > bounds.MinSeq &&
 			e.Sequence <= bounds.MaxSeq &&
 			e.Timestamp > bounds.MinTS &&
@@ -202,10 +196,10 @@ func (s *AzureService) ConsumeSegment(ctx context.Context, args *ConsumeSegment)
 	})
 }
 
-func (s *AzureService) Peek(ctx context.Context, space, segment string) (*Entry, error) {
+func (s *AzureService) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
 	cacheKey := fmt.Sprintf("peek:%s:%s", space, segment)
 	if cached, ok := s.cache.Get(cacheKey); ok {
-		if entry, ok := cached.(*Entry); ok {
+		if entry, ok := cached.(*api.Entry); ok {
 			return entry, nil
 		}
 	}
@@ -229,36 +223,23 @@ func (s *AzureService) Peek(ctx context.Context, space, segment string) (*Entry,
 	return entry, nil
 }
 
-func (s *AzureService) Consume(ctx context.Context, args *Consume) enumerators.Enumerator[*Entry] {
-	spaces := make([]enumerators.Enumerator[*Entry], 0, len(args.Offsets))
-	for space, offset := range args.Offsets {
-		spaces = append(spaces, s.ConsumeSpace(ctx, &ConsumeSpace{
-			Space:        space,
-			MinTimestamp: args.MinTimestamp,
-			MaxTimestamp: args.MaxTimestamp,
-			Offset:       offset,
-		}))
-	}
-	return enumerators.Interleave(spaces, func(e *Entry) int64 { return e.Timestamp })
-}
-
-func (s *AzureService) Produce(ctx context.Context, args *Produce, records enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
+func (s *AzureService) Produce(ctx context.Context, args *api.Produce, records enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
 	if args == nil || args.Space == "" || args.Segment == "" {
-		return enumerators.Error[*SegmentStatus](errors.New(ErrInvalidProduceArgs))
+		return enumerators.Error[*api.SegmentStatus](errors.New(ErrInvalidProduceArgs))
 	}
 
 	lastEntry, err := s.Peek(ctx, args.Space, args.Segment)
 	if err != nil {
-		return enumerators.Error[*SegmentStatus](fmt.Errorf("%s: %w", ErrPeekFailed, err))
+		return enumerators.Error[*api.SegmentStatus](fmt.Errorf("%s: %w", ErrPeekFailed, err))
 	}
 	if lastEntry == nil {
-		lastEntry = &Entry{Sequence: 0, TRX: TRX{Number: 0}}
+		lastEntry = &api.Entry{Sequence: 0, TRX: api.TRX{Number: 0}}
 	}
 
 	chunks := enumerators.ChunkByCount(records, BatchSize)
 	var lastSeq, lastTrx = lastEntry.Sequence, lastEntry.TRX.Number
 
-	return enumerators.Map(chunks, func(chunk enumerators.Enumerator[*Record]) (*SegmentStatus, error) {
+	return enumerators.Map(chunks, func(chunk enumerators.Enumerator[*api.Record]) (*api.SegmentStatus, error) {
 		return s.processChunkWithRetry(ctx, args.Space, args.Segment, chunk, &lastSeq, &lastTrx)
 	})
 }
@@ -277,7 +258,7 @@ func (s *AzureService) Close() error {
 
 // Private Instance Methods
 
-func (s *AzureService) processChunkWithRetry(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*Record], lastSeq, lastTrx *uint64) (*SegmentStatus, error) {
+func (s *AzureService) processChunkWithRetry(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*api.Record], lastSeq, lastTrx *uint64) (*api.SegmentStatus, error) {
 	var lastErr error
 	for attempt := 0; attempt < MaxRetryAttempts; attempt++ {
 		status, err := s.processChunk(ctx, space, segment, chunk, *lastSeq, *lastTrx)
@@ -295,11 +276,11 @@ func (s *AzureService) processChunkWithRetry(ctx context.Context, space, segment
 	return nil, fmt.Errorf("failed after %d attempts: %w", MaxRetryAttempts, lastErr)
 }
 
-func (s *AzureService) processChunk(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*Record], lastSeq, lastTrx uint64) (*SegmentStatus, error) {
+func (s *AzureService) processChunk(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*api.Record], lastSeq, lastTrx uint64) (*api.SegmentStatus, error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	trx := TRX{ID: uuid.New(), Number: lastTrx + 1}
+	trx := api.TRX{ID: uuid.New(), Number: lastTrx + 1}
 	entries, err := createEntries(chunk, space, segment, trx, lastSeq)
 	if err != nil {
 		return nil, err
@@ -324,8 +305,8 @@ func (s *AzureService) recoverWAL(ctx context.Context) error {
 	})
 	transactions := enumerators.Map(
 		NewAzureTableEnumerator(ctx, pager),
-		func(e *Entity) (*Transaction, error) {
-			transaction := &Transaction{}
+		func(e *Entity) (*txn.Transaction, error) {
+			transaction := &txn.Transaction{}
 			if err := json.Unmarshal(e.Value, transaction); err != nil {
 				return nil, fmt.Errorf("%s: %w", ErrUnmarshalTransaction, err)
 			}
@@ -343,7 +324,7 @@ func (s *AzureService) recoverWAL(ctx context.Context) error {
 	return enumerators.Consume(transactions)
 }
 
-func (s *AzureService) executeTransaction(ctx context.Context, transaction *Transaction) error {
+func (s *AzureService) executeTransaction(ctx context.Context, transaction *txn.Transaction) error {
 	transactionEntity, err := createTransactionEntity(transaction)
 	if err != nil {
 		return fmt.Errorf("%s: %w", ErrTransactionCreate, err)
@@ -370,7 +351,7 @@ func (s *AzureService) cleanupWAL(ctx context.Context, pk, rk string) error {
 	return nil
 }
 
-func (s *AzureService) fanoutTransaction(ctx context.Context, transaction *Transaction) error {
+func (s *AzureService) fanoutTransaction(ctx context.Context, transaction *txn.Transaction) error {
 	batch, err := prepareBatchEntries(transaction.Entries)
 	if err != nil {
 		return fmt.Errorf("%s: %w", ErrBatchPrepare, err)
@@ -524,26 +505,26 @@ func (s *AzureService) createTableIfNotExists(ctx context.Context) error {
 	return fmt.Errorf("%s: %w", ErrTableCreation, err)
 }
 
-func (s *AzureService) queryEntries(ctx context.Context, filter string, minTS, maxTS int64) enumerators.Enumerator[*Entry] {
+func (s *AzureService) queryEntries(ctx context.Context, filter string, minTS, maxTS int64) enumerators.Enumerator[*api.Entry] {
 	pager := s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &filter,
 		Format: ptr(aztables.MetadataFormatNone),
 	})
 
 	entities := NewAzureTableEnumerator(ctx, pager)
-	entries := enumerators.Map(entities, func(e *Entity) (*Entry, error) {
+	entries := enumerators.Map(entities, func(e *Entity) (*api.Entry, error) {
 		return decodeEntry(e.Value)
 	})
 
-	return enumerators.TakeWhile(entries, func(e *Entry) bool {
+	return enumerators.TakeWhile(entries, func(e *api.Entry) bool {
 		return e.Timestamp > minTS && e.Timestamp <= maxTS
 	})
 }
 
 // Private Helper Functions
 
-func createTransaction(trx TRX, space, segment string, entries []*Entry) *Transaction {
-	return &Transaction{
+func createTransaction(trx api.TRX, space, segment string, entries []*api.Entry) *txn.Transaction {
+	return &txn.Transaction{
 		TRX:           trx,
 		Space:         space,
 		Segment:       segment,
@@ -554,8 +535,8 @@ func createTransaction(trx TRX, space, segment string, entries []*Entry) *Transa
 	}
 }
 
-func createTransactionEntity(transaction *Transaction) (*Entity, error) {
-	value, err := transaction.EncodeTransactionSnappy(transaction)
+func createTransactionEntity(transaction *txn.Transaction) (*Entity, error) {
+	value, err := codec.EncodeTransactionSnappy(transaction)
 	if err != nil {
 		return nil, err
 	}
@@ -567,14 +548,14 @@ func createTransactionEntity(transaction *Transaction) (*Entity, error) {
 	}, nil
 }
 
-func createEntries(chunk enumerators.Enumerator[*Record], space, segment string, trx TRX, lastSeq uint64) ([]*Entry, error) {
+func createEntries(chunk enumerators.Enumerator[*api.Record], space, segment string, trx api.TRX, lastSeq uint64) ([]*api.Entry, error) {
 	ts := timestamp.GetTimestamp()
-	enumerator := enumerators.Map(chunk, func(r *Record) (*Entry, error) {
+	enumerator := enumerators.Map(chunk, func(r *api.Record) (*api.Entry, error) {
 		lastSeq++
 		if r.Sequence != lastSeq {
 			return nil, api.ERR_SEQUENCE_MISMATCH
 		}
-		return &Entry{
+		return &api.Entry{
 			TRX:       trx,
 			Space:     space,
 			Segment:   segment,
@@ -587,10 +568,10 @@ func createEntries(chunk enumerators.Enumerator[*Record], space, segment string,
 	return enumerators.ToSlice(enumerator)
 }
 
-func prepareBatchEntries(entries []*Entry) ([]batchEntry, error) {
+func prepareBatchEntries(entries []*api.Entry) ([]batchEntry, error) {
 	batch := make([]batchEntry, len(entries))
 	for i, e := range entries {
-		encoded, err := api.EncodeEntrySnappy(e)
+		encoded, err := codec.EncodeEntrySnappy(e)
 		if err != nil {
 			return nil, err
 		}
@@ -599,8 +580,8 @@ func prepareBatchEntries(entries []*Entry) ([]batchEntry, error) {
 	return batch, nil
 }
 
-func createSegmentStatus(space, segment string, entries []*Entry) *SegmentStatus {
-	return &SegmentStatus{
+func createSegmentStatus(space, segment string, entries []*api.Entry) *api.SegmentStatus {
+	return &api.SegmentStatus{
 		Space:          space,
 		Segment:        segment,
 		FirstSequence:  entries[0].Sequence,
@@ -682,7 +663,7 @@ func isRetryableError(err error) bool {
 		strings.Contains(errStr, "429")
 }
 
-func decodeSnappyEntryEntity(value []byte) (*Entry, error) {
+func decodeSnappyEntryEntity(value []byte) (*api.Entry, error) {
 	var entity Entity
 	if err := json.Unmarshal(value, &entity); err != nil {
 		return nil, fmt.Errorf("%s: %w", ErrUnmarshalEntity, err)
@@ -690,9 +671,9 @@ func decodeSnappyEntryEntity(value []byte) (*Entry, error) {
 	return decodeEntry(entity.Value)
 }
 
-func decodeEntry(value []byte) (*Entry, error) {
-	entry := &Entry{}
-	if err := api.DecodeEntrySnappy(value, entry); err != nil {
+func decodeEntry(value []byte) (*api.Entry, error) {
+	entry := &api.Entry{}
+	if err := codec.DecodeEntrySnappy(value, entry); err != nil {
 		return nil, fmt.Errorf("%s: %w", ErrDecodeEntry, err)
 	}
 	return entry, nil
@@ -729,7 +710,7 @@ func getSpaceLowerBound(space string, minTS int64, offset lexkey.LexKey) lexkey.
 	return lexkey.EncodeFirst(api.DATA, api.SPACES, space, minTS)
 }
 
-func calculateSegmentBounds(ts int64, args *ConsumeSegment) struct {
+func calculateSegmentBounds(ts int64, args *api.ConsumeSegment) struct {
 	MinSeq, MaxSeq uint64
 	MinTS, MaxTS   int64
 } {

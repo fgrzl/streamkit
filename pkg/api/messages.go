@@ -150,12 +150,6 @@ func (m *GetStatus) GetDiscriminator() string {
 	return "streamkit://api/v1/get_status"
 }
 
-type ClusterStatus struct {
-	NodeCount int `json:"node_count"`
-}
-
-// ─── Transactions ──────────────────────────────────────────────────────────────
-
 type TRX struct {
 	ID     uuid.UUID `json:"id"`
 	Node   uuid.UUID `json:"node,omitempty"`

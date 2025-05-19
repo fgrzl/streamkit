@@ -1,10 +1,11 @@
-package txn
+package codec
 
 import (
 	"bytes"
 	"encoding/binary"
 	"errors"
 
+	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/golang/snappy"
 )
@@ -124,7 +125,7 @@ func DecodeEntry(data []byte, e *api.Entry) error {
 }
 
 // EncodeEntrySnappy compresses a serialized Entry using Snappy
-func EncodeTransactionSnappy(e *Transaction) ([]byte, error) {
+func EncodeTransactionSnappy(e *txn.Transaction) ([]byte, error) {
 	rawData, err := EncodeTransaction(e) // First encode without compression
 	if err != nil {
 		return nil, err
@@ -135,7 +136,7 @@ func EncodeTransactionSnappy(e *Transaction) ([]byte, error) {
 }
 
 // DecodeEntrySnappy decompresses and deserializes an Entry
-func DecodeTransactionSnappy(data []byte, t *Transaction) error {
+func DecodeTransactionSnappy(data []byte, t *txn.Transaction) error {
 	// Decompress the entry first
 	decompressedData, err := snappy.Decode(nil, data)
 	if err != nil {
@@ -147,7 +148,7 @@ func DecodeTransactionSnappy(data []byte, t *Transaction) error {
 }
 
 // EncodeTransaction serializes a Transaction into binary format
-func EncodeTransaction(t *Transaction) ([]byte, error) {
+func EncodeTransaction(t *txn.Transaction) ([]byte, error) {
 	estimatedSize := defaultBufferSize + len(t.Entries)*128
 	buf := bytes.NewBuffer(make([]byte, 0, estimatedSize))
 
@@ -193,7 +194,7 @@ func EncodeTransaction(t *Transaction) ([]byte, error) {
 }
 
 // DecodeTransaction deserializes a Transaction from binary format
-func DecodeTransaction(data []byte, t *Transaction) error {
+func DecodeTransaction(data []byte, t *txn.Transaction) error {
 	buf := bytes.NewReader(data)
 
 	// Deserialize TRX
