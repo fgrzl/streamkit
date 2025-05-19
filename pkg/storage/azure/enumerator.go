@@ -11,7 +11,7 @@ import (
 )
 
 // NewAzureTableEnumerator creates a new enumerator for Azure Table Storage entities
-func NewAzureTableEnumerator(ctx context.Context, pager *runtime.Pager[aztables.ListEntitiesResponse]) enumerators.Enumerator[*Entity] {
+func NewAzureTableEnumerator(ctx context.Context, pager *runtime.Pager[aztables.ListEntitiesResponse]) enumerators.Enumerator[*entity] {
 	return &AzureTableEnumerator{
 		pager:    pager,
 		ctx:      ctx,
@@ -25,14 +25,14 @@ func NewAzureTableEnumerator(ctx context.Context, pager *runtime.Pager[aztables.
 type AzureTableEnumerator struct {
 	pager    *runtime.Pager[aztables.ListEntitiesResponse]
 	ctx      context.Context
-	current  *Entity
+	current  *entity
 	index    int
 	entities [][]byte
 	err      error
 }
 
 // Current returns the current entity in the enumeration
-func (a *AzureTableEnumerator) Current() (*Entity, error) {
+func (a *AzureTableEnumerator) Current() (*entity, error) {
 	if a.err != nil {
 		return nil, a.err
 	}
@@ -105,7 +105,7 @@ func (a *AzureTableEnumerator) setCurrent() error {
 		return fmt.Errorf("index out of bounds")
 	}
 
-	var entity Entity
+	var entity entity
 	if err := json.Unmarshal(a.entities[a.index], &entity); err != nil {
 		return fmt.Errorf("failed to unmarshal entity: %w", err)
 	}

@@ -10,7 +10,7 @@ require (
 	github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d
 	github.com/fgrzl/lexkey v0.0.0-20250404134045-06756616f02b
 	github.com/fgrzl/logging v0.0.0-20250316183444-a0ee4e3ff2b2
-	github.com/fgrzl/mux v0.0.0-20250516185945-e4a6a5c24c13
+	github.com/fgrzl/mux v0.0.0-20250519160602-3f5792817bc5
 	github.com/fgrzl/streams v0.0.0-20250518171816-70f7a2409d1a
 	github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d
 	github.com/golang-jwt/jwt/v5 v5.2.2

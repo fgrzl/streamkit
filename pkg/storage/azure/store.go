@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
@@ -20,21 +19,19 @@ import (
 	"github.com/fgrzl/streamkit/internal/codec"
 	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/fgrzl/streamkit/pkg/storage"
-	"github.com/fgrzl/streams/broker"
 	"github.com/fgrzl/timestamp"
 	"github.com/google/uuid"
 )
 
 // Constants
 const (
-	BatchSize         int           = 100
-	CacheTTL          time.Duration = time.Minute * 97
-	CacheCleanup      time.Duration = time.Second * 59
-	ShutdownTimeout   time.Duration = time.Second * 59
-	InitialRetryDelay time.Duration = time.Millisecond * 100
-	MaxRetryAttempts  int           = 3
-	LAST_ENTRY        string        = "LAST_ENTRY"
+	BatchSize            int           = 100
+	CacheTTL             time.Duration = time.Minute * 97
+	CacheCleanupInterval time.Duration = time.Second * 59
+	ShutdownTimeout      time.Duration = time.Second * 59
+	InitialRetryDelay    time.Duration = time.Millisecond * 100
+	MaxRetryAttempts     int           = 3
+	LAST_ENTRY           string        = "LAST_ENTRY"
 )
 
 // Error Constants
@@ -70,25 +67,10 @@ const (
 )
 
 // Types
-type Entity struct {
+type entity struct {
 	PartitionKey string `json:"PartitionKey"`
 	RowKey       string `json:"RowKey"`
 	Value        []byte `json:"Value,omitempty"`
-}
-
-type TableProviderOptions struct {
-	Prefix                    string
-	Table                     string
-	Endpoint                  string
-	UseDefaultAzureCredential bool
-	SharedKeyCredential       *aztables.SharedKeyCredential
-}
-
-type AzureService struct {
-	client    *aztables.Client
-	cache     *internal.ExpiringCache
-	wg        sync.WaitGroup
-	closeOnce sync.Once
 }
 
 type batchEntry struct {
@@ -96,34 +78,30 @@ type batchEntry struct {
 	EncodedValue []byte
 }
 
-// Ensure AzureService implements Service
-var _ storage.Store = (*AzureService)(nil)
-
-// Public Methods
-
-func NewService(bus broker.Bus, opts *TableProviderOptions) (storage.Store, error) {
-	client, err := getClient(opts)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", ErrClientCreation, err)
-	}
-
-	s := &AzureService{
+func NewAzureStore(ctx context.Context, client *aztables.Client, cache *internal.ExpiringCache) (*AzureStore, error) {
+	store := &AzureStore{
 		client: client,
-		cache:  internal.NewExpiringCache(CacheTTL, CacheCleanup),
+		cache:  cache,
 	}
 
-	if err := s.createTableIfNotExists(context.Background()); err != nil {
-		return nil, fmt.Errorf("%s: %w", ErrTableInit, err)
+	if err := store.createTableIfNotExists(ctx); err != nil {
+		return nil, fmt.Errorf("create table if not exists failed: %w", err)
 	}
 
-	if err := s.recoverWAL(context.Background()); err != nil {
-		return nil, fmt.Errorf("%s: %w", ErrWALRecovery, err)
+	if err := store.recoverWAL(ctx); err != nil {
+		return nil, fmt.Errorf("recover WAL failed: %w", err)
 	}
-
-	return s, nil
+	return store, nil
 }
 
-func (s *AzureService) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
+type AzureStore struct {
+	client    *aztables.Client
+	cache     *internal.ExpiringCache
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+}
+
+func (s *AzureStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
 	query := buildQuery(
 		lexkey.EncodeFirst(api.INVENTORY, api.SPACES).ToHexString(),
 		lexkey.EncodeLast(api.INVENTORY, api.SPACES).ToHexString(),
@@ -134,12 +112,12 @@ func (s *AzureService) GetSpaces(ctx context.Context) enumerators.Enumerator[str
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
-	return enumerators.Map(entities, func(e *Entity) (string, error) {
+	return enumerators.Map(entities, func(e *entity) (string, error) {
 		return e.RowKey, nil
 	})
 }
 
-func (s *AzureService) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
+func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
 	ts := timestamp.GetTimestamp()
 	bounds := calculateTimeBounds(ts, args.MinTimestamp, args.MaxTimestamp)
 
@@ -151,7 +129,7 @@ func (s *AzureService) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace)
 	return s.queryEntries(ctx, query, bounds.Min, bounds.Max)
 }
 
-func (s *AzureService) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
+func (s *AzureStore) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
 	query := buildQuery(
 		lexkey.EncodeFirst(api.INVENTORY, api.SEGMENTS, space).ToHexString(),
 		lexkey.EncodeLast(api.INVENTORY, api.SEGMENTS, space).ToHexString(),
@@ -162,12 +140,12 @@ func (s *AzureService) GetSegments(ctx context.Context, space string) enumerator
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
-	return enumerators.Map(entities, func(e *Entity) (string, error) {
+	return enumerators.Map(entities, func(e *entity) (string, error) {
 		return e.RowKey, nil
 	})
 }
 
-func (s *AzureService) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry] {
+func (s *AzureStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry] {
 	ts := timestamp.GetTimestamp()
 	bounds := calculateSegmentBounds(ts, args)
 
@@ -184,7 +162,7 @@ func (s *AzureService) ConsumeSegment(ctx context.Context, args *api.ConsumeSegm
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
-	entries := enumerators.Map(entities, func(e *Entity) (*api.Entry, error) {
+	entries := enumerators.Map(entities, func(e *entity) (*api.Entry, error) {
 		return decodeEntry(e.Value)
 	})
 
@@ -196,7 +174,7 @@ func (s *AzureService) ConsumeSegment(ctx context.Context, args *api.ConsumeSegm
 	})
 }
 
-func (s *AzureService) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
+func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
 	cacheKey := fmt.Sprintf("peek:%s:%s", space, segment)
 	if cached, ok := s.cache.Get(cacheKey); ok {
 		if entry, ok := cached.(*api.Entry); ok {
@@ -223,7 +201,7 @@ func (s *AzureService) Peek(ctx context.Context, space, segment string) (*api.En
 	return entry, nil
 }
 
-func (s *AzureService) Produce(ctx context.Context, args *api.Produce, records enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
+func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
 	if args == nil || args.Space == "" || args.Segment == "" {
 		return enumerators.Error[*api.SegmentStatus](errors.New(ErrInvalidProduceArgs))
 	}
@@ -244,7 +222,7 @@ func (s *AzureService) Produce(ctx context.Context, args *api.Produce, records e
 	})
 }
 
-func (s *AzureService) Close() error {
+func (s *AzureStore) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		if !s.waitForTasks(ShutdownTimeout) {
@@ -258,7 +236,7 @@ func (s *AzureService) Close() error {
 
 // Private Instance Methods
 
-func (s *AzureService) processChunkWithRetry(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*api.Record], lastSeq, lastTrx *uint64) (*api.SegmentStatus, error) {
+func (s *AzureStore) processChunkWithRetry(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*api.Record], lastSeq, lastTrx *uint64) (*api.SegmentStatus, error) {
 	var lastErr error
 	for attempt := 0; attempt < MaxRetryAttempts; attempt++ {
 		status, err := s.processChunk(ctx, space, segment, chunk, *lastSeq, *lastTrx)
@@ -276,7 +254,7 @@ func (s *AzureService) processChunkWithRetry(ctx context.Context, space, segment
 	return nil, fmt.Errorf("failed after %d attempts: %w", MaxRetryAttempts, lastErr)
 }
 
-func (s *AzureService) processChunk(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*api.Record], lastSeq, lastTrx uint64) (*api.SegmentStatus, error) {
+func (s *AzureStore) processChunk(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*api.Record], lastSeq, lastTrx uint64) (*api.SegmentStatus, error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
@@ -295,7 +273,7 @@ func (s *AzureService) processChunk(ctx context.Context, space, segment string, 
 	return status, nil
 }
 
-func (s *AzureService) recoverWAL(ctx context.Context) error {
+func (s *AzureStore) recoverWAL(ctx context.Context) error {
 	lower, upper := lexkey.EncodeFirst(api.TRANSACTION).ToHexString(), lexkey.EncodeLast(api.TRANSACTION).ToHexString()
 	query := fmt.Sprintf("PartitionKey ge '%s' and PartitionKey le '%s'", lower, upper)
 
@@ -305,7 +283,7 @@ func (s *AzureService) recoverWAL(ctx context.Context) error {
 	})
 	transactions := enumerators.Map(
 		NewAzureTableEnumerator(ctx, pager),
-		func(e *Entity) (*txn.Transaction, error) {
+		func(e *entity) (*txn.Transaction, error) {
 			transaction := &txn.Transaction{}
 			if err := json.Unmarshal(e.Value, transaction); err != nil {
 				return nil, fmt.Errorf("%s: %w", ErrUnmarshalTransaction, err)
@@ -324,7 +302,7 @@ func (s *AzureService) recoverWAL(ctx context.Context) error {
 	return enumerators.Consume(transactions)
 }
 
-func (s *AzureService) executeTransaction(ctx context.Context, transaction *txn.Transaction) error {
+func (s *AzureStore) executeTransaction(ctx context.Context, transaction *txn.Transaction) error {
 	transactionEntity, err := createTransactionEntity(transaction)
 	if err != nil {
 		return fmt.Errorf("%s: %w", ErrTransactionCreate, err)
@@ -344,14 +322,14 @@ func (s *AzureService) executeTransaction(ctx context.Context, transaction *txn.
 	return s.updateInventory(ctx, transaction.Space, transaction.Segment)
 }
 
-func (s *AzureService) cleanupWAL(ctx context.Context, pk, rk string) error {
+func (s *AzureStore) cleanupWAL(ctx context.Context, pk, rk string) error {
 	if _, err := s.client.DeleteEntity(ctx, pk, rk, nil); err != nil {
 		return fmt.Errorf("%s: %w", ErrWALCleanup, err)
 	}
 	return nil
 }
 
-func (s *AzureService) fanoutTransaction(ctx context.Context, transaction *txn.Transaction) error {
+func (s *AzureStore) fanoutTransaction(ctx context.Context, transaction *txn.Transaction) error {
 	batch, err := prepareBatchEntries(transaction.Entries)
 	if err != nil {
 		return fmt.Errorf("%s: %w", ErrBatchPrepare, err)
@@ -377,10 +355,10 @@ func (s *AzureService) fanoutTransaction(ctx context.Context, transaction *txn.T
 	return nil
 }
 
-func (s *AzureService) writeLastEntry(ctx context.Context, entry batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
+func (s *AzureStore) writeLastEntry(ctx context.Context, entry batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	entity := Entity{
+	entity := entity{
 		PartitionKey: lexkey.Encode(LAST_ENTRY, entry.Entry.Space, entry.Entry.Segment).ToHexString(),
 		RowKey:       lexkey.Encode(lexkey.EndMarker).ToHexString(),
 		Value:        entry.EncodedValue,
@@ -393,12 +371,12 @@ func (s *AzureService) writeLastEntry(ctx context.Context, entry batchEntry, err
 	}
 }
 
-func (s *AzureService) writeSegmentBatch(ctx context.Context, entries []batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
+func (s *AzureStore) writeSegmentBatch(ctx context.Context, entries []batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	entities := make([]Entity, len(entries))
+	entities := make([]entity, len(entries))
 	for i, entry := range entries {
-		entities[i] = Entity{
+		entities[i] = entity{
 			PartitionKey: lexkey.Encode(api.DATA, api.SEGMENTS, entry.Entry.Space, entry.Entry.Segment, entry.Entry.TRX.Number).ToHexString(),
 			RowKey:       lexkey.Encode(entry.Entry.Sequence).ToHexString(),
 			Value:        entry.EncodedValue,
@@ -410,12 +388,12 @@ func (s *AzureService) writeSegmentBatch(ctx context.Context, entries []batchEnt
 	}
 }
 
-func (s *AzureService) writeSpaceBatch(ctx context.Context, entries []batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
+func (s *AzureStore) writeSpaceBatch(ctx context.Context, entries []batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	entities := make([]Entity, len(entries))
+	entities := make([]entity, len(entries))
 	for i, entry := range entries {
-		entities[i] = Entity{
+		entities[i] = entity{
 			PartitionKey: lexkey.Encode(api.DATA, api.SPACES, entry.Entry.Space, entry.Entry.Timestamp, entry.Entry.Segment).ToHexString(),
 			RowKey:       lexkey.Encode(entry.Entry.Sequence).ToHexString(),
 			Value:        entry.EncodedValue,
@@ -427,7 +405,7 @@ func (s *AzureService) writeSpaceBatch(ctx context.Context, entries []batchEntry
 	}
 }
 
-func (s *AzureService) writeBatch(ctx context.Context, entities []Entity) error {
+func (s *AzureStore) writeBatch(ctx context.Context, entities []entity) error {
 	if len(entities) == 0 {
 		return nil
 	}
@@ -447,7 +425,7 @@ func (s *AzureService) writeBatch(ctx context.Context, entities []Entity) error 
 	return nil
 }
 
-func (s *AzureService) updateInventory(ctx context.Context, space, segment string) error {
+func (s *AzureStore) updateInventory(ctx context.Context, space, segment string) error {
 	segmentKey := lexkey.Encode(api.INVENTORY, api.SEGMENTS, space, segment).ToHexString()
 
 	_, ok := s.cache.Get(segmentKey)
@@ -457,7 +435,7 @@ func (s *AzureService) updateInventory(ctx context.Context, space, segment strin
 
 	updateOptions := &aztables.UpsertEntityOptions{UpdateMode: aztables.UpdateModeReplace}
 
-	if _, err := s.client.UpsertEntity(ctx, mustMarshal(Entity{
+	if _, err := s.client.UpsertEntity(ctx, mustMarshal(entity{
 		PartitionKey: segmentKey,
 		RowKey:       segment,
 	}), updateOptions); err != nil {
@@ -466,7 +444,7 @@ func (s *AzureService) updateInventory(ctx context.Context, space, segment strin
 
 	spaceKey := lexkey.Encode(api.INVENTORY, api.SPACES, space).ToHexString()
 
-	if _, err := s.client.UpsertEntity(ctx, mustMarshal(Entity{
+	if _, err := s.client.UpsertEntity(ctx, mustMarshal(entity{
 		PartitionKey: spaceKey,
 		RowKey:       space,
 	}), updateOptions); err != nil {
@@ -477,7 +455,7 @@ func (s *AzureService) updateInventory(ctx context.Context, space, segment strin
 	return nil
 }
 
-func (s *AzureService) waitForTasks(timeout time.Duration) bool {
+func (s *AzureStore) waitForTasks(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -491,7 +469,7 @@ func (s *AzureService) waitForTasks(timeout time.Duration) bool {
 	}
 }
 
-func (s *AzureService) createTableIfNotExists(ctx context.Context) error {
+func (s *AzureStore) createTableIfNotExists(ctx context.Context) error {
 	_, err := s.client.CreateTable(ctx, nil)
 	if err == nil {
 		return nil
@@ -505,14 +483,14 @@ func (s *AzureService) createTableIfNotExists(ctx context.Context) error {
 	return fmt.Errorf("%s: %w", ErrTableCreation, err)
 }
 
-func (s *AzureService) queryEntries(ctx context.Context, filter string, minTS, maxTS int64) enumerators.Enumerator[*api.Entry] {
+func (s *AzureStore) queryEntries(ctx context.Context, filter string, minTS, maxTS int64) enumerators.Enumerator[*api.Entry] {
 	pager := s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &filter,
 		Format: ptr(aztables.MetadataFormatNone),
 	})
 
 	entities := NewAzureTableEnumerator(ctx, pager)
-	entries := enumerators.Map(entities, func(e *Entity) (*api.Entry, error) {
+	entries := enumerators.Map(entities, func(e *entity) (*api.Entry, error) {
 		return decodeEntry(e.Value)
 	})
 
@@ -535,13 +513,13 @@ func createTransaction(trx api.TRX, space, segment string, entries []*api.Entry)
 	}
 }
 
-func createTransactionEntity(transaction *txn.Transaction) (*Entity, error) {
+func createTransactionEntity(transaction *txn.Transaction) (*entity, error) {
 	value, err := codec.EncodeTransactionSnappy(transaction)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Entity{
+	return &entity{
 		PartitionKey: lexkey.Encode(api.TRANSACTION, transaction.Space, transaction.Segment, transaction.TRX.Number).ToHexString(),
 		RowKey:       lexkey.Encode(lexkey.EndMarker).ToHexString(),
 		Value:        value,
@@ -591,63 +569,6 @@ func createSegmentStatus(space, segment string, entries []*api.Entry) *api.Segme
 	}
 }
 
-func getClient(opts *TableProviderOptions) (*aztables.Client, error) {
-	tableName := sanitizeTableName(fmt.Sprintf("%s%s", opts.Prefix, opts.Table))
-	url := fmt.Sprintf("%s/%s", opts.Endpoint, tableName)
-
-	var optsClient aztables.ClientOptions
-	if opts.SharedKeyCredential != nil && opts.SharedKeyCredential.AccountName() == "devstoreaccount1" {
-		optsClient.InsecureAllowCredentialWithHTTP = true
-	}
-
-	if opts.UseDefaultAzureCredential {
-		cred, err := azidentity.NewDefaultAzureCredential(nil)
-		if err != nil {
-			return nil, err
-		}
-		return aztables.NewClient(url, cred, &optsClient)
-	}
-	if opts.SharedKeyCredential != nil {
-		return aztables.NewClientWithSharedKey(url, opts.SharedKeyCredential, &optsClient)
-	}
-	return nil, errors.New(ErrInvalidCredentials)
-}
-
-func sanitizeTableName(name string) string {
-	if len(name) == 0 {
-		return ""
-	}
-
-	var sanitized []byte
-	if isLetter(name[0]) {
-		sanitized = append(sanitized, name[0])
-	} else {
-		sanitized = append(sanitized, 'T')
-	}
-
-	for i := 1; i < len(name); i++ {
-		if isAlphanumeric(name[i]) {
-			sanitized = append(sanitized, name[i])
-		}
-	}
-
-	for len(sanitized) < 3 {
-		sanitized = append(sanitized, '0')
-	}
-	if len(sanitized) > 63 {
-		sanitized = sanitized[:63]
-	}
-	return string(sanitized)
-}
-
-func isLetter(c byte) bool {
-	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-}
-
-func isAlphanumeric(c byte) bool {
-	return isLetter(c) || (c >= '0' && c <= '9')
-}
-
 func isNotFoundError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "ResourceNotFound")
 }
@@ -664,7 +585,7 @@ func isRetryableError(err error) bool {
 }
 
 func decodeSnappyEntryEntity(value []byte) (*api.Entry, error) {
-	var entity Entity
+	var entity entity
 	if err := json.Unmarshal(value, &entity); err != nil {
 		return nil, fmt.Errorf("%s: %w", ErrUnmarshalEntity, err)
 	}

@@ -91,6 +91,7 @@ func (c *client) Peek(ctx context.Context, space, segment string) (*Entry, error
 	if err != nil {
 		return nil, err
 	}
+	defer stream.Close(nil)
 	entry := &api.Entry{}
 	if err := stream.Decode(&entry); err != nil {
 		return nil, err
@@ -133,6 +134,7 @@ func (c *client) Publish(ctx context.Context, space, segment string, payload []b
 	if err != nil {
 		return err
 	}
+	defer stream.Close(nil)
 
 	record := &api.Record{
 		Sequence: peek.Sequence + 1,
@@ -151,7 +153,7 @@ func (c *client) Publish(ctx context.Context, space, segment string, payload []b
 		stream.Close(err)
 		return err
 	}
-	stream.Close(nil)
+
 	return nil
 }
 

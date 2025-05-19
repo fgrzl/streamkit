@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/fgrzl/streams/broker"
+	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
 	"golang.org/x/net/websocket"
 )
@@ -23,6 +23,8 @@ type WebSocketMuxer struct {
 	channels   map[uuid.UUID]*MuxerBidiStream
 	channelsMu sync.RWMutex
 	writeMu    sync.Mutex
+	done       chan struct{}
+	dispatcher Dispatcher
 }
 
 // NewWebSocketMuxer wraps a websocket.Conn and starts its internal reader loop.
@@ -30,17 +32,36 @@ func NewWebSocketMuxer(conn *websocket.Conn) *WebSocketMuxer {
 	m := &WebSocketMuxer{
 		conn:     conn,
 		channels: make(map[uuid.UUID]*MuxerBidiStream),
+		done:     make(chan struct{}),
 	}
 	go m.readLoop()
 	return m
 }
 
+type Dispatcher = func(api.BidiStream)
+
+func NewServerWebSocketMuxer(conn *websocket.Conn, dispatcher Dispatcher) {
+	m := &WebSocketMuxer{
+		conn:       conn,
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		done:       make(chan struct{}),
+		dispatcher: dispatcher,
+	}
+	m.readLoop()
+}
+
+// Serve blocks until the WebSocket connection is closed or an error occurs.
+func (m *WebSocketMuxer) Serve() {
+	<-m.done
+}
+
 // Register creates and tracks a new stream for the given ChannelID.
 // If a stream with this ID already exists, it is overwritten.
-func (m *WebSocketMuxer) Register(channelID uuid.UUID) broker.BidiStream {
+func (m *WebSocketMuxer) Register(channelID uuid.UUID) api.BidiStream {
 	return m.register(channelID)
 }
 
+// internal registration logic (safe for reuse)
 func (m *WebSocketMuxer) register(channelID uuid.UUID) *MuxerBidiStream {
 	sendFn := func(payload []byte) error {
 		m.writeMu.Lock()
@@ -69,8 +90,9 @@ func (m *WebSocketMuxer) register(channelID uuid.UUID) *MuxerBidiStream {
 }
 
 // readLoop continuously receives messages from the WebSocket,
-// routes them to the appropriate stream, and auto-registers new streams on first message.
+// routes them to the appropriate stream, and auto-registers new streams.
 func (m *WebSocketMuxer) readLoop() {
+
 	for {
 		var msg MuxerMsg
 		if err := websocket.JSON.Receive(m.conn, &msg); err != nil {
@@ -79,12 +101,12 @@ func (m *WebSocketMuxer) readLoop() {
 		}
 
 		m.channelsMu.RLock()
-		stream, ok := m.channels[msg.ChannelID]
+		stream, exists := m.channels[msg.ChannelID]
 		m.channelsMu.RUnlock()
 
-		if !ok {
+		if !exists {
 			stream = m.register(msg.ChannelID)
-			slog.Debug("muxer: auto-registered stream on first message", slog.String("channel_id", msg.ChannelID.String()))
+			go m.dispatcher(stream)
 		}
 
 		select {

@@ -43,6 +43,7 @@ func (c *MuxerBidiStream) Encode(m any) error {
 
 // Decode blocks until a message is received or the stream is closed.
 func (c *MuxerBidiStream) Decode(v any) error {
+
 	select {
 	case <-c.closed:
 		return io.EOF

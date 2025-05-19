@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
 	"golang.org/x/net/websocket"
@@ -35,14 +36,15 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, msg api.Ro
 	if err != nil {
 		return nil, err
 	}
-
 	stream := muxer.Register(uuid.New())
 
-	if err := stream.Encode(msg); err != nil {
+	// we use a polymorphic envelope so that we can
+	// unmarshal server side and route the msg
+	envelope := polymorphic.NewEnvelope(msg)
+	if err := stream.Encode(envelope); err != nil {
 		stream.Close(err)
 		return nil, err
 	}
-
 	return stream, nil
 }
 

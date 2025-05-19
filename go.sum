@@ -32,6 +32,8 @@ github.com/fgrzl/logging v0.0.0-20250316183444-a0ee4e3ff2b2 h1:t9cdecObH3RtPlJhV
 github.com/fgrzl/logging v0.0.0-20250316183444-a0ee4e3ff2b2/go.mod h1:hM9YiIQPM2xLyxdxwLcnDCs3mtDPvQsGcOTh61oBrAQ=
 github.com/fgrzl/mux v0.0.0-20250516185945-e4a6a5c24c13 h1:g1VHg/E29pMkdrHI5ZCNg4vWmywc8oW5ZtQjj0Qdzis=
 github.com/fgrzl/mux v0.0.0-20250516185945-e4a6a5c24c13/go.mod h1:0Y8t6b4w5YzzOLzYaKLMG/esyg8jGht0658bmldVvuM=
+github.com/fgrzl/mux v0.0.0-20250519160602-3f5792817bc5 h1:5FhioXLxghUwfFksgfJGIj82szgqR8FZ/ZLPuW17pxk=
+github.com/fgrzl/mux v0.0.0-20250519160602-3f5792817bc5/go.mod h1:0Y8t6b4w5YzzOLzYaKLMG/esyg8jGht0658bmldVvuM=
 github.com/fgrzl/streams v0.0.0-20250518171816-70f7a2409d1a h1:IYXoFbwH4Yk96p1+Ath/gdT4xcgv0PuVPNHuJu/OEM4=
 github.com/fgrzl/streams v0.0.0-20250518171816-70f7a2409d1a/go.mod h1:ZpgONWr20cXyoDieBb8AwFh6iSW4p4GM4rb4LgjFWVE=
 github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d h1:h70KpLp2smJW5eb7pvESk40lsYM3VoFCJmJ/7Y4cs1Y=

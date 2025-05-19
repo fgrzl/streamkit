@@ -33,3 +33,13 @@ func (s *Service) Consume(ctx context.Context, args *api.Consume) enumerators.En
 	}
 	return enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
 }
+
+/*
+
+- load the target node
+- if target node does not exist create it
+- dispatch
+
+
+
+*/
