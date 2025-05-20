@@ -11,12 +11,14 @@ import (
 type NodeManager interface {
 	GetOrCreate(ctx context.Context, name string) (Node, error)
 	Remove(ctx context.Context, name string)
+	Close()
 }
 
 type nodeManager struct {
-	mu      sync.RWMutex
-	factory storage.StoreFactory
-	nodes   map[string]Node
+	mu        sync.RWMutex
+	factory   storage.StoreFactory
+	nodes     map[string]Node
+	closeOnce sync.Once
 }
 
 // NewNodeManager creates a new NodeManager with the given factory.
@@ -61,4 +63,14 @@ func (m *nodeManager) Remove(ctx context.Context, name string) {
 		node.Close() // ignore error, optionally log it
 		delete(m.nodes, name)
 	}
+}
+
+func (m *nodeManager) Close() {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, node := range m.nodes {
+			node.Close()
+		}
+	})
 }

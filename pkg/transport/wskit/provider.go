@@ -36,16 +36,16 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, msg api.Ro
 	if err != nil {
 		return nil, err
 	}
-	stream := muxer.Register(uuid.New())
+	bidi := muxer.Register(uuid.New())
 
 	// we use a polymorphic envelope so that we can
 	// unmarshal server side and route the msg
 	envelope := polymorphic.NewEnvelope(msg)
-	if err := stream.Encode(envelope); err != nil {
-		stream.Close(err)
+	if err := bidi.Encode(envelope); err != nil {
+		bidi.Close(err)
 		return nil, err
 	}
-	return stream, nil
+	return bidi, nil
 }
 
 // getOrCreateMuxer dials and initializes the WebSocket muxer if needed.
@@ -62,7 +62,7 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (*We
 		return nil, err
 	}
 
-	muxer := NewWebSocketMuxer(ctx, conn)
+	muxer := NewClientWebSocketMuxer(ctx, conn)
 	p.muxer = muxer
 	return muxer, nil
 }

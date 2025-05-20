@@ -26,7 +26,7 @@ import (
 // Constants
 const (
 	BatchSize            int           = 100
-	CacheTTL             time.Duration = time.Minute * 97
+	CacheTTL             time.Duration = time.Second * 97
 	CacheCleanupInterval time.Duration = time.Second * 59
 	ShutdownTimeout      time.Duration = time.Second * 59
 	InitialRetryDelay    time.Duration = time.Millisecond * 100
@@ -222,16 +222,13 @@ func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enu
 	})
 }
 
-func (s *AzureStore) Close() error {
-	var err error
+func (s *AzureStore) Close() {
 	s.closeOnce.Do(func() {
 		if !s.waitForTasks(ShutdownTimeout) {
-			err = errors.New(ErrTimeoutTasks)
 			slog.Warn(LogWarnTimeoutTasks)
 		}
 		s.cache.Close()
 	})
-	return err
 }
 
 // Private Instance Methods

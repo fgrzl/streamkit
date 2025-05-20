@@ -89,20 +89,27 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 	}
 	entry, err := n.store.Peek(ctx, args.Space, args.Segment)
 	if err != nil {
-		bidi.Close(err)
+		bidi.CloseSend(err)
 		return
 	}
+
+	if entry == nil {
+		entry = &api.Entry{
+			Space:   args.Space,
+			Segment: args.Segment,
+		}
+	}
+
 	if err := bidi.Encode(entry); err != nil {
-		bidi.Close(err)
+		bidi.CloseSend(err)
 		return
 	}
-	bidi.Close(nil)
+	bidi.CloseSend(nil)
 }
 
 func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi api.BidiStream) {
 	entries := api.NewStreamEnumerator[*api.Record](bidi)
 	results := n.store.Produce(ctx, args, entries)
-	defer results.Dispose()
 
 	for results.MoveNext() {
 		if !checkContext(ctx, bidi) {
@@ -118,7 +125,7 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 			return
 		}
 	}
-	bidi.CloseSend(nil)
+	bidi.CloseSend(results.Err())
 }
 
 func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi api.BidiStream) {

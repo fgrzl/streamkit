@@ -19,5 +19,5 @@ type Store interface {
 	ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry]
 	Peek(ctx context.Context, space, segment string) (*api.Entry, error)
 	Produce(ctx context.Context, args *api.Produce, entries enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus]
-	Close() error
+	Close()
 }

@@ -2,6 +2,7 @@ package wskit
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -26,7 +27,7 @@ func NewMuxerBidiStream(
 ) *MuxerBidiStream {
 	return &MuxerBidiStream{
 		encode:   encode,
-		recvChan: make(chan any),
+		recvChan: make(chan any, 256),
 		closed:   make(chan struct{}),
 		onClose:  onClose,
 	}
@@ -43,34 +44,50 @@ func (c *MuxerBidiStream) Encode(m any) error {
 
 // Decode blocks until a message is received or the stream is closed.
 func (c *MuxerBidiStream) Decode(v any) error {
-
 	select {
 	case <-c.closed:
 		return io.EOF
+
 	case msg, ok := <-c.recvChan:
 		if !ok {
 			return io.EOF
 		}
-		switch payload := msg.(type) {
+
+		var payload []byte
+		switch m := msg.(type) {
 		case []byte:
-			return json.Unmarshal(payload, v)
+			payload = m
 		case string:
-			return json.Unmarshal([]byte(payload), v)
+			payload = []byte(m)
 		default:
-			b, err := json.Marshal(payload)
+			var err error
+			payload, err = json.Marshal(m)
 			if err != nil {
 				return err
 			}
-			return json.Unmarshal(b, v)
 		}
+
+		// Check if it's a CloseMessage
+		var closeMsg CloseMessage
+		if err := json.Unmarshal(payload, &closeMsg); err == nil && closeMsg.Type == "close" {
+			if closeMsg.Err != "" {
+				return fmt.Errorf("remote closed stream: %s", closeMsg.Err)
+			}
+			return io.EOF
+		}
+
+		// Normal decode
+		return json.Unmarshal(payload, v)
 	}
 }
 
 // CloseSend sends a JSON close message to the remote side.
 func (c *MuxerBidiStream) CloseSend(err error) error {
-	msg := map[string]any{"type": "close"}
+	msg := &CloseMessage{
+		Type: "close",
+	}
 	if err != nil {
-		msg["err"] = err.Error()
+		msg.Err = err.Error()
 	}
 	return c.Encode(msg)
 }
@@ -105,4 +122,9 @@ func (c *MuxerBidiStream) IsClosed() bool {
 // EndOfStreamError returns the canonical EOF sentinel.
 func (c *MuxerBidiStream) EndOfStreamError() error {
 	return io.EOF
+}
+
+type CloseMessage struct {
+	Type string `json:"type"` // always "close"
+	Err  string `json:"err,omitempty"`
 }

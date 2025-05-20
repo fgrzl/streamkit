@@ -22,6 +22,7 @@ type MuxerMsg struct {
 // Each logical stream is identified by a ChannelID.
 type WebSocketMuxer struct {
 	Context    context.Context
+	name       string
 	conn       *websocket.Conn
 	channels   map[uuid.UUID]*MuxerBidiStream
 	channelsMu sync.RWMutex
@@ -30,10 +31,11 @@ type WebSocketMuxer struct {
 	node       node.Node
 }
 
-// NewWebSocketMuxer wraps a websocket.Conn and starts its internal reader loop.
-func NewWebSocketMuxer(ctx context.Context, conn *websocket.Conn) *WebSocketMuxer {
+// NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
+func NewClientWebSocketMuxer(ctx context.Context, conn *websocket.Conn) *WebSocketMuxer {
 	m := &WebSocketMuxer{
 		Context:  ctx,
+		name:     "client",
 		conn:     conn,
 		channels: make(map[uuid.UUID]*MuxerBidiStream),
 		done:     make(chan struct{}),
@@ -42,10 +44,11 @@ func NewWebSocketMuxer(ctx context.Context, conn *websocket.Conn) *WebSocketMuxe
 	return m
 }
 
-type Handler = func(context.Context, api.BidiStream)
-
-func NewServerWebSocketMuxer(conn *websocket.Conn, node node.Node) {
+// NewServerWebSocketMuxer will start a blocking read loop to keep the websocket connection open
+func NewServerWebSocketMuxer(ctx context.Context, node node.Node, conn *websocket.Conn) {
 	m := &WebSocketMuxer{
+		Context:  ctx,
+		name:     "server",
 		conn:     conn,
 		node:     node,
 		channels: make(map[uuid.UUID]*MuxerBidiStream),
@@ -83,14 +86,14 @@ func (m *WebSocketMuxer) register(channelID uuid.UUID) *MuxerBidiStream {
 		slog.Debug("muxer: stream unregistered", slog.String("channel_id", channelID.String()))
 	}
 
-	stream := NewMuxerBidiStream(sendFn, cleanup)
+	bidi := NewMuxerBidiStream(sendFn, cleanup)
 
 	m.channelsMu.Lock()
-	m.channels[channelID] = stream
+	m.channels[channelID] = bidi
 	m.channelsMu.Unlock()
 
 	slog.Debug("muxer: stream registered", slog.String("channel_id", channelID.String()))
-	return stream
+	return bidi
 }
 
 // readLoop continuously receives messages from the WebSocket,
@@ -105,18 +108,24 @@ func (m *WebSocketMuxer) readLoop() {
 		}
 
 		m.channelsMu.RLock()
-		stream, exists := m.channels[msg.ChannelID]
+		bidi, exists := m.channels[msg.ChannelID]
 		m.channelsMu.RUnlock()
 
 		if !exists {
-			stream = m.register(msg.ChannelID)
-			go m.node.Handle(m.Context, stream)
+			if m.node == nil {
+				// Client side the channel is registered before the read loop starts
+				// If this is a server side err then the node should not be nil
+				slog.ErrorContext(m.Context, "node does not exists")
+			}
+			bidi = m.register(msg.ChannelID)
+			go m.node.Handle(m.Context, bidi)
 		}
 
 		select {
-		case stream.RecvChan() <- msg.Payload:
-		case <-stream.closed:
-			slog.Debug("muxer: dropped message for closed stream", slog.String("channel_id", msg.ChannelID.String()))
+		case bidi.RecvChan() <- msg.Payload:
+			slog.DebugContext(m.Context, "muxer: sent message", slog.String("channel_id", msg.ChannelID.String()))
+		case <-bidi.closed:
+			slog.DebugContext(m.Context, "muxer: dropped message for closed stream", slog.String("channel_id", msg.ChannelID.String()))
 		}
 	}
 }

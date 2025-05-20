@@ -91,7 +91,7 @@ func (c *client) Peek(ctx context.Context, space, segment string) (*Entry, error
 	if err != nil {
 		return nil, err
 	}
-	defer stream.Close(nil)
+	//defer stream.Close(nil)
 	entry := &api.Entry{}
 	if err := stream.Decode(&entry); err != nil {
 		return nil, err
@@ -100,28 +100,28 @@ func (c *client) Peek(ctx context.Context, space, segment string) (*Entry, error
 }
 
 func (c *client) Produce(ctx context.Context, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
-	stream, err := c.provider.CallStream(ctx, &api.Produce{Space: space, Segment: segment})
+	bidi, err := c.provider.CallStream(ctx, &api.Produce{Space: space, Segment: segment})
 	if err != nil {
 		return enumerators.Error[*SegmentStatus](err)
 	}
 
-	go func(s api.BidiStream, entries enumerators.Enumerator[*Record]) {
+	go func(bidi api.BidiStream, entries enumerators.Enumerator[*Record]) {
 		defer entries.Dispose()
 		for entries.MoveNext() {
 			entry, err := entries.Current()
 			if err != nil {
-				s.CloseSend(err)
+				bidi.CloseSend(err)
 				return
 			}
-			if err := s.Encode(entry); err != nil {
-				s.CloseSend(err)
+			if err := bidi.Encode(entry); err != nil {
+				bidi.CloseSend(err)
 				return
 			}
 		}
-		s.CloseSend(nil)
-	}(stream, entries)
+		bidi.CloseSend(entries.Err())
+	}(bidi, entries)
 
-	return api.NewStreamEnumerator[*SegmentStatus](stream)
+	return api.NewStreamEnumerator[*SegmentStatus](bidi)
 }
 
 func (c *client) Publish(ctx context.Context, space, segment string, payload []byte, metadata map[string]string) error {
