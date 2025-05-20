@@ -7,6 +7,11 @@ import (
 	"github.com/fgrzl/streamkit/pkg/api"
 )
 
+// StoreFactory defines how to create new storage instances by name.
+type StoreFactory interface {
+	NewStore(ctx context.Context, store string) (Store, error)
+}
+
 type Store interface {
 	GetSpaces(ctx context.Context) enumerators.Enumerator[string]
 	ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry]
@@ -16,30 +21,3 @@ type Store interface {
 	Produce(ctx context.Context, args *api.Produce, entries enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus]
 	Close() error
 }
-
-type Service struct {
-	storage Store
-}
-
-func (s *Service) Consume(ctx context.Context, args *api.Consume) enumerators.Enumerator[*api.Entry] {
-	spaces := make([]enumerators.Enumerator[*api.Entry], 0, len(args.Offsets))
-	for space, offset := range args.Offsets {
-		spaces = append(spaces, s.storage.ConsumeSpace(ctx, &api.ConsumeSpace{
-			Space:        space,
-			MinTimestamp: args.MinTimestamp,
-			MaxTimestamp: args.MaxTimestamp,
-			Offset:       offset,
-		}))
-	}
-	return enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
-}
-
-/*
-
-- load the target node
-- if target node does not exist create it
-- dispatch
-
-
-
-*/

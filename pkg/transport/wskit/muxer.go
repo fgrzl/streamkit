@@ -1,10 +1,12 @@
 package wskit
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/node"
 	"github.com/google/uuid"
 	"golang.org/x/net/websocket"
 )
@@ -19,17 +21,19 @@ type MuxerMsg struct {
 // WebSocketMuxer multiplexes multiple logical bidirectional streams over a single WebSocket connection.
 // Each logical stream is identified by a ChannelID.
 type WebSocketMuxer struct {
+	Context    context.Context
 	conn       *websocket.Conn
 	channels   map[uuid.UUID]*MuxerBidiStream
 	channelsMu sync.RWMutex
 	writeMu    sync.Mutex
 	done       chan struct{}
-	dispatcher Dispatcher
+	node       node.Node
 }
 
 // NewWebSocketMuxer wraps a websocket.Conn and starts its internal reader loop.
-func NewWebSocketMuxer(conn *websocket.Conn) *WebSocketMuxer {
+func NewWebSocketMuxer(ctx context.Context, conn *websocket.Conn) *WebSocketMuxer {
 	m := &WebSocketMuxer{
+		Context:  ctx,
 		conn:     conn,
 		channels: make(map[uuid.UUID]*MuxerBidiStream),
 		done:     make(chan struct{}),
@@ -38,14 +42,14 @@ func NewWebSocketMuxer(conn *websocket.Conn) *WebSocketMuxer {
 	return m
 }
 
-type Dispatcher = func(api.BidiStream)
+type Handler = func(context.Context, api.BidiStream)
 
-func NewServerWebSocketMuxer(conn *websocket.Conn, dispatcher Dispatcher) {
+func NewServerWebSocketMuxer(conn *websocket.Conn, node node.Node) {
 	m := &WebSocketMuxer{
-		conn:       conn,
-		channels:   make(map[uuid.UUID]*MuxerBidiStream),
-		done:       make(chan struct{}),
-		dispatcher: dispatcher,
+		conn:     conn,
+		node:     node,
+		channels: make(map[uuid.UUID]*MuxerBidiStream),
+		done:     make(chan struct{}),
 	}
 	m.readLoop()
 }
@@ -106,7 +110,7 @@ func (m *WebSocketMuxer) readLoop() {
 
 		if !exists {
 			stream = m.register(msg.ChannelID)
-			go m.dispatcher(stream)
+			go m.node.Handle(m.Context, stream)
 		}
 
 		select {

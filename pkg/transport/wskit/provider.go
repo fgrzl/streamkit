@@ -32,7 +32,7 @@ func NewBidiStreamProvider(addr, token string) api.BidiStreamProvider {
 
 // CallStream opens or reuses a muxed stream over the WebSocket for a single logical interaction.
 func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, msg api.Routeable) (api.BidiStream, error) {
-	muxer, err := p.getOrCreateMuxer()
+	muxer, err := p.getOrCreateMuxer(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +49,7 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, msg api.Ro
 }
 
 // getOrCreateMuxer dials and initializes the WebSocket muxer if needed.
-func (p *WebSocketBidiStreamProvider) getOrCreateMuxer() (*WebSocketMuxer, error) {
+func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (*WebSocketMuxer, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -62,7 +62,7 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer() (*WebSocketMuxer, error
 		return nil, err
 	}
 
-	muxer := NewWebSocketMuxer(conn)
+	muxer := NewWebSocketMuxer(ctx, conn)
 	p.muxer = muxer
 	return muxer, nil
 }

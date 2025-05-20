@@ -2,7 +2,6 @@ package test
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,12 +9,11 @@ import (
 	"time"
 
 	"github.com/fgrzl/claims"
-	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/mux"
 	"github.com/fgrzl/streamkit"
-	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/auth/jwtkit"
-	"github.com/fgrzl/streamkit/pkg/storage"
+	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/storage/azure"
 	"github.com/fgrzl/streamkit/pkg/transport/wskit"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
@@ -33,7 +31,30 @@ func SetupTestServer(t *testing.T) *httptest.Server {
 		Secret: secret,
 	}
 
+	// Default Azurite configuration for local testing
+	accountName := "devstoreaccount1"
+	accountKey := "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+	endpoint := "http://127.0.0.1:10002/devstoreaccount1"
+
+	credential, err := azure.NewSharedKeyCredential(accountName, accountKey)
+	if err != nil {
+		panic(err)
+	}
+
+	options := &azure.AzureStoreOptions{
+		Prefix:              "test",
+		Endpoint:            endpoint,
+		SharedKeyCredential: credential,
+		AllowInsecureHTTP:   true,
+	}
+
+	factory, err := azure.NewStoreFactory(options)
+	require.NoError(t, err)
+
+	nodeManager := node.NewNodeManager(factory)
+
 	router := mux.NewRouter()
+
 	router.UseAuthentication(&mux.AuthenticationOptions{
 		Validate: func(token string) (claims.Principal, bool) {
 			claimsMap, err := validator.Validate(token)
@@ -44,43 +65,24 @@ func SetupTestServer(t *testing.T) *httptest.Server {
 			return jwtkit.NewClaimsPrincipal(claimsMap), true
 		},
 	})
+
 	router.UseAuthorization(&mux.AuthorizationOptions{})
+
 	router.Healthz().AllowAnonymous()
+
 	router.GET("/ws", func(c *mux.RouteContext) {
-
-		// at this point we should have the claims.Principal
-		// get the tenant_id from the claims principal
-		// get or create a service node
-
 		tenantID, ok := c.User.Claims()["tenant_id"]
-		if(!ok){
+		if !ok {
 			c.Forbidden("missing tenant")
 			return
 		}
-		provider := 
-
-		var store storage.Store
-
+		node, err := nodeManager.GetOrCreate(c, tenantID.Value())
+		require.NoError(t, err)
 		websocket.Handler(func(ws *websocket.Conn) {
-			wskit.NewServerWebSocketMuxer(ws, func(bidiStream api.BidiStream) {
-
-				envelope := &polymorphic.Envelope{}
-				if err := bidiStream.Decode(envelope); err != nil {
-					bidiStream.Close(err)
-				}
-
-				// get the node for this tenant
-				switch v := envelope.Content.(type) {
-				case *api.Peek:
-					store.Peek(c, v.Space, v.Segment)
-
-				default:
-					bidiStream.Close(fmt.Errorf("invalid request msg"))
-				}
-
-			})
+			wskit.NewServerWebSocketMuxer(ws, node)
 		}).ServeHTTP(c.Response, c.Request)
 	})
+
 	server := httptest.NewServer(router)
 	t.Cleanup(func() {
 		server.Close()

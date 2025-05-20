@@ -12,7 +12,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/fgrzl/streamkit/internal"
 	"github.com/fgrzl/streamkit/pkg/storage"
-	"github.com/fgrzl/streams/broker"
 )
 
 const (
@@ -31,14 +30,14 @@ type AzureStoreOptions struct {
 
 // StoreFactory creates Azure-backed stores using shared credentials.
 type StoreFactory struct {
-	options AzureStoreOptions
+	options *AzureStoreOptions
 	cred    azcore.TokenCredential
 	once    sync.Once
 	initErr error
 }
 
 // NewStoreFactory validates options and initializes credentials.
-func NewStoreFactory(bus broker.Bus, options AzureStoreOptions) (*StoreFactory, error) {
+func NewStoreFactory(options *AzureStoreOptions) (*StoreFactory, error) {
 	if options.Endpoint == "" {
 		return nil, errors.New("azure store factory: endpoint is required")
 	}
