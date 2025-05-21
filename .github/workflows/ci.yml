@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+jobs:
+  BuildAndTest:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.24.0
+
+      - name: Install Dependencies
+        run: go mod tidy
+
+      - name: Build Project
+        run: go build ./...
+
+      - name: Run Tests
+        run: go test ./... -v -coverprofile=coverage.out
+
+      - name: Workflow Cleanup
+        uses: fgrzl/workflow-cleanup@v2

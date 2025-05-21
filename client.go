@@ -158,12 +158,12 @@ func (c *client) Publish(ctx context.Context, space, segment string, payload []b
 }
 
 func (c *client) SubscribeToSpace(ctx context.Context, space string, handler func(*SegmentStatus)) (api.Subscription, error) {
-	args := &api.SubscribeToSpaceNotification{Space: space}
+	args := &api.SubscribeToSegmentStatus{Space: space, Segment: "*"}
 	return c.subscribeStream(ctx, args, handler)
 }
 
 func (c *client) SubscribeToSegment(ctx context.Context, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error) {
-	args := &api.SubscribeToSegmentNotification{Space: space, Segment: segment}
+	args := &api.SubscribeToSegmentStatus{Space: space, Segment: segment}
 	return c.subscribeStream(ctx, args, handler)
 }
 

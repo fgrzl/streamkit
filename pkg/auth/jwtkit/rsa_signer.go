@@ -28,6 +28,12 @@ type RSASigner struct {
 }
 
 func (s *RSASigner) CreateToken(claims jwt.MapClaims, ttl time.Duration) (string, error) {
+
+	// Inject 'exp' if not already set
+	if _, ok := claims["exp"]; !ok && ttl > 0 {
+		claims["exp"] = time.Now().Add(ttl).Unix()
+	}
+
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	return token.SignedString(s.PrivateKey)
 }

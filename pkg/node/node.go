@@ -3,11 +3,14 @@ package node
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/json/polymorphic"
+	"github.com/fgrzl/messaging"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/storage"
+	"github.com/google/uuid"
 )
 
 type Node interface {
@@ -15,14 +18,18 @@ type Node interface {
 	Close()
 }
 
-func NewNode(store storage.Store) Node {
+func NewNode(storeID uuid.UUID, store storage.Store, bus messaging.MessageBus) Node {
 	return &defaultNode{
-		store: store,
+		storeID: storeID,
+		store:   store,
+		bus:     bus,
 	}
 }
 
 type defaultNode struct {
-	store storage.Store
+	storeID uuid.UUID
+	store   storage.Store
+	bus     messaging.MessageBus
 }
 
 func (n *defaultNode) Close() {
@@ -58,6 +65,8 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 		n.handlePeek(ctx, args, bidi)
 	case *api.Produce:
 		n.handleProduce(ctx, args, bidi)
+	case *api.SubscribeToSegmentStatus:
+		n.handleSubscribe(ctx, args, bidi)
 	default:
 		bidi.Close(fmt.Errorf("invalid request msg type: %T", envelope.Content))
 	}
@@ -124,8 +133,23 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 			bidi.CloseSend(err)
 			return
 		}
+
+		notification := &SegmentNotification{
+			StoreID:       n.storeID,
+			SegmentStatus: result,
+		}
+		if err := n.bus.Notify(notification); err != nil {
+			slog.WarnContext(ctx, err.Error())
+		}
 	}
-	bidi.CloseSend(results.Err())
+
+	if err := results.Err(); err != nil {
+		slog.ErrorContext(ctx, "produce failed", "err", err)
+		bidi.CloseSend(err)
+		return
+	}
+
+	bidi.CloseSend(nil)
 }
 
 func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi api.BidiStream) {
@@ -140,6 +164,36 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 	}
 	enumerator := enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
 	streamEntries(ctx, enumerator, bidi)
+}
+
+func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
+
+	if n.bus == nil {
+		slog.WarnContext(ctx, "the message bus was not configured.")
+		bidi.CloseSend(fmt.Errorf("the message bus was not configured"))
+		return
+	}
+
+	route := GetSegmentNotificationRoute(n.storeID, args.Space)
+	sub, err := messaging.Subscribe(n.bus, route, func(ctx context.Context, msg *SegmentNotification) error {
+
+		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
+		if match {
+			return bidi.Encode(msg.SegmentStatus)
+		}
+		return nil
+	})
+
+	if err != nil {
+		bidi.CloseSend(err)
+		return
+	}
+
+	// Clean up on bidi close
+	go func() {
+		<-bidi.Closed() // blocks until closed
+		sub.Unsubscribe()
+	}()
 }
 
 func streamNames(ctx context.Context, enumerator enumerators.Enumerator[string], bidi api.BidiStream) {

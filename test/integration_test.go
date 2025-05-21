@@ -38,7 +38,7 @@ func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 		Secret: secret,
 	}
 
-	nodeManager := node.NewNodeManager(factory)
+	nodeManager := node.NewNodeManager(nil, factory)
 
 	router := mux.NewRouter()
 	router.UseAuthentication(&mux.AuthenticationOptions{

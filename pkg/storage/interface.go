@@ -5,11 +5,12 @@ import (
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/google/uuid"
 )
 
 // StoreFactory defines how to create new storage instances by name.
 type StoreFactory interface {
-	NewStore(ctx context.Context, store string) (Store, error)
+	NewStore(ctx context.Context, storeID uuid.UUID) (Store, error)
 }
 
 type Store interface {

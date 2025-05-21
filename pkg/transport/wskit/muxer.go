@@ -111,21 +111,24 @@ func (m *WebSocketMuxer) readLoop() {
 		bidi, exists := m.channels[msg.ChannelID]
 		m.channelsMu.RUnlock()
 
+		ctx := node.WithChannelID(m.Context, msg.ChannelID)
+
 		if !exists {
 			if m.node == nil {
 				// Client side the channel is registered before the read loop starts
 				// If this is a server side err then the node should not be nil
-				slog.ErrorContext(m.Context, "node does not exists")
+				slog.ErrorContext(ctx, "node does not exists")
 			}
 			bidi = m.register(msg.ChannelID)
-			go m.node.Handle(m.Context, bidi)
+
+			go m.node.Handle(ctx, bidi)
 		}
 
 		select {
 		case bidi.RecvChan() <- msg.Payload:
-			slog.DebugContext(m.Context, "muxer: sent message", slog.String("channel_id", msg.ChannelID.String()))
+			slog.DebugContext(ctx, "muxer: sent message", slog.String("channel_id", msg.ChannelID.String()))
 		case <-bidi.closed:
-			slog.DebugContext(m.Context, "muxer: dropped message for closed stream", slog.String("channel_id", msg.ChannelID.String()))
+			slog.DebugContext(ctx, "muxer: dropped message for closed stream", slog.String("channel_id", msg.ChannelID.String()))
 		}
 	}
 }

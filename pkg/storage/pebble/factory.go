@@ -5,8 +5,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/fgrzl/streamkit/internal"
+	"github.com/fgrzl/streamkit/internal/cache"
 	"github.com/fgrzl/streamkit/pkg/storage"
+	"github.com/google/uuid"
 )
 
 var (
@@ -30,8 +31,8 @@ func NewStoreFactory(options *PebbleStoreOptions) (*StoreFactory, error) {
 	return f, nil
 }
 
-func (f *StoreFactory) NewStore(ctx context.Context, name string) (storage.Store, error) {
-	path := filepath.Join(f.options.Path, name)
-	cache := internal.NewExpiringCache(CacheTTL, CacheCleanupInterval)
+func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage.Store, error) {
+	path := filepath.Join(f.options.Path, storeID.String())
+	cache := cache.NewExpiringCache(CacheTTL, CacheCleanupInterval)
 	return NewPebbleStore(path, cache)
 }

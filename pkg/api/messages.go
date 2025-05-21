@@ -16,27 +16,18 @@ func init() {
 	polymorphic.Register(func() *Peek { return &Peek{} })
 	polymorphic.Register(func() *Produce { return &Produce{} })
 	polymorphic.Register(func() *SegmentStatus { return &SegmentStatus{} })
-	polymorphic.Register(func() *SubscribeToSpaceNotification { return &SubscribeToSpaceNotification{} })
-	polymorphic.Register(func() *SubscribeToSegmentNotification { return &SubscribeToSegmentNotification{} })
+	polymorphic.Register(func() *SubscribeToSegmentStatus { return &SubscribeToSegmentStatus{} })
 }
 
 // ─── Notification & Subscription ───────────────────────────────────────────────
 
-type SubscribeToSpaceNotification struct {
-	Space string `json:"space"`
-}
-
-func (m *SubscribeToSpaceNotification) GetDiscriminator() string {
-	return "streamkit://api/v1/subscribe_to_space"
-}
-
-type SubscribeToSegmentNotification struct {
+type SubscribeToSegmentStatus struct {
 	Space   string `json:"space"`
 	Segment string `json:"segment"`
 }
 
-func (m *SubscribeToSegmentNotification) GetDiscriminator() string {
-	return "streamkit://api/v1/subscribe_to_segment"
+func (m *SubscribeToSegmentStatus) GetDiscriminator() string {
+	return "streamkit://api/v1/subscribe_to_segment_status"
 }
 
 type SegmentStatus struct {

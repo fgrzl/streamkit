@@ -119,6 +119,10 @@ func (c *MuxerBidiStream) IsClosed() bool {
 	}
 }
 
+func (c *MuxerBidiStream) Closed() <-chan struct{} {
+	return c.closed
+}
+
 // EndOfStreamError returns the canonical EOF sentinel.
 func (c *MuxerBidiStream) EndOfStreamError() error {
 	return io.EOF

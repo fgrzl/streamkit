@@ -8,11 +8,11 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.3.0
 	github.com/cockroachdb/pebble/v2 v2.0.3
 	github.com/fgrzl/claims v0.0.0-20250323164204-b3eff8063c51
-	github.com/fgrzl/enumerators v0.0.0-20250410102914-6a54f0117505
+	github.com/fgrzl/enumerators v0.1.0-alpha.19
 	github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d
 	github.com/fgrzl/lexkey v0.0.0-20250404134045-06756616f02b
+	github.com/fgrzl/messaging v0.0.1-alpha.22
 	github.com/fgrzl/mux v0.0.0-20250519162615-fcedc56af9d5
-	github.com/fgrzl/streams v0.0.0-20250518171816-70f7a2409d1a
 	github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d
 	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/golang/snappy v1.0.0
@@ -27,7 +27,7 @@ require (
 	github.com/DataDog/zstd v1.5.7 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cockroachdb/crlib v0.0.0-20250407164549-d205a3fb157a // indirect
+	github.com/cockroachdb/crlib v0.0.0-20250521014800-1789bc709bcb // indirect
 	github.com/cockroachdb/errors v1.12.0 // indirect
 	github.com/cockroachdb/fifo v0.0.0-20240816210425-c5d0cb0b6fc0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20241215232642-bb51bb14a506 // indirect
@@ -57,9 +57,9 @@ require (
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.60.0 // indirect
-	go.opentelemetry.io/otel v1.35.0 // indirect
-	go.opentelemetry.io/otel/metric v1.35.0 // indirect
-	go.opentelemetry.io/otel/trace v1.35.0 // indirect
+	go.opentelemetry.io/otel v1.36.0 // indirect
+	go.opentelemetry.io/otel/metric v1.36.0 // indirect
+	go.opentelemetry.io/otel/trace v1.36.0 // indirect
 	golang.org/x/crypto v0.38.0 // indirect
 	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
 	golang.org/x/sys v0.33.0 // indirect

@@ -39,8 +39,11 @@ func (v *RSAValidator) Validate(tokenStr string) (jwt.MapClaims, error) {
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return nil, fmt.Errorf("invalid claims map")
+	if !ok || !token.Valid {
+		return nil, fmt.Errorf("invalid token claims")
+	}
+	if err := ValidateStandardClaims(claims); err != nil {
+		return nil, err
 	}
 
 	return claims, nil

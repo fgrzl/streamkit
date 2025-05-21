@@ -21,12 +21,17 @@ type webSocketServer struct {
 }
 
 func (s *webSocketServer) connect(c *mux.RouteContext) {
-	tenantID, ok := c.User.Claims()["tenant_id"]
+	tenantIDClaim, ok := c.User.Claims()["tenant_id"]
 	if !ok {
-		c.Forbidden("missing tenant")
+		c.Forbidden("missing tenant_id claim")
 		return
 	}
-	node, err := s.manager.GetOrCreate(c, tenantID.Value())
+	tenantID, ok := tenantIDClaim.UUIDValue()
+	if !ok {
+		c.BadRequest("invalid tenant_id claim", "The tenant id must be an valid UUID")
+		return
+	}
+	node, err := s.manager.GetOrCreate(c, tenantID)
 	if err != nil {
 		c.ServerError("Could not connect", err.Error())
 		return

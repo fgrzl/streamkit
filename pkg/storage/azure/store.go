@@ -15,7 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
-	"github.com/fgrzl/streamkit/internal"
+	"github.com/fgrzl/streamkit/internal/cache"
 	"github.com/fgrzl/streamkit/internal/codec"
 	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -78,7 +78,7 @@ type batchEntry struct {
 	EncodedValue []byte
 }
 
-func NewAzureStore(ctx context.Context, client *aztables.Client, cache *internal.ExpiringCache) (*AzureStore, error) {
+func NewAzureStore(ctx context.Context, client *aztables.Client, cache *cache.ExpiringCache) (*AzureStore, error) {
 	store := &AzureStore{
 		client: client,
 		cache:  cache,
@@ -96,7 +96,7 @@ func NewAzureStore(ctx context.Context, client *aztables.Client, cache *internal
 
 type AzureStore struct {
 	client    *aztables.Client
-	cache     *internal.ExpiringCache
+	cache     *cache.ExpiringCache
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 }
@@ -467,7 +467,7 @@ func (s *AzureStore) waitForTasks(timeout time.Duration) bool {
 }
 
 func (s *AzureStore) createTableIfNotExists(ctx context.Context) error {
-	_, err := s.client.CreateTable(ctx, nil)
+	_, err := s.client.CreateTable(ctx, &aztables.CreateTableOptions{})
 	if err == nil {
 		return nil
 	}

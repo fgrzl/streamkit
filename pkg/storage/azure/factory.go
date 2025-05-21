@@ -10,8 +10,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
-	"github.com/fgrzl/streamkit/internal"
+	"github.com/fgrzl/streamkit/internal/cache"
 	"github.com/fgrzl/streamkit/pkg/storage"
+	"github.com/google/uuid"
 )
 
 const (
@@ -56,12 +57,12 @@ func NewStoreFactory(options *AzureStoreOptions) (*StoreFactory, error) {
 }
 
 // NewStore returns a new Azure-backed store scoped to a sanitized table name.
-func (f *StoreFactory) NewStore(ctx context.Context, store string) (storage.Store, error) {
+func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage.Store, error) {
 	if f.initErr != nil {
 		return nil, fmt.Errorf("azure store factory: credentials not initialized: %w", f.initErr)
 	}
 
-	tableName := sanitizeTableName(f.options.Prefix + store)
+	tableName := sanitizeTableName(f.options.Prefix + storeID.String())
 	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(f.options.Endpoint, "/"), tableName)
 
 	clientOpts := aztables.ClientOptions{}
@@ -79,7 +80,7 @@ func (f *StoreFactory) NewStore(ctx context.Context, store string) (storage.Stor
 		return nil, err
 	}
 
-	cache := internal.NewExpiringCache(CacheTTL, CacheCleanupInterval)
+	cache := cache.NewExpiringCache(CacheTTL, CacheCleanupInterval)
 	return NewAzureStore(ctx, client, cache)
 }
 

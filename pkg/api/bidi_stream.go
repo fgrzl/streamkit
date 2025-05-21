@@ -6,4 +6,6 @@ type BidiStream interface {
 	CloseSend(error) error
 	Close(error)
 	EndOfStreamError() error
+
+	Closed() <-chan struct{}
 }

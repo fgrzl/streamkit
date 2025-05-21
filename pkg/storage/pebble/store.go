@@ -11,7 +11,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
-	"github.com/fgrzl/streamkit/internal"
+	"github.com/fgrzl/streamkit/internal/cache"
 	"github.com/fgrzl/streamkit/internal/codec"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/timestamp"
@@ -20,11 +20,11 @@ import (
 
 type PebbleStore struct {
 	db        *pebble.DB
-	cache     *internal.ExpiringCache
+	cache     *cache.ExpiringCache
 	closeOnce sync.Once
 }
 
-func NewPebbleStore(path string, cache *internal.ExpiringCache) (*PebbleStore, error) {
+func NewPebbleStore(path string, cache *cache.ExpiringCache) (*PebbleStore, error) {
 	dbPath := filepath.Join(path, "streams")
 	db, err := pebble.Open(dbPath, &pebble.Options{})
 	if err != nil {
