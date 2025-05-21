@@ -47,53 +47,53 @@ type client struct {
 }
 
 func (c *client) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
-	stream, err := c.provider.CallStream(ctx, &api.GetSpaces{})
+	bidi, err := c.provider.CallStream(ctx, &api.GetSpaces{})
 	if err != nil {
 		return enumerators.Error[string](err)
 	}
-	return api.NewStreamEnumerator[string](stream)
+	return api.NewStreamEnumerator[string](bidi)
 }
 
 func (c *client) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
-	stream, err := c.provider.CallStream(ctx, &api.GetSegments{Space: space})
+	bidi, err := c.provider.CallStream(ctx, &api.GetSegments{Space: space})
 	if err != nil {
 		return enumerators.Error[string](err)
 	}
-	return api.NewStreamEnumerator[string](stream)
+	return api.NewStreamEnumerator[string](bidi)
 }
 
 func (c *client) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
-	stream, err := c.provider.CallStream(ctx, args)
+	bidi, err := c.provider.CallStream(ctx, args)
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
-	return api.NewStreamEnumerator[*Entry](stream)
+	return api.NewStreamEnumerator[*Entry](bidi)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
-	stream, err := c.provider.CallStream(ctx, args)
+	bidi, err := c.provider.CallStream(ctx, args)
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
-	return api.NewStreamEnumerator[*Entry](stream)
+	return api.NewStreamEnumerator[*Entry](bidi)
 }
 
 func (c *client) Consume(ctx context.Context, args *api.Consume) enumerators.Enumerator[*Entry] {
-	stream, err := c.provider.CallStream(ctx, args)
+	bidi, err := c.provider.CallStream(ctx, args)
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
-	return api.NewStreamEnumerator[*Entry](stream)
+	return api.NewStreamEnumerator[*Entry](bidi)
 }
 
 func (c *client) Peek(ctx context.Context, space, segment string) (*Entry, error) {
-	stream, err := c.provider.CallStream(ctx, &api.Peek{Space: space, Segment: segment})
+	bidi, err := c.provider.CallStream(ctx, &api.Peek{Space: space, Segment: segment})
 	if err != nil {
 		return nil, err
 	}
 	//defer stream.Close(nil)
 	entry := &api.Entry{}
-	if err := stream.Decode(&entry); err != nil {
+	if err := bidi.Decode(&entry); err != nil {
 		return nil, err
 	}
 	return entry, nil
@@ -130,11 +130,11 @@ func (c *client) Publish(ctx context.Context, space, segment string, payload []b
 		return err
 	}
 
-	stream, err := c.provider.CallStream(ctx, &api.Produce{Space: space, Segment: segment})
+	bidi, err := c.provider.CallStream(ctx, &api.Produce{Space: space, Segment: segment})
 	if err != nil {
 		return err
 	}
-	defer stream.Close(nil)
+	defer bidi.Close(nil)
 
 	record := &api.Record{
 		Sequence: peek.Sequence + 1,
@@ -142,15 +142,15 @@ func (c *client) Publish(ctx context.Context, space, segment string, payload []b
 		Metadata: metadata,
 	}
 
-	if err := stream.Encode(record); err != nil {
-		stream.CloseSend(err)
+	if err := bidi.Encode(record); err != nil {
+		bidi.CloseSend(err)
 		return err
 	}
-	stream.CloseSend(nil)
+	bidi.CloseSend(nil)
 
-	enumerator := api.NewStreamEnumerator[*SegmentStatus](stream)
+	enumerator := api.NewStreamEnumerator[*SegmentStatus](bidi)
 	if err := enumerators.Consume(enumerator); err != nil {
-		stream.Close(err)
+		bidi.Close(err)
 		return err
 	}
 
@@ -168,7 +168,7 @@ func (c *client) SubscribeToSegment(ctx context.Context, space, segment string, 
 }
 
 func (c *client) subscribeStream(ctx context.Context, initMsg api.Routeable, handler func(*SegmentStatus)) (api.Subscription, error) {
-	stream, err := c.provider.CallStream(ctx, initMsg)
+	bidi, err := c.provider.CallStream(ctx, initMsg)
 	if err != nil {
 		return nil, err
 	}
@@ -182,13 +182,13 @@ func (c *client) subscribeStream(ctx context.Context, initMsg api.Routeable, han
 			select {
 			case <-ctx.Done():
 				slog.DebugContext(ctx, "subscription canceled")
-				stream.Close(ctx.Err())
+				bidi.Close(ctx.Err())
 				return
 			default:
 				var status SegmentStatus
-				if err := stream.Decode(&status); err != nil {
+				if err := bidi.Decode(&status); err != nil {
 					slog.ErrorContext(ctx, "subscription closed", "err", err)
-					stream.Close(err)
+					bidi.Close(err)
 					return
 				}
 				handler(&status)

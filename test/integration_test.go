@@ -29,7 +29,7 @@ import (
 
 var secret = []byte("top-secret")
 var tester = jwt.MapClaims{
-	"tenant_id": "test",
+	"tenant_id": uuid.NewString(),
 }
 
 func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
@@ -79,7 +79,7 @@ func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 	url, err := url.Parse(server.URL)
 	require.NoError(t, err)
 
-	addr := "ws://" + url.Host + "/ws"
+	addr := "ws://" + url.Host
 	provider := wskit.NewBidiStreamProvider(addr, token)
 	client := streamkit.NewClient(provider)
 
@@ -125,14 +125,14 @@ func pebbleTestHarness(t *testing.T) *TestHarness {
 
 func configurations(t *testing.T) map[string]*TestHarness {
 	return map[string]*TestHarness{
-		//"azure":  azureTestHarness(t),
+		"azure":  azureTestHarness(t),
 		"pebble": pebbleTestHarness(t),
 	}
 }
 
 func TestMultipleCallStreams(t *testing.T) {
 	for name, h := range configurations(t) {
-		t.Run("should produce "+name, func(t *testing.T) {
+		t.Run("should allow for multiplexed calls "+name, func(t *testing.T) {
 			for i := range 3 {
 				// Arrange
 				ctx := t.Context()

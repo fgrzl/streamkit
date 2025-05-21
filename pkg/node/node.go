@@ -138,8 +138,12 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 			StoreID:       n.storeID,
 			SegmentStatus: result,
 		}
-		if err := n.bus.Notify(notification); err != nil {
-			slog.WarnContext(ctx, err.Error())
+		if n.bus == nil {
+			slog.WarnContext(ctx, "the message bus was not configured")
+		} else {
+			if err := n.bus.Notify(notification); err != nil {
+				slog.WarnContext(ctx, err.Error())
+			}
 		}
 	}
 
