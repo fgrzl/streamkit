@@ -49,8 +49,8 @@ github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2
 github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
 github.com/fgrzl/claims v0.0.0-20250323164204-b3eff8063c51 h1:oD5J85If/i7VRv0PL7QjM0PyUkcMpp9OLk92p6cn+B0=
 github.com/fgrzl/claims v0.0.0-20250323164204-b3eff8063c51/go.mod h1:PoFYgZTF4mbZlixISlCW5tXwymHusjGf9QAu5Q0FWCU=
-github.com/fgrzl/enumerators v0.1.0-alpha.19 h1:PxvfK9gWud12i5SPZdnDnD46GaEoIIAJPrzc3wEw4dg=
-github.com/fgrzl/enumerators v0.1.0-alpha.19/go.mod h1:UnOxEAJRwe/NlSYMRCvMp1NqsmwR7EVpI9xAQsew9MM=
+github.com/fgrzl/enumerators v0.1.0-alpha.20 h1:pppcISda1SBUQ8xgN3LCybTRB9REavRCfSOoyyZrh2k=
+github.com/fgrzl/enumerators v0.1.0-alpha.20/go.mod h1:gqcOfcKqWMh6z3TeDXwDvPD3YZ/BKSPuYH6FLCIo3RE=
 github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d h1:97aOsKoAGNaq7dpkPg1U4T04JBVzgc5rpIgIRv/MoVQ=
 github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d/go.mod h1:L7IAn4wOCSsQGJ44XZePleqf7/tAZPgBDC6A3Egv9e8=
 github.com/fgrzl/lexkey v0.0.0-20250404134045-06756616f02b h1:C8VidHCs+ETGfWPKmilU/5XlrkMmBl8XZEtSUQSPNwU=
