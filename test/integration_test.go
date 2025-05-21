@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/fgrzl/claims"
+	"github.com/fgrzl/claims/jwtkit"
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/mux"
 	"github.com/fgrzl/streamkit"
-	"github.com/fgrzl/streamkit/pkg/auth/jwtkit"
 	"github.com/fgrzl/streamkit/pkg/node"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streamkit/pkg/storage/azure"

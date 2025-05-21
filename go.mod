@@ -7,12 +7,12 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.0
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.3.0
 	github.com/cockroachdb/pebble/v2 v2.0.3
-	github.com/fgrzl/claims v0.0.0-20250323164204-b3eff8063c51
+	github.com/fgrzl/claims v0.0.1-alpha.4
 	github.com/fgrzl/enumerators v0.1.0-alpha.20
 	github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d
 	github.com/fgrzl/lexkey v0.0.0-20250404134045-06756616f02b
 	github.com/fgrzl/messaging v0.0.1-alpha.22
-	github.com/fgrzl/mux v0.0.0-20250519162615-fcedc56af9d5
+	github.com/fgrzl/mux v0.0.1-alpha.24
 	github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d
 	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/golang/snappy v1.0.0
