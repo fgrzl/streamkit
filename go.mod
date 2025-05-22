@@ -11,7 +11,7 @@ require (
 	github.com/fgrzl/enumerators v0.1.0-alpha.20
 	github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d
 	github.com/fgrzl/lexkey v0.0.0-20250404134045-06756616f02b
-	github.com/fgrzl/messaging v0.0.1-alpha.22
+	github.com/fgrzl/messaging v0.0.1-alpha.24
 	github.com/fgrzl/mux v0.0.1-alpha.25
 	github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d
 	github.com/golang-jwt/jwt/v5 v5.2.2
