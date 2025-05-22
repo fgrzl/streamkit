@@ -25,6 +25,10 @@ type (
 	Produce        = api.Produce
 )
 
+type ClientFactory interface {
+	Get(ctx context.Context) (Client, error)
+}
+
 type Client interface {
 	GetSpaces(ctx context.Context) enumerators.Enumerator[string]
 	GetSegments(ctx context.Context, space string) enumerators.Enumerator[string]
