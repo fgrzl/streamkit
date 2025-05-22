@@ -180,13 +180,20 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
 
 	if n.busFactory == nil {
-		slog.WarnContext(ctx, "the message bus was not configured.")
+		slog.WarnContext(ctx, "the message bus factory was not configured")
 		bidi.CloseSend(fmt.Errorf("the message bus was not configured"))
 		return
 	}
 
+	bus, err := n.busFactory.Get(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to connect to the message bus")
+		bidi.CloseSend(fmt.Errorf("failed to connect to the message bus"))
+		return
+	}
+
 	route := GetSegmentNotificationRoute(n.storeID, args.Space)
-	sub, err := messaging.Subscribe(n.busFactory, route, func(ctx context.Context, msg *SegmentNotification) error {
+	sub, err := messaging.Subscribe(bus, route, func(ctx context.Context, msg *SegmentNotification) error {
 
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {
