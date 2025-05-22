@@ -17,19 +17,19 @@ type NodeManager interface {
 }
 
 type nodeManager struct {
-	mu        sync.RWMutex
-	bus       messaging.MessageBus
-	factory   storage.StoreFactory
-	nodes     map[uuid.UUID]Node
-	closeOnce sync.Once
+	mu           sync.RWMutex
+	busFactory   messaging.MessageBusFactory
+	storeFactory storage.StoreFactory
+	nodes        map[uuid.UUID]Node
+	closeOnce    sync.Once
 }
 
 // NewNodeManager creates a new NodeManager with the given factory.
-func NewNodeManager(bus messaging.MessageBus, factory storage.StoreFactory) NodeManager {
+func NewNodeManager(busFactory messaging.MessageBusFactory, storeFactory storage.StoreFactory) NodeManager {
 	return &nodeManager{
-		bus:     bus,
-		factory: factory,
-		nodes:   make(map[uuid.UUID]Node),
+		busFactory:   busFactory,
+		storeFactory: storeFactory,
+		nodes:        make(map[uuid.UUID]Node),
 	}
 }
 
@@ -49,12 +49,12 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 		return s, nil
 	}
 
-	storeInstance, err := m.factory.NewStore(ctx, storeID)
+	store, err := m.storeFactory.NewStore(ctx, storeID)
 	if err != nil {
 		return nil, err
 	}
 
-	node := NewNode(storeID, storeInstance, m.bus)
+	node := NewNode(storeID, store, m.busFactory)
 	m.nodes[storeID] = node
 	return node, nil
 }

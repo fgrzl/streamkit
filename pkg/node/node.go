@@ -18,18 +18,18 @@ type Node interface {
 	Close()
 }
 
-func NewNode(storeID uuid.UUID, store storage.Store, bus messaging.MessageBus) Node {
+func NewNode(storeID uuid.UUID, store storage.Store, busFactory messaging.MessageBusFactory) Node {
 	return &defaultNode{
-		storeID: storeID,
-		store:   store,
-		bus:     bus,
+		storeID:    storeID,
+		store:      store,
+		busFactory: busFactory,
 	}
 }
 
 type defaultNode struct {
-	storeID uuid.UUID
-	store   storage.Store
-	bus     messaging.MessageBus
+	storeID    uuid.UUID
+	store      storage.Store
+	busFactory messaging.MessageBusFactory
 }
 
 func (n *defaultNode) Close() {
@@ -138,11 +138,18 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 			StoreID:       n.storeID,
 			SegmentStatus: result,
 		}
-		if n.bus == nil {
-			slog.WarnContext(ctx, "the message bus was not configured")
+
+		if n.busFactory == nil {
+			slog.WarnContext(ctx, "the message bus factory was not configured")
 		} else {
-			if err := n.bus.Notify(notification); err != nil {
-				slog.WarnContext(ctx, err.Error())
+			bus, err := n.busFactory.Get(ctx)
+			if err != nil {
+				slog.WarnContext(ctx, "the message bus factory was not configured")
+			} else {
+
+				if err := bus.Notify(notification); err != nil {
+					slog.WarnContext(ctx, err.Error())
+				}
 			}
 		}
 	}
@@ -172,14 +179,14 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 
 func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
 
-	if n.bus == nil {
+	if n.busFactory == nil {
 		slog.WarnContext(ctx, "the message bus was not configured.")
 		bidi.CloseSend(fmt.Errorf("the message bus was not configured"))
 		return
 	}
 
 	route := GetSegmentNotificationRoute(n.storeID, args.Space)
-	sub, err := messaging.Subscribe(n.bus, route, func(ctx context.Context, msg *SegmentNotification) error {
+	sub, err := messaging.Subscribe(n.busFactory, route, func(ctx context.Context, msg *SegmentNotification) error {
 
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {
