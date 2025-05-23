@@ -31,12 +31,14 @@ func NewBidiStreamProvider(addr, token string) api.BidiStreamProvider {
 }
 
 // CallStream opens or reuses a muxed stream over the WebSocket for a single logical interaction.
-func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, msg api.Routeable) (api.BidiStream, error) {
+func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uuid.UUID, msg api.Routeable) (api.BidiStream, error) {
+
 	muxer, err := p.getOrCreateMuxer(ctx)
 	if err != nil {
 		return nil, err
 	}
-	bidi := muxer.Register(uuid.New())
+	channelID := uuid.New()
+	bidi := muxer.Register(storeID, channelID)
 
 	// we use a polymorphic envelope so that we can
 	// unmarshal server side and route the msg
@@ -62,7 +64,7 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (*We
 		return nil, err
 	}
 
-	muxer := NewClientWebSocketMuxer(ctx, conn)
+	muxer := NewClientWebSocketMuxer(ctx, NewClientMuxerSession(), conn)
 	p.muxer = muxer
 	return muxer, nil
 }

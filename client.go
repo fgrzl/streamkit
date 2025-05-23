@@ -6,6 +6,7 @@ import (
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/google/uuid"
 )
 
 type (
@@ -30,16 +31,16 @@ type ClientFactory interface {
 }
 
 type Client interface {
-	GetSpaces(ctx context.Context) enumerators.Enumerator[string]
-	GetSegments(ctx context.Context, space string) enumerators.Enumerator[string]
-	Peek(ctx context.Context, space, segment string) (*Entry, error)
-	Consume(ctx context.Context, args *Consume) enumerators.Enumerator[*Entry]
-	ConsumeSpace(ctx context.Context, args *ConsumeSpace) enumerators.Enumerator[*Entry]
-	ConsumeSegment(ctx context.Context, args *ConsumeSegment) enumerators.Enumerator[*Entry]
-	Produce(ctx context.Context, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus]
-	Publish(ctx context.Context, space, segment string, payload []byte, metadata map[string]string) error
-	SubscribeToSpace(ctx context.Context, space string, handler func(*SegmentStatus)) (api.Subscription, error)
-	SubscribeToSegment(ctx context.Context, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error)
+	GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[string]
+	GetSegments(ctx context.Context, storeID uuid.UUID, space string) enumerators.Enumerator[string]
+	Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*Entry, error)
+	Consume(ctx context.Context, storeID uuid.UUID, args *Consume) enumerators.Enumerator[*Entry]
+	ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *ConsumeSpace) enumerators.Enumerator[*Entry]
+	ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *ConsumeSegment) enumerators.Enumerator[*Entry]
+	Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus]
+	Publish(ctx context.Context, storeID uuid.UUID, space, segment string, payload []byte, metadata map[string]string) error
+	SubscribeToSpace(ctx context.Context, storeID uuid.UUID, space string, handler func(*SegmentStatus)) (api.Subscription, error)
+	SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error)
 }
 
 func NewClient(provider api.BidiStreamProvider) Client {
@@ -50,48 +51,48 @@ type client struct {
 	provider api.BidiStreamProvider
 }
 
-func (c *client) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
-	bidi, err := c.provider.CallStream(ctx, &api.GetSpaces{})
+func (c *client) GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[string] {
+	bidi, err := c.provider.CallStream(ctx, storeID, &api.GetSpaces{})
 	if err != nil {
 		return enumerators.Error[string](err)
 	}
 	return api.NewStreamEnumerator[string](bidi)
 }
 
-func (c *client) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
-	bidi, err := c.provider.CallStream(ctx, &api.GetSegments{Space: space})
+func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space string) enumerators.Enumerator[string] {
+	bidi, err := c.provider.CallStream(ctx, storeID, &api.GetSegments{Space: space})
 	if err != nil {
 		return enumerators.Error[string](err)
 	}
 	return api.NewStreamEnumerator[string](bidi)
 }
 
-func (c *client) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
-	bidi, err := c.provider.CallStream(ctx, args)
+func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
+	bidi, err := c.provider.CallStream(ctx, storeID, args)
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
 	return api.NewStreamEnumerator[*Entry](bidi)
 }
 
-func (c *client) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
-	bidi, err := c.provider.CallStream(ctx, args)
+func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
+	bidi, err := c.provider.CallStream(ctx, storeID, args)
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
 	return api.NewStreamEnumerator[*Entry](bidi)
 }
 
-func (c *client) Consume(ctx context.Context, args *api.Consume) enumerators.Enumerator[*Entry] {
-	bidi, err := c.provider.CallStream(ctx, args)
+func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
+	bidi, err := c.provider.CallStream(ctx, storeID, args)
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
 	return api.NewStreamEnumerator[*Entry](bidi)
 }
 
-func (c *client) Peek(ctx context.Context, space, segment string) (*Entry, error) {
-	bidi, err := c.provider.CallStream(ctx, &api.Peek{Space: space, Segment: segment})
+func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*Entry, error) {
+	bidi, err := c.provider.CallStream(ctx, storeID, &api.Peek{Space: space, Segment: segment})
 	if err != nil {
 		return nil, err
 	}
@@ -103,8 +104,8 @@ func (c *client) Peek(ctx context.Context, space, segment string) (*Entry, error
 	return entry, nil
 }
 
-func (c *client) Produce(ctx context.Context, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
-	bidi, err := c.provider.CallStream(ctx, &api.Produce{Space: space, Segment: segment})
+func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
+	bidi, err := c.provider.CallStream(ctx, storeID, &api.Produce{Space: space, Segment: segment})
 	if err != nil {
 		return enumerators.Error[*SegmentStatus](err)
 	}
@@ -128,13 +129,13 @@ func (c *client) Produce(ctx context.Context, space, segment string, entries enu
 	return api.NewStreamEnumerator[*SegmentStatus](bidi)
 }
 
-func (c *client) Publish(ctx context.Context, space, segment string, payload []byte, metadata map[string]string) error {
-	peek, err := c.Peek(ctx, space, segment)
+func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment string, payload []byte, metadata map[string]string) error {
+	peek, err := c.Peek(ctx, storeID, space, segment)
 	if err != nil {
 		return err
 	}
 
-	bidi, err := c.provider.CallStream(ctx, &api.Produce{Space: space, Segment: segment})
+	bidi, err := c.provider.CallStream(ctx, storeID, &api.Produce{Space: space, Segment: segment})
 	if err != nil {
 		return err
 	}
@@ -161,18 +162,18 @@ func (c *client) Publish(ctx context.Context, space, segment string, payload []b
 	return nil
 }
 
-func (c *client) SubscribeToSpace(ctx context.Context, space string, handler func(*SegmentStatus)) (api.Subscription, error) {
+func (c *client) SubscribeToSpace(ctx context.Context, storeID uuid.UUID, space string, handler func(*SegmentStatus)) (api.Subscription, error) {
 	args := &api.SubscribeToSegmentStatus{Space: space, Segment: "*"}
-	return c.subscribeStream(ctx, args, handler)
+	return c.subscribeStream(ctx, storeID, args, handler)
 }
 
-func (c *client) SubscribeToSegment(ctx context.Context, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error) {
+func (c *client) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error) {
 	args := &api.SubscribeToSegmentStatus{Space: space, Segment: segment}
-	return c.subscribeStream(ctx, args, handler)
+	return c.subscribeStream(ctx, storeID, args, handler)
 }
 
-func (c *client) subscribeStream(ctx context.Context, initMsg api.Routeable, handler func(*SegmentStatus)) (api.Subscription, error) {
-	bidi, err := c.provider.CallStream(ctx, initMsg)
+func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg api.Routeable, handler func(*SegmentStatus)) (api.Subscription, error) {
+	bidi, err := c.provider.CallStream(ctx, storeID, initMsg)
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package wskit
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"sync"
 
@@ -14,6 +15,7 @@ import (
 // MuxerMsg represents a framed message sent over the multiplexed WebSocket.
 // Each message is scoped to a specific logical channel by ChannelID.
 type MuxerMsg struct {
+	StoreID   uuid.UUID `json:"store_id"`
 	ChannelID uuid.UUID `json:"channel_id"`
 	Payload   []byte    `json:"payload"`
 }
@@ -21,20 +23,22 @@ type MuxerMsg struct {
 // WebSocketMuxer multiplexes multiple logical bidirectional streams over a single WebSocket connection.
 // Each logical stream is identified by a ChannelID.
 type WebSocketMuxer struct {
-	Context    context.Context
-	name       string
-	conn       *websocket.Conn
-	channels   map[uuid.UUID]*MuxerBidiStream
-	channelsMu sync.RWMutex
-	writeMu    sync.Mutex
-	done       chan struct{}
-	node       node.Node
+	Context     context.Context
+	session     MuxerSession
+	name        string
+	conn        *websocket.Conn
+	channels    map[uuid.UUID]*MuxerBidiStream
+	channelsMu  sync.RWMutex
+	writeMu     sync.Mutex
+	done        chan struct{}
+	nodeManager node.NodeManager
 }
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
-func NewClientWebSocketMuxer(ctx context.Context, conn *websocket.Conn) *WebSocketMuxer {
+func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *websocket.Conn) *WebSocketMuxer {
 	m := &WebSocketMuxer{
 		Context:  ctx,
+		session:  session,
 		name:     "client",
 		conn:     conn,
 		channels: make(map[uuid.UUID]*MuxerBidiStream),
@@ -45,14 +49,15 @@ func NewClientWebSocketMuxer(ctx context.Context, conn *websocket.Conn) *WebSock
 }
 
 // NewServerWebSocketMuxer will start a blocking read loop to keep the websocket connection open
-func NewServerWebSocketMuxer(ctx context.Context, node node.Node, conn *websocket.Conn) {
+func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeManager node.NodeManager, conn *websocket.Conn) {
 	m := &WebSocketMuxer{
-		Context:  ctx,
-		name:     "server",
-		conn:     conn,
-		node:     node,
-		channels: make(map[uuid.UUID]*MuxerBidiStream),
-		done:     make(chan struct{}),
+		Context:     ctx,
+		session:     session,
+		name:        "server",
+		conn:        conn,
+		nodeManager: nodeManager,
+		channels:    make(map[uuid.UUID]*MuxerBidiStream),
+		done:        make(chan struct{}),
 	}
 	m.readLoop()
 }
@@ -64,16 +69,17 @@ func (m *WebSocketMuxer) Serve() {
 
 // Register creates and tracks a new stream for the given ChannelID.
 // If a stream with this ID already exists, it is overwritten.
-func (m *WebSocketMuxer) Register(channelID uuid.UUID) api.BidiStream {
-	return m.register(channelID)
+func (m *WebSocketMuxer) Register(storeID, channelID uuid.UUID) api.BidiStream {
+	return m.register(storeID, channelID)
 }
 
 // internal registration logic (safe for reuse)
-func (m *WebSocketMuxer) register(channelID uuid.UUID) *MuxerBidiStream {
+func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream {
 	sendFn := func(payload []byte) error {
 		m.writeMu.Lock()
 		defer m.writeMu.Unlock()
 		return websocket.JSON.Send(m.conn, &MuxerMsg{
+			StoreID:   storeID,
 			ChannelID: channelID,
 			Payload:   payload,
 		})
@@ -107,6 +113,22 @@ func (m *WebSocketMuxer) readLoop() {
 			return
 		}
 
+		// can access store
+		if !m.session.CanAccessStore(msg.StoreID) {
+
+			accessDenied := &ErrorMessage{
+				Type: "err",
+				Err:  "access denied",
+			}
+			payload, _ := json.Marshal(accessDenied)
+
+			websocket.JSON.Send(m.conn, &MuxerMsg{
+				StoreID:   msg.StoreID,
+				ChannelID: msg.ChannelID,
+				Payload:   payload,
+			})
+		}
+
 		m.channelsMu.RLock()
 		bidi, exists := m.channels[msg.ChannelID]
 		m.channelsMu.RUnlock()
@@ -114,14 +136,23 @@ func (m *WebSocketMuxer) readLoop() {
 		ctx := node.WithChannelID(m.Context, msg.ChannelID)
 
 		if !exists {
-			if m.node == nil {
+			if m.nodeManager == nil {
 				// Client side the channel is registered before the read loop starts
 				// If this is a server side err then the node should not be nil
-				slog.ErrorContext(ctx, "node does not exists")
+				slog.ErrorContext(ctx, "node manager does not exists")
 			}
-			bidi = m.register(msg.ChannelID)
 
-			go m.node.Handle(ctx, bidi)
+			bidi = m.register(msg.StoreID, msg.ChannelID)
+
+			instance, err := m.nodeManager.GetOrCreate(ctx, msg.StoreID)
+			if err != nil {
+				slog.ErrorContext(ctx, "node does not exists")
+
+			}
+
+			go func(ctx context.Context, bidi api.BidiStream, instance node.Node) {
+				instance.Handle(ctx, bidi)
+			}(ctx, bidi, instance)
 		}
 
 		select {

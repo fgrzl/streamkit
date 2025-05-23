@@ -7,6 +7,7 @@ import (
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/streamkit"
 	"github.com/fgrzl/streamkit/pkg/storage"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -15,13 +16,13 @@ type TestHarness struct {
 	streamkit.Client
 }
 
-func setupConsumerData(t *testing.T, client streamkit.Client) {
+func setupConsumerData(t *testing.T, storeID uuid.UUID, client streamkit.Client) {
 	ctx := t.Context()
 
 	for i := range 5 {
 		for j := range 5 {
 			space, segment, records := fmt.Sprintf("space%d", i), fmt.Sprintf("segment%d", j), generateRange(0, 253)
-			results := client.Produce(ctx, space, segment, records)
+			results := client.Produce(ctx, storeID, space, segment, records)
 			err := enumerators.Consume(results)
 			require.NoError(t, err)
 		}

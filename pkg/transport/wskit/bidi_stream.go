@@ -67,13 +67,20 @@ func (c *MuxerBidiStream) Decode(v any) error {
 			}
 		}
 
-		// Check if it's a CloseMessage
-		var closeMsg CloseMessage
-		if err := json.Unmarshal(payload, &closeMsg); err == nil && closeMsg.Type == "close" {
-			if closeMsg.Err != "" {
-				return fmt.Errorf("remote closed stream: %s", closeMsg.Err)
+		// Check if it's an ErrorMessage
+		var errMsg ErrorMessage
+		if err := json.Unmarshal(payload, &errMsg); err == nil && errMsg.Type != "" {
+			switch errMsg.Type {
+			case "close":
+				if errMsg.Err != "" {
+					return fmt.Errorf("remote closed stream: %s", errMsg.Err)
+				}
+				return io.EOF
+			case "error":
+				return fmt.Errorf("remote error: %s", errMsg.Err)
+			default:
+				return fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err)
 			}
-			return io.EOF
 		}
 
 		// Normal decode
@@ -83,7 +90,7 @@ func (c *MuxerBidiStream) Decode(v any) error {
 
 // CloseSend sends a JSON close message to the remote side.
 func (c *MuxerBidiStream) CloseSend(err error) error {
-	msg := &CloseMessage{
+	msg := &ErrorMessage{
 		Type: "close",
 	}
 	if err != nil {
@@ -128,7 +135,7 @@ func (c *MuxerBidiStream) EndOfStreamError() error {
 	return io.EOF
 }
 
-type CloseMessage struct {
-	Type string `json:"type"` // always "close"
+type ErrorMessage struct {
+	Type string `json:"type"`
 	Err  string `json:"err,omitempty"`
 }

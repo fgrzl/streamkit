@@ -20,17 +20,15 @@ import (
 	"github.com/fgrzl/streamkit/pkg/storage/azure"
 	"github.com/fgrzl/streamkit/pkg/storage/pebble"
 	"github.com/fgrzl/streamkit/pkg/transport/wskit"
-	"github.com/fgrzl/streamkit/pkg/web"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 var secret = []byte("top-secret")
-var tester = jwt.MapClaims{
-	"tenant_id": uuid.NewString(),
-}
+var tester = claims.NewClaimsList("tenant_id", uuid.NewString()).Add("scopes", "streamkit::*")
+
+var storeID = uuid.New()
 
 func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 
@@ -40,23 +38,17 @@ func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 
 	nodeManager := node.NewNodeManager(nil, factory)
 
-	router := mux.NewRouter()
-	router.UseAuthentication(&mux.AuthenticationOptions{
-		Validate: func(token string) (claims.Principal, bool) {
-			claimsMap, err := validator.Validate(token)
-			if err != nil {
-				return nil, false
-			}
+	router := mux.NewRouter(nil)
 
-			return jwtkit.NewClaimsPrincipal(claimsMap), true
-		},
+	router.UseAuthentication(&mux.AuthenticationOptions{
+		Validate: validator.Validate,
 	})
 
 	router.UseAuthorization(&mux.AuthorizationOptions{})
 
 	router.Healthz().AllowAnonymous()
 
-	web.ConfigureWebSocketServer(router, nodeManager)
+	wskit.ConfigureWebSocketServer(router, nodeManager)
 
 	server := httptest.NewServer(router)
 	t.Cleanup(func() {
@@ -73,7 +65,8 @@ func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 	signer := jwtkit.HMAC256Signer{
 		Secret: secret,
 	}
-	token, err := signer.CreateToken(tester, time.Minute*1)
+	ttl := time.Minute
+	token, err := signer.CreateToken(claims.NewPrincipalFromList(tester, &ttl), ttl)
 	require.NoError(t, err)
 
 	url, err := url.Parse(server.URL)
@@ -139,7 +132,7 @@ func TestMultipleCallStreams(t *testing.T) {
 				space, segment := "space0", "segment"+strconv.Itoa(i)
 
 				// Act
-				entry, err := h.Client.Peek(ctx, space, segment)
+				entry, err := h.Client.Peek(ctx, storeID, space, segment)
 
 				// Assert
 				assert.NoError(t, err)
@@ -159,7 +152,7 @@ func TestProduce(t *testing.T) {
 				space, segment, records := "space0", "segment"+strconv.Itoa(i), generateRange(0, 5)
 
 				// Act
-				results := h.Client.Produce(ctx, space, segment, records)
+				results := h.Client.Produce(ctx, storeID, space, segment, records)
 				statuses, err := enumerators.ToSlice(results)
 
 				// Assert
@@ -175,10 +168,10 @@ func TestGetSpaces(t *testing.T) {
 		t.Run("should get spaces "+name, func(t *testing.T) {
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, h.Client)
+			setupConsumerData(t, storeID, h.Client)
 
 			// Act
-			enumerator := h.Client.GetSpaces(ctx)
+			enumerator := h.Client.GetSpaces(ctx, storeID)
 			spaces, err := enumerators.ToSlice(enumerator)
 
 			// Assert
@@ -198,10 +191,10 @@ func TestGetSegments(t *testing.T) {
 		t.Run("should get segments "+name, func(t *testing.T) {
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, h.Client)
+			setupConsumerData(t, storeID, h.Client)
 
 			// Act
-			enumerator := h.Client.GetSegments(ctx, "space0")
+			enumerator := h.Client.GetSegments(ctx, storeID, "space0")
 			segments, err := enumerators.ToSlice(enumerator)
 
 			// Assert
@@ -221,10 +214,10 @@ func TestPeek(t *testing.T) {
 		t.Run("should peek "+name, func(t *testing.T) {
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, h.Client)
+			setupConsumerData(t, storeID, h.Client)
 
 			// Act
-			peek, err := h.Client.Peek(ctx, "space0", "segment0")
+			peek, err := h.Client.Peek(ctx, storeID, "space0", "segment0")
 
 			// Assert
 			assert.NoError(t, err)
@@ -240,7 +233,7 @@ func TestConsumeSegment(t *testing.T) {
 		t.Run("should consume segment "+name, func(t *testing.T) {
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, h.Client)
+			setupConsumerData(t, storeID, h.Client)
 
 			args := &streamkit.ConsumeSegment{
 				Space:   "space0",
@@ -248,7 +241,7 @@ func TestConsumeSegment(t *testing.T) {
 			}
 
 			// Act
-			results := h.Client.ConsumeSegment(ctx, args)
+			results := h.Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
@@ -263,14 +256,14 @@ func TestConsumeSpace(t *testing.T) {
 		t.Run("should consume space "+name, func(t *testing.T) {
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, h.Client)
+			setupConsumerData(t, storeID, h.Client)
 
 			args := &streamkit.ConsumeSpace{
 				Space: "space0",
 			}
 
 			// Act
-			results := h.Client.ConsumeSpace(ctx, args)
+			results := h.Client.ConsumeSpace(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
@@ -286,7 +279,7 @@ func TestConsume(t *testing.T) {
 			// Arrange
 			ctx := t.Context()
 
-			setupConsumerData(t, h.Client)
+			setupConsumerData(t, storeID, h.Client)
 			runtime.Gosched()
 
 			args := &streamkit.Consume{
@@ -300,7 +293,7 @@ func TestConsume(t *testing.T) {
 			}
 
 			// Act
-			results := h.Client.Consume(ctx, args)
+			results := h.Client.Consume(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
