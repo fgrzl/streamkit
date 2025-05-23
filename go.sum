@@ -47,8 +47,8 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
 github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
-github.com/fgrzl/claims v0.0.1-alpha.4 h1:9s1AfXZxraP7EsteaBXw+uG+WHa64HDfj7csaQGGuwA=
-github.com/fgrzl/claims v0.0.1-alpha.4/go.mod h1:sN7zr8FIiKmESWghf+BuKvPpliLMUjkeQp93S/Z/imE=
+github.com/fgrzl/claims v0.0.1-alpha.5 h1:3hGnsEpM9RcpecTpc14RpG04Q4Omewad+nKkxhes1dI=
+github.com/fgrzl/claims v0.0.1-alpha.5/go.mod h1:sN7zr8FIiKmESWghf+BuKvPpliLMUjkeQp93S/Z/imE=
 github.com/fgrzl/enumerators v0.1.0-alpha.20 h1:pppcISda1SBUQ8xgN3LCybTRB9REavRCfSOoyyZrh2k=
 github.com/fgrzl/enumerators v0.1.0-alpha.20/go.mod h1:gqcOfcKqWMh6z3TeDXwDvPD3YZ/BKSPuYH6FLCIo3RE=
 github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d h1:97aOsKoAGNaq7dpkPg1U4T04JBVzgc5rpIgIRv/MoVQ=
@@ -57,8 +57,8 @@ github.com/fgrzl/lexkey v0.0.0-20250404134045-06756616f02b h1:C8VidHCs+ETGfWPKmi
 github.com/fgrzl/lexkey v0.0.0-20250404134045-06756616f02b/go.mod h1:DfrNX28YpZvrxyDm+jYQ6Jv2pJbZxQoMS1dcBSwBv58=
 github.com/fgrzl/messaging v0.0.1-alpha.24 h1:1esXQz1vV/j5/PUcmqP0c/GvcnJ613PziFHCm6e8uvk=
 github.com/fgrzl/messaging v0.0.1-alpha.24/go.mod h1:1lbFrGEcKm4gD8bpuBDuOtPr3kKwbwfHuwpqxnpOeTk=
-github.com/fgrzl/mux v0.0.1-alpha.25 h1:M0qO+2HnDfFX5M1jmE0E/EK28lx1XMqXF6vB9ZfZ5Lw=
-github.com/fgrzl/mux v0.0.1-alpha.25/go.mod h1:pCF8ggGbVHvctjwvFg/TQnfzWyw4labTqeEVrSDbqDk=
+github.com/fgrzl/mux v0.0.1-alpha.26 h1:YfnhoeCfFw3f9CUoay/FBhGt80WnRHD3v9MV0HlMYcI=
+github.com/fgrzl/mux v0.0.1-alpha.26/go.mod h1:BhsdnqreOsr/5oiaF2qL/Ryd8q9HP9mhHNWuMbTNSns=
 github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d h1:h70KpLp2smJW5eb7pvESk40lsYM3VoFCJmJ/7Y4cs1Y=
 github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d/go.mod h1:P+pm97eJskSlGp6EpOwz6CBXzRZTWMaL7UQG2IcCHrw=
 github.com/getsentry/sentry-go v0.33.0 h1:YWyDii0KGVov3xOaamOnF0mjOrqSjBqwv48UEzn7QFg=
