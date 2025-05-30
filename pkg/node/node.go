@@ -8,6 +8,7 @@ import (
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/messaging"
+	"github.com/fgrzl/messaging/busx"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/google/uuid"
@@ -193,7 +194,7 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	}
 
 	route := GetSegmentNotificationRoute(n.storeID, args.Space)
-	sub, err := messaging.Subscribe(bus, route, func(ctx context.Context, msg *SegmentNotification) error {
+	sub, err := busx.Subscribe(bus, route, func(ctx context.Context, msg *SegmentNotification) error {
 
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {
