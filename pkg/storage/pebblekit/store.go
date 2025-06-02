@@ -1,4 +1,4 @@
-package pebble
+package pebblekit
 
 import (
 	"context"

@@ -1,4 +1,4 @@
-package azure
+package azurekit
 
 import "github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 

@@ -17,8 +17,8 @@ import (
 	"github.com/fgrzl/streamkit"
 	"github.com/fgrzl/streamkit/pkg/node"
 	"github.com/fgrzl/streamkit/pkg/storage"
-	"github.com/fgrzl/streamkit/pkg/storage/azure"
-	"github.com/fgrzl/streamkit/pkg/storage/pebble"
+	"github.com/fgrzl/streamkit/pkg/storage/azurekit"
+	"github.com/fgrzl/streamkit/pkg/storage/pebblekit"
 	"github.com/fgrzl/streamkit/pkg/transport/wskit"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -88,29 +88,29 @@ func azureTestHarness(t *testing.T) *TestHarness {
 	accountKey := "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 	endpoint := "http://127.0.0.1:10002/devstoreaccount1"
 
-	credential, err := azure.NewSharedKeyCredential(accountName, accountKey)
+	credential, err := azurekit.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
 		panic(err)
 	}
 
-	options := &azure.AzureStoreOptions{
+	options := &azurekit.AzureStoreOptions{
 		Prefix:              uuid.NewString(),
 		Endpoint:            endpoint,
 		SharedKeyCredential: credential,
 		AllowInsecureHTTP:   true,
 	}
 
-	factory, err := azure.NewStoreFactory(options)
+	factory, err := azurekit.NewStoreFactory(options)
 	require.NoError(t, err)
 
 	return newTestHarness(t, factory)
 }
 
 func pebbleTestHarness(t *testing.T) *TestHarness {
-	options := &pebble.PebbleStoreOptions{
+	options := &pebblekit.PebbleStoreOptions{
 		Path: t.TempDir(),
 	}
-	factory, err := pebble.NewStoreFactory(options)
+	factory, err := pebblekit.NewStoreFactory(options)
 	require.NoError(t, err)
 
 	return newTestHarness(t, factory)
