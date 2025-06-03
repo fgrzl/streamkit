@@ -47,8 +47,8 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
 github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
-github.com/fgrzl/claims v0.0.1-alpha.12 h1:tqtvFA1f0JuaDOr8eHLKX1TCR1p8cJK0Z43sRJWIxbs=
-github.com/fgrzl/claims v0.0.1-alpha.12/go.mod h1:sN7zr8FIiKmESWghf+BuKvPpliLMUjkeQp93S/Z/imE=
+github.com/fgrzl/claims v0.0.1-alpha.13 h1:Vp2XmAyLC+VSB2/A72EEfFnxbmo0XY3AVZ4hmG1+A28=
+github.com/fgrzl/claims v0.0.1-alpha.13/go.mod h1:sN7zr8FIiKmESWghf+BuKvPpliLMUjkeQp93S/Z/imE=
 github.com/fgrzl/enumerators v0.1.0-alpha.20 h1:pppcISda1SBUQ8xgN3LCybTRB9REavRCfSOoyyZrh2k=
 github.com/fgrzl/enumerators v0.1.0-alpha.20/go.mod h1:gqcOfcKqWMh6z3TeDXwDvPD3YZ/BKSPuYH6FLCIo3RE=
 github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d h1:97aOsKoAGNaq7dpkPg1U4T04JBVzgc5rpIgIRv/MoVQ=
