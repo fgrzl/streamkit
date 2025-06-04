@@ -13,7 +13,7 @@ require (
 	github.com/fgrzl/lexkey v0.1.0-alpha.14
 	github.com/fgrzl/messaging v0.0.1-alpha.32
 	github.com/fgrzl/mux v0.0.1-alpha.28
-	github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d
+	github.com/fgrzl/timestamp v0.1.0-alpha.7
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.10.0
