@@ -4,7 +4,7 @@
 # Streamkit  
 
 #### Organizing Streams: Spaces and Segments  
-Streams uses a hierarchical model—**Spaces** and **Segments**—to efficiently manage and consume high-throughput event data.
+Streams use a hierarchical model—**Spaces** and **Segments**—to efficiently manage and consume high-throughput event data.
 
 ### Store
 A **Store** provides the physical separation at a storge level. 
@@ -25,7 +25,7 @@ A **Space** is a top-level logical container for related streams.
 
 ### How It Works  
 
-- **Producing**: Data is written to specific Segments in a Space  
+- **Producing**: Data is written to specific Segments in a Space within a Store
 - **Consuming**:  
   - Subscribe to a Space for all Segments (interleaved)  
   - Subscribe to a Segment for strict ordering  
