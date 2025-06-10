@@ -66,7 +66,7 @@ func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 		Secret: secret,
 	}
 	ttl := time.Minute
-	token, err := signer.CreateToken(claims.NewPrincipalFromList(tester, &ttl), ttl)
+	token, err := signer.CreateToken(claims.NewPrincipalFromList(tester), ttl)
 	require.NoError(t, err)
 
 	url, err := url.Parse(server.URL)

@@ -6,18 +6,18 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.0
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.3.0
-	github.com/cockroachdb/pebble/v2 v2.0.4
-	github.com/fgrzl/claims v0.0.1-alpha.12
+	github.com/cockroachdb/pebble/v2 v2.0.5
+	github.com/fgrzl/claims v0.0.1-alpha.15
 	github.com/fgrzl/enumerators v0.1.0-alpha.20
 	github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d
 	github.com/fgrzl/lexkey v0.1.0-alpha.14
-	github.com/fgrzl/messaging v0.0.1-alpha.32
-	github.com/fgrzl/mux v0.0.1-alpha.28
-	github.com/fgrzl/timestamp v0.0.0-20250225130908-89948d7bd71d
+	github.com/fgrzl/messaging v0.0.1-alpha.41
+	github.com/fgrzl/mux v0.0.1-alpha.30
+	github.com/fgrzl/timestamp v0.1.0-alpha.7
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.10.0
-	golang.org/x/net v0.40.0
+	golang.org/x/net v0.41.0
 )
 
 require (
@@ -60,10 +60,10 @@ require (
 	go.opentelemetry.io/otel v1.36.0 // indirect
 	go.opentelemetry.io/otel/metric v1.36.0 // indirect
 	go.opentelemetry.io/otel/trace v1.36.0 // indirect
-	golang.org/x/crypto v0.38.0 // indirect
-	golang.org/x/exp v0.0.0-20250531010427-b6e5de432a8b // indirect
+	golang.org/x/crypto v0.39.0 // indirect
+	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476 // indirect
 	golang.org/x/sys v0.33.0 // indirect
-	golang.org/x/text v0.25.0 // indirect
+	golang.org/x/text v0.26.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
