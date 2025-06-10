@@ -1,7 +1,7 @@
 github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.0 h1:Gt0j3wceWMwPmiazCa8MzMA0MfhmPIz0Qp0FJ6qcM0U=
 github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.0/go.mod h1:Ot/6aikWnKWi4l9QB7qVSwa8iMphQNqkWALMoNT3rzM=
-github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.0 h1:j8BorDEigD8UFOSZQiSqAMOOleyQOOQPnUAwV+Ls1gA=
-github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.0/go.mod h1:JdM5psgjfBf5fo2uWOZhflPWyDBZ/O/CNAH9CtsuZE4=
+github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.1 h1:B+blDbyVIG3WaikNxPnhPiJ1MThR03b3vKGtER95TP4=
+github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.1/go.mod h1:JdM5psgjfBf5fo2uWOZhflPWyDBZ/O/CNAH9CtsuZE4=
 github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache v0.3.2 h1:yz1bePFlP5Vws5+8ez6T3HWXPmwOK7Yvq8QxDBD3SKY=
 github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache v0.3.2/go.mod h1:Pa9ZNPuoNu/GztvBSKk9J1cDJW6vk/n0zLtV4mgd8N8=
 github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.3.0 h1:NnE8y/opvxowwNcSNHubQUiSSEhfk3dmooLGAOmPuKs=
@@ -51,6 +51,8 @@ github.com/fgrzl/claims v0.0.1-alpha.15 h1:FmKiM79vkMPILrZTUGcmM+C5zkpZEC3NpbGzl
 github.com/fgrzl/claims v0.0.1-alpha.15/go.mod h1:sN7zr8FIiKmESWghf+BuKvPpliLMUjkeQp93S/Z/imE=
 github.com/fgrzl/enumerators v0.1.0-alpha.20 h1:pppcISda1SBUQ8xgN3LCybTRB9REavRCfSOoyyZrh2k=
 github.com/fgrzl/enumerators v0.1.0-alpha.20/go.mod h1:gqcOfcKqWMh6z3TeDXwDvPD3YZ/BKSPuYH6FLCIo3RE=
+github.com/fgrzl/es v0.0.0-20250501132443-78c951391684 h1:4/uoctvgR67oUzanvTf2QkIaXnL8tgIZZIIzQzFDVFg=
+github.com/fgrzl/es v0.0.0-20250501132443-78c951391684/go.mod h1:n2d7nTXA8rQLV8dN9FwrZS/gLirHwwowIC44D/J3CFQ=
 github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d h1:97aOsKoAGNaq7dpkPg1U4T04JBVzgc5rpIgIRv/MoVQ=
 github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d/go.mod h1:L7IAn4wOCSsQGJ44XZePleqf7/tAZPgBDC6A3Egv9e8=
 github.com/fgrzl/lexkey v0.1.0-alpha.14 h1:ZgSGY13wta+cJK/OqM1iSYCUEdY8ixcS/nFL++VhYtI=
@@ -59,6 +61,10 @@ github.com/fgrzl/messaging v0.0.1-alpha.41 h1:Nammgqx7BRuALJOLTGn6ZqMZGEHb1N/26N
 github.com/fgrzl/messaging v0.0.1-alpha.41/go.mod h1:E0Oy/9ZXs7Xf+0lR9llcrionqRYJcxOA1V5vUUzu7NU=
 github.com/fgrzl/mux v0.0.1-alpha.30 h1:0iQil+WeRD2mJNGGpGwC74VN3v5X0XhDcXczgjJezXM=
 github.com/fgrzl/mux v0.0.1-alpha.30/go.mod h1:ixlrEd2Wq5PVkLxdAonBBMBWRbIik9Y5QSK0BRCYWtc=
+github.com/fgrzl/streams v0.0.0-20250518171816-70f7a2409d1a h1:IYXoFbwH4Yk96p1+Ath/gdT4xcgv0PuVPNHuJu/OEM4=
+github.com/fgrzl/streams v0.0.0-20250518171816-70f7a2409d1a/go.mod h1:ZpgONWr20cXyoDieBb8AwFh6iSW4p4GM4rb4LgjFWVE=
+github.com/fgrzl/tickle v0.0.0-20250326142409-26a8ec1d1519 h1:omNh8HjkDKv99svi4ndtPC7xKMIvLw64197pwOayJqA=
+github.com/fgrzl/tickle v0.0.0-20250326142409-26a8ec1d1519/go.mod h1:LPt4T6+pz9tCQg+E7AGe6oprQNU+2SJRD0kOEqwnBdo=
 github.com/fgrzl/timestamp v0.1.0-alpha.7 h1:fpZd2kTyqXdensrODPrTq+4AqWFAp8uhJT6y4HQG5Wk=
 github.com/fgrzl/timestamp v0.1.0-alpha.7/go.mod h1:P+pm97eJskSlGp6EpOwz6CBXzRZTWMaL7UQG2IcCHrw=
 github.com/getsentry/sentry-go v0.33.0 h1:YWyDii0KGVov3xOaamOnF0mjOrqSjBqwv48UEzn7QFg=
