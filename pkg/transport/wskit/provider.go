@@ -13,20 +13,20 @@ import (
 
 // WebSocketBidiStreamProvider manages a per-tenant WebSocket connection and muxer.
 type WebSocketBidiStreamProvider struct {
-	addr   string
-	origin string
-	token  string
+	addr     string
+	origin   string
+	fetchJWT func() (string, error)
 
 	mu    sync.Mutex
 	muxer *WebSocketMuxer
 }
 
-// NewBidiStreamProvider creates a provider that uses a dedicated WebSocket connection per tenant.
-func NewBidiStreamProvider(addr, token string) api.BidiStreamProvider {
+// NewBidiStreamProvider creates a provider that uses a dedicated WebSocket connection per client.
+func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.BidiStreamProvider {
 	return &WebSocketBidiStreamProvider{
-		addr:   addr,
-		origin: "http://localhost",
-		token:  token,
+		addr:     addr,
+		origin:   "http://localhost",
+		fetchJWT: fetchJWT,
 	}
 }
 
@@ -55,7 +55,7 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (*We
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.muxer != nil {
+	if p.muxer != nil && p.muxer.Ping() {
 		return p.muxer, nil
 	}
 
@@ -76,8 +76,13 @@ func (p *WebSocketBidiStreamProvider) dial() (*websocket.Conn, error) {
 		return nil, err
 	}
 
+	token, err := p.fetchJWT()
+	if err != nil {
+		return nil, err
+	}
+
 	cfg.Header = http.Header{}
-	cfg.Header.Set("Authorization", "Bearer "+p.token)
+	cfg.Header.Set("Authorization", "Bearer "+token)
 
 	return websocket.DialConfig(cfg)
 }

@@ -12,12 +12,23 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+type ControlType string
+
+const (
+	ControlTypeData  ControlType = "data"
+	ControlTypePing  ControlType = "ping"
+	ControlTypePong  ControlType = "pong"
+	ControlTypeClose ControlType = "close"
+	ControlTypeError ControlType = "error"
+)
+
 // MuxerMsg represents a framed message sent over the multiplexed WebSocket.
 // Each message is scoped to a specific logical channel by ChannelID.
 type MuxerMsg struct {
-	StoreID   uuid.UUID `json:"store_id"`
-	ChannelID uuid.UUID `json:"channel_id"`
-	Payload   []byte    `json:"payload"`
+	ControlType ControlType `type:"control_type"`
+	StoreID     uuid.UUID   `json:"store_id"`
+	ChannelID   uuid.UUID   `json:"channel_id"`
+	Payload     []byte      `json:"payload"`
 }
 
 // WebSocketMuxer multiplexes multiple logical bidirectional streams over a single WebSocket connection.
@@ -62,6 +73,11 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	m.readLoop()
 }
 
+func (m *WebSocketMuxer) Ping() bool {
+	err := websocket.JSON.Send(m.conn, &MuxerMsg{ControlType: ControlTypePing})
+	return err != nil
+}
+
 // Serve blocks until the WebSocket connection is closed or an error occurs.
 func (m *WebSocketMuxer) Serve() {
 	<-m.done
@@ -79,9 +95,10 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 		m.writeMu.Lock()
 		defer m.writeMu.Unlock()
 		return websocket.JSON.Send(m.conn, &MuxerMsg{
-			StoreID:   storeID,
-			ChannelID: channelID,
-			Payload:   payload,
+			ControlType: ControlTypeData,
+			StoreID:     storeID,
+			ChannelID:   channelID,
+			Payload:     payload,
 		})
 	}
 
@@ -105,61 +122,92 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 // readLoop continuously receives messages from the WebSocket,
 // routes them to the appropriate stream, and auto-registers new streams.
 func (m *WebSocketMuxer) readLoop() {
-
 	for {
 		var msg MuxerMsg
 		if err := websocket.JSON.Receive(m.conn, &msg); err != nil {
 			slog.Warn("muxer: websocket receive error", slog.String("error", err.Error()))
+			close(m.done)
 			return
 		}
 
-		// can access store
-		if !m.session.CanAccessStore(msg.StoreID) {
-
-			accessDenied := &ErrorMessage{
-				Type: "err",
-				Err:  "access denied",
-			}
-			payload, _ := json.Marshal(accessDenied)
-
-			websocket.JSON.Send(m.conn, &MuxerMsg{
-				StoreID:   msg.StoreID,
-				ChannelID: msg.ChannelID,
-				Payload:   payload,
-			})
-		}
-
-		m.channelsMu.RLock()
-		bidi, exists := m.channels[msg.ChannelID]
-		m.channelsMu.RUnlock()
-
 		ctx := node.WithChannelID(m.Context, msg.ChannelID)
 
-		if !exists {
-			if m.nodeManager == nil {
-				// Client side the channel is registered before the read loop starts
-				// If this is a server side err then the node should not be nil
-				slog.ErrorContext(ctx, "node manager does not exists")
+		switch msg.ControlType {
+		case ControlTypePing:
+			slog.Debug("muxer: received ping")
+			_ = websocket.JSON.Send(m.conn, &MuxerMsg{
+				ControlType: ControlTypePong,
+			})
+			continue
+
+		case ControlTypePong:
+			slog.Debug("muxer: received pong")
+			continue
+
+		case ControlTypeClose:
+			slog.Info("muxer: received close")
+			_ = m.conn.Close()
+			close(m.done)
+			return
+
+		case ControlTypeError:
+			slog.Warn("muxer: received error control message",
+				slog.String("store_id", msg.StoreID.String()),
+				slog.String("channel_id", msg.ChannelID.String()),
+				slog.String("payload", string(msg.Payload)),
+			)
+			continue
+
+		case ControlTypeData:
+			if !m.session.CanAccessStore(msg.StoreID) {
+				payload, _ := json.Marshal(&ErrorMessage{
+					Type: "err",
+					Err:  "access denied",
+				})
+
+				_ = websocket.JSON.Send(m.conn, &MuxerMsg{
+					ControlType: ControlTypeError,
+					StoreID:     msg.StoreID,
+					ChannelID:   msg.ChannelID,
+					Payload:     payload,
+				})
+				continue
 			}
 
-			bidi = m.register(msg.StoreID, msg.ChannelID)
+			m.channelsMu.RLock()
+			bidi, exists := m.channels[msg.ChannelID]
+			m.channelsMu.RUnlock()
 
-			instance, err := m.nodeManager.GetOrCreate(ctx, msg.StoreID)
-			if err != nil {
-				slog.ErrorContext(ctx, "node does not exists")
+			if !exists {
+				if m.nodeManager == nil {
+					slog.ErrorContext(ctx, "muxer: node manager is nil on server side")
+					continue
+				}
 
+				bidi = m.register(msg.StoreID, msg.ChannelID)
+
+				instance, err := m.nodeManager.GetOrCreate(ctx, msg.StoreID)
+				if err != nil {
+					slog.ErrorContext(ctx, "muxer: failed to get or create node")
+					continue
+				}
+
+				go instance.Handle(ctx, bidi)
 			}
 
-			go func(ctx context.Context, bidi api.BidiStream, instance node.Node) {
-				instance.Handle(ctx, bidi)
-			}(ctx, bidi, instance)
-		}
+			select {
+			case bidi.RecvChan() <- msg.Payload:
+				slog.DebugContext(ctx, "muxer: delivered message",
+					slog.String("channel_id", msg.ChannelID.String()))
+			case <-bidi.closed:
+				slog.DebugContext(ctx, "muxer: dropped message for closed stream",
+					slog.String("channel_id", msg.ChannelID.String()))
+			}
 
-		select {
-		case bidi.RecvChan() <- msg.Payload:
-			slog.DebugContext(ctx, "muxer: sent message", slog.String("channel_id", msg.ChannelID.String()))
-		case <-bidi.closed:
-			slog.DebugContext(ctx, "muxer: dropped message for closed stream", slog.String("channel_id", msg.ChannelID.String()))
+		default:
+			slog.Warn("muxer: unrecognized control type",
+				slog.String("type", string(msg.ControlType)))
+			continue
 		}
 	}
 }
