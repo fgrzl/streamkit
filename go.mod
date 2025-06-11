@@ -9,7 +9,7 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.0.5
 	github.com/fgrzl/claims v0.0.1-alpha.15
 	github.com/fgrzl/enumerators v0.1.0-alpha.20
-	github.com/fgrzl/es v0.0.0-20250501132443-78c951391684
+	github.com/fgrzl/es v0.0.1-alpha.14
 	github.com/fgrzl/json v0.0.0-20250514205914-77c559a7b06d
 	github.com/fgrzl/lexkey v0.1.0-alpha.14
 	github.com/fgrzl/messaging v0.0.1-alpha.41
@@ -36,8 +36,6 @@ require (
 	github.com/cockroachdb/tokenbucket v0.0.0-20250429170803-42689b6311bb // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/fgrzl/streams v0.0.0-20250518171816-70f7a2409d1a // indirect
-	github.com/fgrzl/tickle v0.0.0-20250326142409-26a8ec1d1519 // indirect
 	github.com/getsentry/sentry-go v0.33.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
