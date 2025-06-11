@@ -72,7 +72,7 @@ func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 	url, err := url.Parse(server.URL)
 	require.NoError(t, err)
 
-	addr := "ws://" + url.Host + "/streamkit"
+	addr := "ws://" + url.Host
 	provider := wskit.NewBidiStreamProvider(addr, func() (string, error) { return token, nil })
 	client := streamkit.NewClient(provider)
 

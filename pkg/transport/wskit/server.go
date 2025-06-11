@@ -12,7 +12,7 @@ func ConfigureWebSocketServer(router *mux.Router, manager node.NodeManager) {
 	server := &webSocketServer{
 		manager: manager,
 	}
-	router.GET("/streamkit", server.connect)
+	router.GET("/", server.connect)
 }
 
 type webSocketServer struct {
