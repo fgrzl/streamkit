@@ -2,6 +2,10 @@ name: Pre-Release
 
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
 
 permissions:
   contents: write
@@ -25,56 +29,15 @@ jobs:
         id: version
         uses: gittools/actions/gitversion/execute@v4.0.1
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: 1.24.0
-
-      - name: Install Dependencies
-        run: go mod tidy
-
-      - name: Build Project
-        run: go build ./...
-
-      - name: Setup Test Infrastructure
-        run: docker compose -f test/compose.yml up -d
-
-      - name: Run Tests
-        run: go test ./... -v -coverprofile=coverage.out
-
       - name: Tag Commit
-        run: |
-          TAG=${{ steps.version.outputs.semVer }}
-          echo "Tagging as v$TAG"
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git tag "v$TAG"
-          git push origin "v$TAG"
+        uses: fgrzl/actions/tag-commit@v1
+        with:
+          tag: ${{ steps.version.outputs.semVer }}
 
       - name: Notify Go Proxy
-        run: |
-          TAG=${{ steps.version.outputs.semVer }}
-          curl -sSf "https://proxy.golang.org/github.com/${{ github.repository }}/@v/v$TAG.info"
+        uses: fgrzl/actions/notify-go-proxy@v1
+        with:
+          tag: ${{ steps.version.outputs.semVer }}
 
-      - name: Cleanup old pre-release tags
-        run: |
-          set -euo pipefail
-
-          # Fetch all tags
-          git fetch --tags
-
-          # List pre-release tags (with hyphen), sort descending
-          tags=$(git tag --list "v*-*" | sort -Vr)
-
-          # Skip if fewer than 6 tags
-          count=$(echo "$tags" | wc -l)
-          if [ "$count" -le 5 ]; then
-            echo "Only $count pre-release tags, skipping cleanup."
-            exit 0
-          fi
-
-          # Delete older tags beyond the latest 5
-          echo "$tags" | tail -n +6 | while read -r tag; do
-            echo "Deleting tag: $tag"
-            git push origin :refs/tags/"$tag"
-          done
+      - name: Prune Pre-release Tags
+        uses: fgrzl/actions/cleanup-old-prerelease-tags@v1
