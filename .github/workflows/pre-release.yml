@@ -16,12 +16,10 @@ jobs:
       - name: Checkout Full History
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  
+          fetch-depth: 0
 
       - name: Install GitVersion
         uses: gittools/actions/gitversion/setup@v4.0.1
-        with:
-          versionSpec: '6.0.0'
 
       - name: Calculate Version
         id: version
@@ -57,3 +55,26 @@ jobs:
         run: |
           TAG=${{ steps.version.outputs.semVer }}
           curl -sSf "https://proxy.golang.org/github.com/${{ github.repository }}/@v/v$TAG.info"
+
+      - name: Cleanup old pre-release tags
+        run: |
+          set -euo pipefail
+
+          # Fetch all tags
+          git fetch --tags
+
+          # List pre-release tags (with hyphen), sort descending
+          tags=$(git tag --list "v*-*" | sort -Vr)
+
+          # Skip if fewer than 6 tags
+          count=$(echo "$tags" | wc -l)
+          if [ "$count" -le 5 ]; then
+            echo "Only $count pre-release tags, skipping cleanup."
+            exit 0
+          fi
+
+          # Delete older tags beyond the latest 5
+          echo "$tags" | tail -n +6 | while read -r tag; do
+            echo "Deleting tag: $tag"
+            git push origin :refs/tags/"$tag"
+          done
