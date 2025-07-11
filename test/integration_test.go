@@ -19,6 +19,7 @@ import (
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streamkit/pkg/storage/azurekit"
 	"github.com/fgrzl/streamkit/pkg/storage/pebblekit"
+	"github.com/fgrzl/streamkit/pkg/transport/mockkit"
 	"github.com/fgrzl/streamkit/pkg/transport/wskit"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -30,21 +31,19 @@ var tester = claims.NewClaimsList("tenant_id", uuid.NewString()).Add("scopes", "
 
 var storeID = uuid.New()
 
-func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
+func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 
 	validator := &jwtkit.HMAC256Validator{
 		Secret: secret,
 	}
 
-	nodeManager := node.NewNodeManager(nil, factory)
+	nodeManager := node.NewNodeManager(node.WithStoreFactory(factory))
 
-	router := mux.NewRouter(nil)
+	router := mux.NewRouter()
 
-	router.UseAuthentication(&mux.AuthenticationOptions{
-		Validate: validator.Validate,
-	})
+	router.UseAuthentication(mux.WithValidator(validator.Validate))
 
-	router.UseAuthorization(&mux.AuthorizationOptions{})
+	router.UseAuthorization()
 
 	router.Healthz().AllowAnonymous()
 
@@ -82,7 +81,7 @@ func newTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 	return harness
 }
 
-func azureTestHarness(t *testing.T) *TestHarness {
+func azurekitTestHarness(t *testing.T) *TestHarness {
 	// Default Azurite configuration for local testing
 	accountName := "devstoreaccount1"
 	accountKey := "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
@@ -103,23 +102,43 @@ func azureTestHarness(t *testing.T) *TestHarness {
 	factory, err := azurekit.NewStoreFactory(options)
 	require.NoError(t, err)
 
-	return newTestHarness(t, factory)
+	return wskitTestHarness(t, factory)
 }
 
-func pebbleTestHarness(t *testing.T) *TestHarness {
+func pebblekitTestHarness(t *testing.T) *TestHarness {
 	options := &pebblekit.PebbleStoreOptions{
 		Path: t.TempDir(),
 	}
 	factory, err := pebblekit.NewStoreFactory(options)
 	require.NoError(t, err)
 
-	return newTestHarness(t, factory)
+	return wskitTestHarness(t, factory)
+}
+
+func mockkitTestHarness(t *testing.T) *TestHarness {
+	options := &pebblekit.PebbleStoreOptions{Path: t.TempDir()}
+	factory, err := pebblekit.NewStoreFactory(options)
+	require.NoError(t, err)
+
+	nodeManager := node.NewNodeManager(node.WithStoreFactory(factory))
+
+	provider := mockkit.NewMockBidiStreamProvider(t.Context(), nodeManager)
+	client := streamkit.NewClient(provider)
+
+	t.Cleanup(func() {
+		nodeManager.Close()
+	})
+
+	return &TestHarness{
+		Client: client,
+	}
 }
 
 func configurations(t *testing.T) map[string]*TestHarness {
 	return map[string]*TestHarness{
-		"azure":  azureTestHarness(t),
-		"pebble": pebbleTestHarness(t),
+		"azure":  azurekitTestHarness(t),
+		"pebble": pebblekitTestHarness(t),
+		"mock":   mockkitTestHarness(t),
 	}
 }
 
@@ -145,7 +164,6 @@ func TestMultipleCallStreams(t *testing.T) {
 func TestProduce(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should produce "+name, func(t *testing.T) {
-
 			for i := range 3 {
 				// Arrange
 				ctx := t.Context()
