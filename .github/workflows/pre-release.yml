@@ -15,6 +15,7 @@ jobs:
   TagAndPublish:
     name: Tag and Notify Go Proxy
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout Full History
