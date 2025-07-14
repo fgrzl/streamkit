@@ -34,8 +34,12 @@ func (s *MockBidiStream) Encode(m any) error {
 	if err != nil {
 		return err
 	}
-	s.sendChan <- payload
-	return nil
+	select {
+	case <-s.closed:
+		return io.ErrClosedPipe
+	case s.sendChan <- payload:
+		return nil
+	}
 }
 
 func (s *MockBidiStream) Decode(v any) error {
