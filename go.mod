@@ -10,7 +10,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.4.0
 	github.com/cockroachdb/pebble/v2 v2.0.6
 	github.com/fgrzl/claims v0.0.1-alpha.15
-	github.com/fgrzl/enumerators v0.1.0-alpha.32
+	github.com/fgrzl/enumerators v0.1.0-alpha.33
 	github.com/fgrzl/es v0.0.1-alpha.14
 	github.com/fgrzl/json v0.0.1-alpha.38
 	github.com/fgrzl/lexkey v0.1.0-alpha.23
