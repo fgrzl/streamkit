@@ -180,7 +180,10 @@ func (m *WebSocketMuxer) readLoop() {
 
 			if !exists {
 				if m.nodeManager == nil {
-					slog.ErrorContext(ctx, "muxer: node manager is nil on server side")
+					if m.name == "server" {
+						slog.ErrorContext(ctx, "muxer: node manager is nil on server side")
+						return
+					}
 					continue
 				}
 

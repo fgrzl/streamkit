@@ -248,10 +248,11 @@ func TestPeek(t *testing.T) {
 
 func TestConsumeSegment(t *testing.T) {
 	for name, h := range configurations(t) {
+
+		ctx := t.Context()
+		setupConsumerData(t, storeID, h.Client)
 		t.Run("should consume segment "+name, func(t *testing.T) {
 			// Arrange
-			ctx := t.Context()
-			setupConsumerData(t, storeID, h.Client)
 
 			args := &streamkit.ConsumeSegment{
 				Space:   "space0",
@@ -265,6 +266,23 @@ func TestConsumeSegment(t *testing.T) {
 			// Assert
 			assert.NoError(t, err)
 			assert.Len(t, entries, 253)
+		})
+
+		t.Run("should consume segment with exclusive min "+name, func(t *testing.T) {
+			// Arrange
+			args := &streamkit.ConsumeSegment{
+				Space:       "space0",
+				Segment:     "segment0",
+				MinSequence: 233,
+			}
+
+			// Act
+			results := h.Client.ConsumeSegment(ctx, storeID, args)
+			entries, err := enumerators.ToSlice(results)
+
+			// Assert
+			assert.NoError(t, err)
+			assert.Len(t, entries, 20)
 		})
 	}
 }

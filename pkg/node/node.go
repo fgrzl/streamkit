@@ -120,41 +120,24 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 	entries := api.NewStreamEnumerator[*api.Record](bidi)
 	results := n.store.Produce(ctx, args, entries)
 
-	for results.MoveNext() {
-		if !checkContext(ctx, bidi) {
-			return
-		}
-		result, err := results.Current()
-		if err != nil {
-			bidi.CloseSend(err)
-			return
-		}
+	bus := n.getBus(ctx)
+
+	err := enumerators.ForEach(results, func(result *api.SegmentStatus) error {
 		if err := bidi.Encode(result); err != nil {
-			bidi.CloseSend(err)
-			return
+			return err
 		}
-
-		notification := &SegmentNotification{
-			StoreID:       n.storeID,
-			SegmentStatus: result,
-		}
-
-		if n.busFactory == nil {
-			slog.WarnContext(ctx, "the message bus factory was not configured")
-		} else {
-			bus, err := n.busFactory.Get(ctx)
-			if err != nil {
-				slog.WarnContext(ctx, "the message bus factory was not configured")
-			} else {
-
-				if err := bus.Notify(notification); err != nil {
-					slog.WarnContext(ctx, err.Error())
-				}
+		if bus != nil {
+			notification := &SegmentNotification{
+				StoreID:       n.storeID,
+				SegmentStatus: result,
+			}
+			if err := bus.Notify(notification); err != nil {
+				slog.WarnContext(ctx, err.Error())
 			}
 		}
-	}
-
-	if err := results.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		slog.ErrorContext(ctx, "produce failed", "err", err)
 		bidi.CloseSend(err)
 		return
@@ -212,6 +195,18 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		<-bidi.Closed() // blocks until closed
 		sub.Unsubscribe()
 	}()
+}
+
+func (n *defaultNode) getBus(ctx context.Context) messaging.MessageBus {
+	if n.busFactory == nil {
+		return nil
+	}
+	bus, err := n.busFactory.Get(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "the message bus factory was not configured")
+		return nil
+	}
+	return bus
 }
 
 func streamNames(ctx context.Context, enumerator enumerators.Enumerator[string], bidi api.BidiStream) {

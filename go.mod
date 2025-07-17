@@ -10,10 +10,10 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.4.0
 	github.com/cockroachdb/pebble/v2 v2.0.6
 	github.com/fgrzl/claims v0.0.1-alpha.15
-	github.com/fgrzl/enumerators v0.1.0-alpha.32
+	github.com/fgrzl/enumerators v0.1.0-alpha.33
 	github.com/fgrzl/es v0.0.1-alpha.14
-	github.com/fgrzl/json v0.0.1-alpha.38
-	github.com/fgrzl/lexkey v0.1.0-alpha.23
+	github.com/fgrzl/json v0.1.0-alpha.40
+	github.com/fgrzl/lexkey v0.1.0-alpha.24
 	github.com/fgrzl/messaging v0.0.1-alpha.47
 	github.com/fgrzl/mux v0.0.1-alpha.47
 	github.com/fgrzl/timestamp v0.1.0-alpha.7
@@ -42,7 +42,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.3 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
@@ -64,7 +64,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.37.0 // indirect
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	golang.org/x/crypto v0.40.0 // indirect
-	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc // indirect
 	golang.org/x/sys v0.34.0 // indirect
 	golang.org/x/text v0.27.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
