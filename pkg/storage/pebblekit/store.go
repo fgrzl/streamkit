@@ -286,7 +286,7 @@ func (s *PebbleStore) calculateSegmentBounds(ts int64, args *api.ConsumeSegment)
 func (s *PebbleStore) getSegmentBounds(space, segment string, minSeq, maxSeq uint64) (lexkey.LexKey, lexkey.LexKey) {
 	lower := lexkey.EncodeFirst(api.DATA, api.SEGMENTS, space, segment)
 	if minSeq > 0 {
-		lower = lexkey.Encode(api.DATA, api.SEGMENTS, space, segment, minSeq)
+		lower = lexkey.EncodeFirst(api.DATA, api.SEGMENTS, space, segment, minSeq)
 	}
 	upper := lexkey.EncodeLast(api.DATA, api.SEGMENTS, space, segment)
 	if maxSeq > 0 {
