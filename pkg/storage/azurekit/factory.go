@@ -1,3 +1,9 @@
+// Package azurekit provides an Azure Table Storage-based implementation
+// for the streamkit streaming platform.
+//
+// This package implements the storage interface using Azure Table Storage
+// as the backend, providing cloud-native, scalable storage with support
+// for distributed access and high availability.
 package azurekit
 
 import (

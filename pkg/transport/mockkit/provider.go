@@ -1,8 +1,12 @@
+// Package mockkit provides in-memory mock implementations of transport
+// interfaces for testing and development purposes.
+//
+// This package implements bidirectional streaming without network transport,
+// allowing for fast unit testing and local development of streamkit applications.
 package mockkit
 
 import (
 	"context"
-	"sync"
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -10,14 +14,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// MockBidiStreamPair represents a connected pair of mock bidirectional streams.
 type MockBidiStreamPair struct {
 	Client *MockBidiStream
 	Server *MockBidiStream
 }
 
+// MockBidiStreamProvider provides mock bidirectional streams for testing.
 type MockBidiStreamProvider struct {
-	mu    sync.Mutex
-	calls []MockBidiStreamPair
 	muxer *MockMuxer
 }
 

@@ -7,6 +7,7 @@ import (
 	"github.com/fgrzl/enumerators"
 )
 
+// BidiStreamEnumerator provides an enumerator interface over a bidirectional stream.
 type BidiStreamEnumerator[T any] struct {
 	stream  BidiStream
 	end     error
@@ -43,7 +44,7 @@ func (e *BidiStreamEnumerator[T]) Dispose() {
 	e.stream.Close(e.Err())
 }
 
-// A new enumerator of the responses
+// NewStreamEnumerator creates a new enumerator that reads responses from a bidirectional stream.
 func NewStreamEnumerator[T any](stream BidiStream) enumerators.Enumerator[T] {
 	return &BidiStreamEnumerator[T]{stream: stream, end: stream.EndOfStreamError()}
 }
