@@ -250,7 +250,7 @@ func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 	for name, h := range configurations(t) {
 		ctx := t.Context()
 		setupConsumerData(t, storeID, h.Client)
-		
+
 		t.Run("should consume segment "+name, func(t *testing.T) {
 			// Arrange
 			args := &streamkit.ConsumeSegment{
@@ -273,7 +273,7 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 	for name, h := range configurations(t) {
 		ctx := t.Context()
 		setupConsumerData(t, storeID, h.Client)
-		
+
 		t.Run("should consume segment with exclusive min "+name, func(t *testing.T) {
 			// Arrange
 			args := &streamkit.ConsumeSegment{

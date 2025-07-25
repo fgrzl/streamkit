@@ -23,25 +23,30 @@ var (
 	ERR_WRITE_TRX                error = NewTransientError("failed to write transaction")
 )
 
+// StreamsError represents errors that occur within the streaming system.
 type StreamsError struct {
 	Code    int
 	Message string
 }
 
+// Error returns the error message string.
 func (e *StreamsError) Error() string {
 	return e.Message
 }
 
 const (
+	// ErrCodeTransient indicates a temporary error that may be retried.
 	ErrCodeTransient = 1
+	// ErrCodePermanent indicates a permanent error that should not be retried.
 	ErrCodePermanent = 2
 )
 
-// Error helpers
+// NewTransientError creates a new transient error with the given message.
 func NewTransientError(msg string) error {
 	return &StreamsError{Code: ErrCodeTransient, Message: msg}
 }
 
+// NewPermanentError creates a new permanent error with the given message.
 func NewPermanentError(msg string) error {
 	return &StreamsError{Code: ErrCodePermanent, Message: msg}
 }

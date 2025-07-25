@@ -2,7 +2,6 @@ package mockkit
 
 import (
 	"context"
-	"sync"
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -16,8 +15,6 @@ type MockBidiStreamPair struct {
 }
 
 type MockBidiStreamProvider struct {
-	mu    sync.Mutex
-	calls []MockBidiStreamPair
 	muxer *MockMuxer
 }
 
