@@ -44,31 +44,31 @@ type ClientFactory interface {
 type Client interface {
 	// GetSpaces returns an enumerator of space names for the given store.
 	GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[string]
-	
+
 	// GetSegments returns an enumerator of segment names within the specified space.
 	GetSegments(ctx context.Context, storeID uuid.UUID, space string) enumerators.Enumerator[string]
-	
+
 	// Peek returns the latest entry in the specified segment without consuming it.
 	Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*Entry, error)
-	
+
 	// Consume reads entries from multiple spaces based on the provided consumption arguments.
 	Consume(ctx context.Context, storeID uuid.UUID, args *Consume) enumerators.Enumerator[*Entry]
-	
+
 	// ConsumeSpace reads entries from all segments within a space, returning them in timestamp order.
 	ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *ConsumeSpace) enumerators.Enumerator[*Entry]
-	
+
 	// ConsumeSegment reads entries from a specific segment in sequence order.
 	ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *ConsumeSegment) enumerators.Enumerator[*Entry]
-	
+
 	// Produce writes a stream of records to the specified segment and returns status updates.
 	Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus]
-	
+
 	// Publish writes a single record to the specified segment.
 	Publish(ctx context.Context, storeID uuid.UUID, space, segment string, payload []byte, metadata map[string]string) error
-	
+
 	// SubscribeToSpace subscribes to status updates for all segments within a space.
 	SubscribeToSpace(ctx context.Context, storeID uuid.UUID, space string, handler func(*SegmentStatus)) (api.Subscription, error)
-	
+
 	// SubscribeToSegment subscribes to status updates for a specific segment.
 	SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error)
 }

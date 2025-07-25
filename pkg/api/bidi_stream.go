@@ -5,16 +5,16 @@ package api
 type BidiStream interface {
 	// Encode sends a message through the stream.
 	Encode(m any) error
-	
+
 	// Decode receives a message from the stream.
 	Decode(m any) (err error)
-	
+
 	// CloseSend signals that no more messages will be sent, optionally with an error.
 	CloseSend(error) error
-	
+
 	// Close terminates the entire stream with an optional error.
 	Close(error)
-	
+
 	// EndOfStreamError returns the error type used to signal end of stream.
 	EndOfStreamError() error
 

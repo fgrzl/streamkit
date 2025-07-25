@@ -18,12 +18,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// PebbleStore implements the storage interface using PebbleDB as the backend.
 type PebbleStore struct {
 	db        *pebble.DB
 	cache     *cache.ExpiringCache
 	closeOnce sync.Once
 }
 
+// NewPebbleStore creates a new PebbleStore instance at the specified path with caching.
 func NewPebbleStore(path string, cache *cache.ExpiringCache) (*PebbleStore, error) {
 	dbPath := filepath.Join(path, "streams")
 	db, err := pebble.Open(dbPath, &pebble.Options{})

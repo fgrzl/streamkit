@@ -26,22 +26,22 @@ type StoreFactory interface {
 type Store interface {
 	// GetSpaces returns an enumerator of all available space names.
 	GetSpaces(ctx context.Context) enumerators.Enumerator[string]
-	
+
 	// ConsumeSpace reads entries from all segments within a space, ordered by timestamp.
 	ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry]
-	
+
 	// GetSegments returns an enumerator of all segment names within the specified space.
 	GetSegments(ctx context.Context, space string) enumerators.Enumerator[string]
-	
+
 	// ConsumeSegment reads entries from a specific segment in sequence order.
 	ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry]
-	
+
 	// Peek returns the latest entry from the specified segment without consuming it.
 	Peek(ctx context.Context, space, segment string) (*api.Entry, error)
-	
+
 	// Produce writes a stream of records to the specified segment and returns status updates.
 	Produce(ctx context.Context, args *api.Produce, entries enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus]
-	
+
 	// Close releases all resources associated with the store.
 	Close()
 }
