@@ -1,3 +1,10 @@
+// Package node provides the core request handling and coordination logic
+// for the streamkit streaming platform.
+//
+// This package implements the Node interface which processes incoming
+// requests and coordinates with storage backends to fulfill streaming
+// operations. It also manages node lifecycle and provides notification
+// capabilities for real-time updates.
 package node
 
 import (
@@ -13,11 +20,16 @@ import (
 	"github.com/google/uuid"
 )
 
+// Node represents a request handler that processes streaming operations
+// and coordinates with storage backends.
 type Node interface {
+	// Handle processes incoming bidirectional stream requests.
 	Handle(context.Context, api.BidiStream)
+	// Close releases all resources associated with the node.
 	Close()
 }
 
+// NewNode creates a new Node instance with the specified store and optional message bus factory.
 func NewNode(storeID uuid.UUID, store storage.Store, busFactory messaging.MessageBusFactory) Node {
 	return &defaultNode{
 		storeID:    storeID,

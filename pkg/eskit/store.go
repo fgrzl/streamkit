@@ -1,3 +1,9 @@
+// Package eskit provides integration between the streamkit streaming platform
+// and event sourcing capabilities.
+//
+// This package implements an event store adapter that bridges streamkit's
+// streaming APIs with domain event persistence patterns, enabling event-driven
+// architectures built on top of the streaming platform.
 package eskit
 
 import (
@@ -12,6 +18,7 @@ import (
 	"github.com/fgrzl/streamkit"
 )
 
+// NewStreamStore creates a new event store implementation backed by a streamkit client.
 func NewStreamStore(client streamkit.Client) es.Store {
 	return &streamStore{
 		client: client,
