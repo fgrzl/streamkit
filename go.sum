@@ -57,8 +57,8 @@ github.com/fgrzl/json v0.1.0-alpha.40 h1:xX0LQAxwtNUvjToDBJd0HM9atOOamq5eo/BOAHg
 github.com/fgrzl/json v0.1.0-alpha.40/go.mod h1:uhY90IO9L/wJ4qXdqHBS0PLC14YlwrpUMU8O2D9YGxQ=
 github.com/fgrzl/lexkey v0.1.0-alpha.32 h1:8UMk/VnYRl4ZRFAeJLcCdrL5VpGikiDcWAMnzzCSpOU=
 github.com/fgrzl/lexkey v0.1.0-alpha.32/go.mod h1:DfrNX28YpZvrxyDm+jYQ6Jv2pJbZxQoMS1dcBSwBv58=
-github.com/fgrzl/messaging v0.0.1-alpha.47 h1:ViG/+UD5Wn9kEJ/RUMyMADMXCEQsWdf4+a9+p3Wvcnw=
-github.com/fgrzl/messaging v0.0.1-alpha.47/go.mod h1:bc9pt7iqzZOeHn/p8a27IMKjRvVS7Imi0enjpvd7ltg=
+github.com/fgrzl/messaging v0.0.1-alpha.53 h1:LvYI77JeITauvfFh/SGZ8ohJk6AVcwNrtiyPrv7gd0E=
+github.com/fgrzl/messaging v0.0.1-alpha.53/go.mod h1:17daNAA5adzvwcUiIjdNToxdMJ2dqiM+D6I2GC3IOOo=
 github.com/fgrzl/mux v0.0.1-alpha.55 h1:zt42BMpE1uzV80fudoYrFaNtIAGw2urqqlsaLK6XipU=
 github.com/fgrzl/mux v0.0.1-alpha.55/go.mod h1:ZaL8U1oqSVDo1pgXOa4dBjwtTUyoUktak4y/f/0VoCk=
 github.com/fgrzl/timestamp v0.1.0-alpha.7 h1:fpZd2kTyqXdensrODPrTq+4AqWFAp8uhJT6y4HQG5Wk=
