@@ -9,12 +9,12 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.1
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.4.0
 	github.com/cockroachdb/pebble/v2 v2.0.6
-	github.com/fgrzl/claims v0.0.1-alpha.15
+	github.com/fgrzl/claims v0.0.1-alpha.17
 	github.com/fgrzl/enumerators v0.1.0-alpha.39
 	github.com/fgrzl/es v0.0.1-alpha.14
-	github.com/fgrzl/json v0.1.0-alpha.40
+	github.com/fgrzl/json v0.1.0-alpha.41
 	github.com/fgrzl/lexkey v0.1.0-alpha.32
-	github.com/fgrzl/messaging v0.0.1-alpha.47
+	github.com/fgrzl/messaging v0.0.1-alpha.56
 	github.com/fgrzl/mux v0.0.1-alpha.55
 	github.com/fgrzl/timestamp v0.1.0-alpha.7
 	github.com/golang/snappy v1.0.0
@@ -42,7 +42,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/golang-jwt/jwt/v5 v5.2.3 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
