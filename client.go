@@ -1,3 +1,11 @@
+// Package streamkit provides a high-throughput, hierarchical event streaming platform
+// designed for scalable, organized, and reliable data flows.
+//
+// The package offers a client interface for interacting with streaming stores,
+// spaces, and segments. A Store provides physical separation at the storage level,
+// acting as the root for all spaces and segments. A Space is a top-level logical
+// container for related streams, while Segments are independent, ordered sub-streams
+// within a Space.
 package streamkit
 
 import (
@@ -26,23 +34,46 @@ type (
 	Produce        = api.Produce
 )
 
+// ClientFactory defines how to create new Client instances.
 type ClientFactory interface {
 	Get(ctx context.Context) (Client, error)
 }
 
+// Client provides the main interface for interacting with the streaming platform.
+// It supports operations for spaces, segments, consumption, production, and subscriptions.
 type Client interface {
+	// GetSpaces returns an enumerator of space names for the given store.
 	GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[string]
+
+	// GetSegments returns an enumerator of segment names within the specified space.
 	GetSegments(ctx context.Context, storeID uuid.UUID, space string) enumerators.Enumerator[string]
+
+	// Peek returns the latest entry in the specified segment without consuming it.
 	Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*Entry, error)
+
+	// Consume reads entries from multiple spaces based on the provided consumption arguments.
 	Consume(ctx context.Context, storeID uuid.UUID, args *Consume) enumerators.Enumerator[*Entry]
+
+	// ConsumeSpace reads entries from all segments within a space, returning them in timestamp order.
 	ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *ConsumeSpace) enumerators.Enumerator[*Entry]
+
+	// ConsumeSegment reads entries from a specific segment in sequence order.
 	ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *ConsumeSegment) enumerators.Enumerator[*Entry]
+
+	// Produce writes a stream of records to the specified segment and returns status updates.
 	Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus]
+
+	// Publish writes a single record to the specified segment.
 	Publish(ctx context.Context, storeID uuid.UUID, space, segment string, payload []byte, metadata map[string]string) error
+
+	// SubscribeToSpace subscribes to status updates for all segments within a space.
 	SubscribeToSpace(ctx context.Context, storeID uuid.UUID, space string, handler func(*SegmentStatus)) (api.Subscription, error)
+
+	// SubscribeToSegment subscribes to status updates for a specific segment.
 	SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error)
 }
 
+// NewClient creates a new Client instance using the provided BidiStreamProvider.
 func NewClient(provider api.BidiStreamProvider) Client {
 	return &client{provider: provider}
 }

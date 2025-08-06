@@ -1,3 +1,9 @@
+// Package wskit provides WebSocket-based transport implementation
+// for the streamkit streaming platform.
+//
+// This package implements bidirectional streaming over WebSocket connections,
+// including connection management, message multiplexing, and integration
+// with the node management system.
 package wskit
 
 import (
@@ -8,6 +14,8 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+// ConfigureWebSocketServer configures a WebSocket endpoint on the provided router
+// that integrates with the node manager for handling streaming requests.
 func ConfigureWebSocketServer(router *mux.Router, manager node.NodeManager) {
 	server := &webSocketServer{
 		manager: manager,

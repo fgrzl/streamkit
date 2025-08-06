@@ -142,7 +142,7 @@ func configurations(t *testing.T) map[string]*TestHarness {
 	}
 }
 
-func TestMultipleCallStreams(t *testing.T) {
+func TestShouldAllowMultiplexedCallsWhenUsingDifferentSegments(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should allow for multiplexed calls "+name, func(t *testing.T) {
 			for i := range 3 {
@@ -161,7 +161,7 @@ func TestMultipleCallStreams(t *testing.T) {
 	}
 }
 
-func TestProduce(t *testing.T) {
+func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should produce "+name, func(t *testing.T) {
 			for i := range 3 {
@@ -181,7 +181,7 @@ func TestProduce(t *testing.T) {
 	}
 }
 
-func TestGetSpaces(t *testing.T) {
+func TestShouldReturnAllSpacesWhenRequested(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should get spaces "+name, func(t *testing.T) {
 			// Arrange
@@ -204,7 +204,7 @@ func TestGetSpaces(t *testing.T) {
 	}
 }
 
-func TestGetSegments(t *testing.T) {
+func TestShouldReturnAllSegmentsWhenGivenValidSpace(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should get segments "+name, func(t *testing.T) {
 			// Arrange
@@ -227,7 +227,7 @@ func TestGetSegments(t *testing.T) {
 	}
 }
 
-func TestPeek(t *testing.T) {
+func TestShouldReturnCorrectEntryWhenPeekingAtSegment(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should peek "+name, func(t *testing.T) {
 			// Arrange
@@ -246,14 +246,13 @@ func TestPeek(t *testing.T) {
 	}
 }
 
-func TestConsumeSegment(t *testing.T) {
+func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 	for name, h := range configurations(t) {
-
 		ctx := t.Context()
 		setupConsumerData(t, storeID, h.Client)
+
 		t.Run("should consume segment "+name, func(t *testing.T) {
 			// Arrange
-
 			args := &streamkit.ConsumeSegment{
 				Space:   "space0",
 				Segment: "segment0",
@@ -267,6 +266,13 @@ func TestConsumeSegment(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Len(t, entries, 253)
 		})
+	}
+}
+
+func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
+	for name, h := range configurations(t) {
+		ctx := t.Context()
+		setupConsumerData(t, storeID, h.Client)
 
 		t.Run("should consume segment with exclusive min "+name, func(t *testing.T) {
 			// Arrange
@@ -287,7 +293,7 @@ func TestConsumeSegment(t *testing.T) {
 	}
 }
 
-func TestConsumeSpace(t *testing.T) {
+func TestShouldConsumeAllEntriesWhenGivenValidSpace(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should consume space "+name, func(t *testing.T) {
 			// Arrange
@@ -309,7 +315,7 @@ func TestConsumeSpace(t *testing.T) {
 	}
 }
 
-func TestConsume(t *testing.T) {
+func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 	for name, h := range configurations(t) {
 		t.Run("should consume interleaved spaces "+name, func(t *testing.T) {
 			// Arrange

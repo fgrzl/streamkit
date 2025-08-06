@@ -10,7 +10,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestTransactionMarshalJSON(t *testing.T) {
+func TestShouldMarshalAndUnmarshalTransactionWhenGivenValidData(t *testing.T) {
+	// Arrange
 	ts := timestamp.GetTimestamp()
 	trx := api.TRX{Node: uuid.New(), ID: uuid.New(), Number: 1}
 	entries := []*api.Entry{{
@@ -22,7 +23,7 @@ func TestTransactionMarshalJSON(t *testing.T) {
 		Payload:   []byte("data"),
 	}}
 
-	trn := &Transaction{
+	originalTransaction := &Transaction{
 		TRX:           trx,
 		Space:         "space0",
 		Segment:       "segment0",
@@ -32,20 +33,22 @@ func TestTransactionMarshalJSON(t *testing.T) {
 		Timestamp:     ts,
 	}
 
-	trnJSON, err := json.Marshal(trn)
+	// Act
+	trnJSON, err := json.Marshal(originalTransaction)
 	assert.NoError(t, err)
 	assert.NotNil(t, trnJSON)
 
-	trn2 := &Transaction{}
-	err = json.Unmarshal(trnJSON, trn2)
-	assert.NoError(t, err)
-	assert.NotNil(t, trn2)
+	unmarshaledTransaction := &Transaction{}
+	err = json.Unmarshal(trnJSON, unmarshaledTransaction)
 
-	assert.Equal(t, trn.TRX, trn2.TRX)
-	assert.Equal(t, trn.Space, trn2.Space)
-	assert.Equal(t, trn.Segment, trn2.Segment)
-	assert.Equal(t, trn.FirstSequence, trn2.FirstSequence)
-	assert.Equal(t, trn.LastSequence, trn2.LastSequence)
-	assert.Equal(t, len(trn.Entries), len(trn2.Entries))
-	assert.Equal(t, trn.Timestamp, trn2.Timestamp)
+	// Assert
+	assert.NoError(t, err)
+	assert.NotNil(t, unmarshaledTransaction)
+	assert.Equal(t, originalTransaction.TRX, unmarshaledTransaction.TRX)
+	assert.Equal(t, originalTransaction.Space, unmarshaledTransaction.Space)
+	assert.Equal(t, originalTransaction.Segment, unmarshaledTransaction.Segment)
+	assert.Equal(t, originalTransaction.FirstSequence, unmarshaledTransaction.FirstSequence)
+	assert.Equal(t, originalTransaction.LastSequence, unmarshaledTransaction.LastSequence)
+	assert.Equal(t, len(originalTransaction.Entries), len(unmarshaledTransaction.Entries))
+	assert.Equal(t, originalTransaction.Timestamp, unmarshaledTransaction.Timestamp)
 }
