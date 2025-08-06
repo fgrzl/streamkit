@@ -127,7 +127,7 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 			return err
 		}
 		if bus != nil {
-			notification := &SegmentNotification{
+			notification := &api.SegmentNotification{
 				StoreID:       n.storeID,
 				SegmentStatus: result,
 			}
@@ -175,8 +175,8 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
-	route := GetSegmentNotificationRoute(n.storeID, args.Space)
-	sub, err := messaging.Subscribe(bus, route, func(ctx context.Context, msg *SegmentNotification) error {
+	route := api.GetSegmentNotificationRoute(n.storeID, args.Space)
+	sub, err := messaging.Subscribe(bus, route, func(ctx context.Context, msg *api.SegmentNotification) error {
 
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {

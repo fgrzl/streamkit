@@ -3,6 +3,7 @@ package api
 import (
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/lexkey"
+	"github.com/fgrzl/messaging"
 	"github.com/google/uuid"
 )
 
@@ -10,11 +11,12 @@ func init() {
 	polymorphic.Register(func() *Consume { return &Consume{} })
 	polymorphic.Register(func() *ConsumeSegment { return &ConsumeSegment{} })
 	polymorphic.Register(func() *ConsumeSpace { return &ConsumeSpace{} })
-	polymorphic.Register(func() *GetSpaces { return &GetSpaces{} })
 	polymorphic.Register(func() *GetSegments { return &GetSegments{} })
+	polymorphic.Register(func() *GetSpaces { return &GetSpaces{} })
 	polymorphic.Register(func() *GetStatus { return &GetStatus{} })
 	polymorphic.Register(func() *Peek { return &Peek{} })
 	polymorphic.Register(func() *Produce { return &Produce{} })
+	polymorphic.Register(func() *SegmentNotification { return &SegmentNotification{} })
 	polymorphic.Register(func() *SegmentStatus { return &SegmentStatus{} })
 	polymorphic.Register(func() *SubscribeToSegmentStatus { return &SubscribeToSegmentStatus{} })
 }
@@ -41,6 +43,24 @@ type SegmentStatus struct {
 
 func (m *SegmentStatus) GetDiscriminator() string {
 	return "streamkit://api/v1/segment_status"
+}
+
+type SegmentNotification struct {
+	StoreID       uuid.UUID      `json:"store_id"`
+	SegmentStatus *SegmentStatus `json:"segment_status"`
+}
+
+func (obj *SegmentNotification) GetDiscriminator() string {
+	return "streamkit://api/v1/segment_notification"
+}
+
+func (obj *SegmentNotification) GetRoute() messaging.Route {
+	return GetSegmentNotificationRoute(obj.StoreID, obj.SegmentStatus.Space)
+}
+
+func GetSegmentNotificationRoute(storeID uuid.UUID, space string) messaging.Route {
+	inboxID := uuid.NewSHA1(storeID, []byte(space))
+	return messaging.NewInboxRoute("streamkit", "segment_notification", &inboxID)
 }
 
 // ─── API Messages ──────────────────────────────────────────────────────────────
