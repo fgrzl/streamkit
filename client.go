@@ -35,7 +35,7 @@ type (
 
 	// Interfaces
 	Consumable = api.Consumable
-	Routeable  = Routeable
+	Routeable  = api.Routeable
 )
 
 // ClientFactory defines how to create new Client instances.
