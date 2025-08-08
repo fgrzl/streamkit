@@ -11,7 +11,7 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.0.6
 	github.com/fgrzl/claims v0.0.1-alpha.19
 	github.com/fgrzl/enumerators v0.1.0-alpha.39
-	github.com/fgrzl/es v0.0.1-alpha.14
+	github.com/fgrzl/es v0.0.1-alpha.19
 	github.com/fgrzl/json v0.1.0-alpha.41
 	github.com/fgrzl/lexkey v0.1.0-alpha.32
 	github.com/fgrzl/messaging v0.0.1-alpha.60
@@ -20,7 +20,7 @@ require (
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.10.0
-	golang.org/x/net v0.42.0
+	golang.org/x/net v0.43.0
 )
 
 require (
@@ -72,7 +72,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.37.0 // indirect
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.7.1 // indirect
-	golang.org/x/crypto v0.40.0 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/exp v0.0.0-20250718183923-645b1fa84792 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
