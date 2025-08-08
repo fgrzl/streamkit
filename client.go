@@ -32,6 +32,10 @@ type (
 	GetStatus      = api.GetStatus
 	Peek           = api.Peek
 	Produce        = api.Produce
+
+	// Interfaces
+	Consumable = api.Consumable
+	Routeable  = api.Routeable
 )
 
 // ClientFactory defines how to create new Client instances.
