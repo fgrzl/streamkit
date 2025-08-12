@@ -27,9 +27,9 @@ type webSocketServer struct {
 	manager node.NodeManager
 }
 
-func (s *webSocketServer) connect(c *mux.RouteContext) {
+func (s *webSocketServer) connect(c mux.RouteContext) {
 
-	session, err := NewServerMuxerSession(c.User)
+	session, err := NewServerMuxerSession(c.User())
 	if err != nil {
 		c.Unauthorized()
 	}
@@ -40,7 +40,7 @@ func (s *webSocketServer) connect(c *mux.RouteContext) {
 		manager: s.manager,
 	}
 
-	websocket.Handler(handler.handle).ServeHTTP(c.Response, c.Request)
+	websocket.Handler(handler.handle).ServeHTTP(c.Response(), c.Request())
 }
 
 type webSocketHandler struct {
