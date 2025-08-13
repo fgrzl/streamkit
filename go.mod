@@ -15,7 +15,7 @@ require (
 	github.com/fgrzl/json v0.1.0-alpha.41
 	github.com/fgrzl/lexkey v0.1.0-alpha.32
 	github.com/fgrzl/messaging v0.0.1-alpha.60
-	github.com/fgrzl/mux v0.0.1-alpha.85
+	github.com/fgrzl/mux v0.0.1-alpha.89
 	github.com/fgrzl/timestamp v0.1.0-alpha.11
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
