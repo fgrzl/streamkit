@@ -15,7 +15,7 @@ require (
 	github.com/fgrzl/json v0.1.0-alpha.41
 	github.com/fgrzl/lexkey v0.1.0-alpha.32
 	github.com/fgrzl/messaging v0.0.1-alpha.60
-	github.com/fgrzl/mux v0.0.1-alpha.85
+	github.com/fgrzl/mux v0.0.1-alpha.92
 	github.com/fgrzl/timestamp v0.1.0-alpha.11
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
@@ -40,7 +40,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/fgrzl/telemetry v0.1.0-alpha.9 // indirect
-	github.com/getsentry/sentry-go v0.35.0 // indirect
+	github.com/getsentry/sentry-go v0.35.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
@@ -73,7 +73,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.7.1 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
-	golang.org/x/exp v0.0.0-20250811191247-51f88131bc50 // indirect
+	golang.org/x/exp v0.0.0-20250813145105-42675adae3e6 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250811230008-5f3141c8851a // indirect
