@@ -19,7 +19,7 @@ require (
 	github.com/fgrzl/timestamp v0.1.0-alpha.11
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.0
 	golang.org/x/net v0.43.0
 )
 
