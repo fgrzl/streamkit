@@ -1,9 +1,8 @@
-package codec_test
+package codec
 
 import (
 	"testing"
 
-	codec "github.com/fgrzl/streamkit/internal/codec"
 	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
@@ -32,11 +31,11 @@ func TestEncodeDecodeEntryRoundtrip(t *testing.T) {
 		e := makeTestEntry(1)
 
 		t.Run("When it is encoded and decoded", func(t *testing.T) {
-			data, err := codec.EncodeEntry(e)
+			data, err := EncodeEntry(e)
 			require.NoError(t, err)
 
 			got := &api.Entry{}
-			err = codec.DecodeEntry(data, got)
+			err = DecodeEntry(data, got)
 			require.NoError(t, err)
 
 			t.Run("Then the decoded entry should match the original", func(t *testing.T) {
@@ -51,11 +50,11 @@ func TestEncodeDecodeEntrySnappyRoundtrip(t *testing.T) {
 		e := makeTestEntry(2)
 
 		t.Run("When it is encoded and decoded with snappy", func(t *testing.T) {
-			data, err := codec.EncodeEntrySnappy(e)
+			data, err := EncodeEntrySnappy(e)
 			require.NoError(t, err)
 
 			got := &api.Entry{}
-			err = codec.DecodeEntrySnappy(data, got)
+			err = DecodeEntrySnappy(data, got)
 			require.NoError(t, err)
 
 			t.Run("Then the decoded entry should match the original", func(t *testing.T) {
@@ -85,11 +84,11 @@ func TestEncodeDecodeTransactionRoundtrip(t *testing.T) {
 		tr := makeTestTransaction()
 
 		t.Run("When it is encoded and decoded", func(t *testing.T) {
-			data, err := codec.EncodeTransaction(tr)
+			data, err := EncodeTransaction(tr)
 			require.NoError(t, err)
 
 			got := &txn.Transaction{}
-			err = codec.DecodeTransaction(data, got)
+			err = DecodeTransaction(data, got)
 			require.NoError(t, err)
 
 			t.Run("Then the decoded transaction should match the original", func(t *testing.T) {
@@ -104,11 +103,11 @@ func TestEncodeDecodeTransactionSnappyRoundtrip(t *testing.T) {
 		tr := makeTestTransaction()
 
 		t.Run("When it is encoded and decoded with snappy", func(t *testing.T) {
-			data, err := codec.EncodeTransactionSnappy(tr)
+			data, err := EncodeTransactionSnappy(tr)
 			require.NoError(t, err)
 
 			got := &txn.Transaction{}
-			err = codec.DecodeTransactionSnappy(data, got)
+			err = DecodeTransactionSnappy(data, got)
 			require.NoError(t, err)
 
 			t.Run("Then the decoded transaction should match the original", func(t *testing.T) {
