@@ -45,7 +45,7 @@ func TestShouldMarshalAndUnmarshalTransactionWhenGivenValidData(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	require.NotNil(t, unmarshaledTransaction)
-	assert.NotNil(t, unmarshaledTransaction)
+
 	assert.Equal(t, originalTransaction.TRX, unmarshaledTransaction.TRX)
 	assert.Equal(t, originalTransaction.Space, unmarshaledTransaction.Space)
 	assert.Equal(t, originalTransaction.Segment, unmarshaledTransaction.Segment)
