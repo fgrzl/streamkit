@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fgrzl/streamkit/internal/cache"
+	cache "github.com/fgrzl/streamkit/internal/cache"
 	"github.com/stretchr/testify/assert"
 )
 

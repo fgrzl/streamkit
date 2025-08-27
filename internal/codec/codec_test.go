@@ -3,7 +3,7 @@ package codec_test
 import (
 	"testing"
 
-	"github.com/fgrzl/streamkit/internal/codec"
+	codec "github.com/fgrzl/streamkit/internal/codec"
 	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
