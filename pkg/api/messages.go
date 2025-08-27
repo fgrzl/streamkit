@@ -8,25 +8,10 @@
 package api
 
 import (
-	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/messaging"
 	"github.com/google/uuid"
 )
-
-func init() {
-	polymorphic.Register(func() *Consume { return &Consume{} })
-	polymorphic.Register(func() *ConsumeSegment { return &ConsumeSegment{} })
-	polymorphic.Register(func() *ConsumeSpace { return &ConsumeSpace{} })
-	polymorphic.Register(func() *GetSegments { return &GetSegments{} })
-	polymorphic.Register(func() *GetSpaces { return &GetSpaces{} })
-	polymorphic.Register(func() *GetStatus { return &GetStatus{} })
-	polymorphic.Register(func() *Peek { return &Peek{} })
-	polymorphic.Register(func() *Produce { return &Produce{} })
-	polymorphic.Register(func() *SegmentNotification { return &SegmentNotification{} })
-	polymorphic.Register(func() *SegmentStatus { return &SegmentStatus{} })
-	polymorphic.Register(func() *SubscribeToSegmentStatus { return &SubscribeToSegmentStatus{} })
-}
 
 // ─── Notification & Subscription ───────────────────────────────────────────────
 

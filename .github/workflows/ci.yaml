@@ -40,7 +40,7 @@ jobs:
         run: go build ./...
 
       - name: Setup Test Infrastructure
-        run: docker compose -f test/compose.yml up -d
+        run: docker compose -f test/compose.yaml up -d
 
       - name: Run Tests
         run: go test ./... -v -coverprofile=coverage.out
