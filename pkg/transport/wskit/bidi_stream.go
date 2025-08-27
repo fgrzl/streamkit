@@ -116,6 +116,34 @@ func (c *MuxerBidiStream) RecvChan() chan<- any {
 	return c.recvChan
 }
 
+// Offer attempts to deliver a message to the stream's receive channel.
+// It returns true if the message was delivered, or false if the stream
+// is closed or the delivery failed. This method recovers from a possible
+// panic caused by sending on a closed channel to be defensive against
+// races between senders and Close().
+func (c *MuxerBidiStream) Offer(msg any) (ok bool) {
+	// quick check: if closed, skip
+	select {
+	case <-c.closed:
+		return false
+	default:
+	}
+
+	// recover from potential panic if channel is closed concurrently
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+
+	select {
+	case c.recvChan <- msg:
+		return true
+	case <-c.closed:
+		return false
+	}
+}
+
 // IsClosed reports whether the stream has been closed.
 func (c *MuxerBidiStream) IsClosed() bool {
 	select {

@@ -198,11 +198,10 @@ func (m *WebSocketMuxer) readLoop() {
 				go instance.Handle(ctx, bidi)
 			}
 
-			select {
-			case bidi.RecvChan() <- msg.Payload:
+			if bidi.Offer(msg.Payload) {
 				slog.DebugContext(ctx, "muxer: delivered message",
 					slog.String("channel_id", msg.ChannelID.String()))
-			case <-bidi.closed:
+			} else {
 				slog.DebugContext(ctx, "muxer: dropped message for closed stream",
 					slog.String("channel_id", msg.ChannelID.String()))
 			}
