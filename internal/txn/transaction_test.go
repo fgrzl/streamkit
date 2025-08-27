@@ -1,9 +1,10 @@
-package txn
+package txn_test
 
 import (
 	"encoding/json"
 	"testing"
 
+	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/timestamp"
 	"github.com/google/uuid"
@@ -24,7 +25,7 @@ func TestShouldMarshalAndUnmarshalTransactionWhenGivenValidData(t *testing.T) {
 		Payload:   []byte("data"),
 	}}
 
-	originalTransaction := &Transaction{
+	originalTransaction := &txn.Transaction{
 		TRX:           trx,
 		Space:         "space0",
 		Segment:       "segment0",
@@ -39,7 +40,7 @@ func TestShouldMarshalAndUnmarshalTransactionWhenGivenValidData(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, trnJSON)
 
-	unmarshaledTransaction := &Transaction{}
+	unmarshaledTransaction := &txn.Transaction{}
 	err = json.Unmarshal(trnJSON, unmarshaledTransaction)
 
 	// Assert
