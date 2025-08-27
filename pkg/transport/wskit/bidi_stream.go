@@ -5,17 +5,18 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 // MuxerBidiStream is a bidirectional stream abstraction for use with a WebSocketMuxer.
 // It is envelope-agnostic and operates on raw JSON payloads.
 type MuxerBidiStream struct {
-	encode   func([]byte) error
-	recvChan chan any
-
-	closeOnce sync.Once
-	closed    chan struct{}
-	onClose   func()
+	encode     func([]byte) error
+	recvChan   chan any
+	closeOnce  sync.Once
+	closed     chan struct{}
+	closedFlag uint32 // 0 == open, 1 == closed
+	onClose    func()
 }
 
 // NewMuxerBidiStream creates a new MuxerBidiStream.
@@ -103,7 +104,8 @@ func (c *MuxerBidiStream) CloseSend(err error) error {
 func (c *MuxerBidiStream) Close(err error) {
 	c.closeOnce.Do(func() {
 		_ = c.CloseSend(err)
-		close(c.recvChan)
+		// mark closed and notify listeners; do not close recvChan to avoid send-on-closed panics
+		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
 		if c.onClose != nil {
 			c.onClose()
@@ -122,19 +124,10 @@ func (c *MuxerBidiStream) RecvChan() chan<- any {
 // panic caused by sending on a closed channel to be defensive against
 // races between senders and Close().
 func (c *MuxerBidiStream) Offer(msg any) (ok bool) {
-	// quick check: if closed, skip
-	select {
-	case <-c.closed:
+	// Fast-path: if closed, skip without attempting to send.
+	if atomic.LoadUint32(&c.closedFlag) != 0 {
 		return false
-	default:
 	}
-
-	// recover from potential panic if channel is closed concurrently
-	defer func() {
-		if r := recover(); r != nil {
-			ok = false
-		}
-	}()
 
 	select {
 	case c.recvChan <- msg:
