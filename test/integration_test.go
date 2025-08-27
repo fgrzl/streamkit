@@ -41,9 +41,9 @@ func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 
 	router := mux.NewRouter()
 
-	router.UseAuthentication(mux.WithValidator(validator.Validate))
+	mux.UseAuthentication(router, mux.WithValidator(validator.Validate))
 
-	router.UseAuthorization()
+	mux.UseAuthorization(router)
 
 	router.Healthz().AllowAnonymous()
 
@@ -154,7 +154,7 @@ func TestShouldAllowMultiplexedCallsWhenUsingDifferentSegments(t *testing.T) {
 				entry, err := h.Client.Peek(ctx, storeID, space, segment)
 
 				// Assert
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, &streamkit.Entry{Space: space, Segment: segment}, entry)
 			}
 		})
@@ -174,7 +174,7 @@ func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
 				statuses, err := enumerators.ToSlice(results)
 
 				// Assert
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Len(t, statuses, 1)
 			}
 		})
@@ -193,7 +193,7 @@ func TestShouldReturnAllSpacesWhenRequested(t *testing.T) {
 			spaces, err := enumerators.ToSlice(enumerator)
 
 			// Assert
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Len(t, spaces, 5)
 			assert.Equal(t, "space0", spaces[0])
 			assert.Equal(t, "space1", spaces[1])
@@ -216,7 +216,7 @@ func TestShouldReturnAllSegmentsWhenGivenValidSpace(t *testing.T) {
 			segments, err := enumerators.ToSlice(enumerator)
 
 			// Assert
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Len(t, segments, 5)
 			assert.Equal(t, "segment0", segments[0])
 			assert.Equal(t, "segment1", segments[1])
@@ -238,7 +238,7 @@ func TestShouldReturnCorrectEntryWhenPeekingAtSegment(t *testing.T) {
 			peek, err := h.Client.Peek(ctx, storeID, "space0", "segment0")
 
 			// Assert
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, "space0", peek.Space)
 			assert.Equal(t, "segment0", peek.Segment)
 			assert.Equal(t, uint64(253), peek.Sequence)
@@ -263,7 +263,7 @@ func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Len(t, entries, 253)
 		})
 	}
@@ -287,7 +287,7 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Len(t, entries, 20)
 		})
 	}
@@ -309,7 +309,7 @@ func TestShouldConsumeAllEntriesWhenGivenValidSpace(t *testing.T) {
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Len(t, entries, 1_265)
 		})
 	}
@@ -339,7 +339,7 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Len(t, entries, 6_325)
 		})
 	}
