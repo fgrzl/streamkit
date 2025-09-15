@@ -20,7 +20,7 @@ require (
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/net v0.43.0
+	golang.org/x/net v0.44.0
 )
 
 require (
