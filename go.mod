@@ -5,8 +5,8 @@ go 1.24.4
 toolchain go1.24.5
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.19.0
-	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.11.0
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.19.1
+	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.12.0
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.4.0
 	github.com/cockroachdb/pebble/v2 v2.1.0
 	github.com/fgrzl/claims v0.0.1-alpha.19
