@@ -23,8 +23,6 @@ require (
 	golang.org/x/net v0.44.0
 )
 
-replace github.com/fgrzl/mux => ../mux
-
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0 // indirect
