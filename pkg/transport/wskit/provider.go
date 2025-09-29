@@ -3,6 +3,7 @@ package wskit
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/fgrzl/json/polymorphic"
@@ -23,8 +24,14 @@ type WebSocketBidiStreamProvider struct {
 
 // NewBidiStreamProvider creates a provider that uses a dedicated WebSocket connection per client.
 func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.BidiStreamProvider {
+
+	// normalize address: ensure it ends with /streamz and avoid duplicate slashes
+	// trim any trailing slashes, then append the segment
+	a := strings.TrimRight(addr, "/")
+	a = a + "/streamz"
+
 	return &WebSocketBidiStreamProvider{
-		addr:     addr,
+		addr:     a,
 		origin:   "http://localhost",
 		fetchJWT: fetchJWT,
 	}
