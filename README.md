@@ -1,6 +1,6 @@
 
-[![CI](https://github.com/fgrzl/streamkit/actions/workflows/ci.yaml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/ci.yaml)
-[![CI](https://github.com/fgrzl/streamkit/actions/workflows/pre-release.yaml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/pre-release.yaml)
+[![CI](https://github.com/fgrzl/streamkit/actions/workflows/ci.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/ci.yml)
+[![CI](https://github.com/fgrzl/streamkit/actions/workflows/pre-release.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/pre-release.yml)
 [![Dependabot Updates](https://github.com/fgrzl/streamkit/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/dependabot/dependabot-updates)
 
 
