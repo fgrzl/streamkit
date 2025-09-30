@@ -56,7 +56,7 @@ type WebSocketMuxer struct {
 	// heartbeat configuration
 	pingInterval  int64 // seconds
 	pongTimeout   int64 // seconds
-	lastPongUnix  int64 // unix seconds of last received pong or activity
+	lastPongUnix  int64 // unix seconds of last received pong or activity (atomic access)
 	heartbeatStop chan struct{}
 	cancelFunc    context.CancelFunc
 	pingJitter    int64 // seconds of jitter +/- around pingInterval
@@ -97,6 +97,8 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	m.Context = cctx
 	// per-muxer RNG for jittered heartbeat
 	m.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	// initialize lastPongUnix atomically
+	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	go m.readLoop()
 	go m.heartbeat()
 	return m
@@ -124,6 +126,8 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	m.Context = cctx
 	m.logger = slog.With(slog.String("muxer", m.name))
 	m.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	// initialize lastPongUnix atomically
+	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	go m.heartbeat()
 	// readLoop blocks the caller (the websocket handler) until the connection closes
 	m.readLoop()
@@ -199,6 +203,9 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 			}
 			slog.ErrorContext(m.Context, "muxer: write/send failed", fields...)
 			m.shutdown(err)
+		} else {
+			// mark activity on successful send
+			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 		}
 		return err
 	}
@@ -257,7 +264,7 @@ func (m *WebSocketMuxer) readLoop() {
 		}
 
 		// refresh activity time on any received message
-		m.lastPongUnix = timestamp.GetTimestamp()
+		atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 
 		ctx := node.WithChannelID(m.Context, msg.ChannelID)
 
@@ -268,7 +275,7 @@ func (m *WebSocketMuxer) readLoop() {
 				ControlType: ControlTypePong,
 			})
 			// refresh activity
-			m.lastPongUnix = timestamp.GetTimestamp()
+			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 			continue
 
 		case ControlTypePong:
@@ -276,7 +283,7 @@ func (m *WebSocketMuxer) readLoop() {
 				slog.DebugContext(ctx, "muxer: received pong")
 			}
 			atomic.AddInt64(&m.pongsReceived, 1)
-			m.lastPongUnix = timestamp.GetTimestamp()
+			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 			continue
 
 		case ControlTypeClose:
@@ -374,9 +381,10 @@ func (m *WebSocketMuxer) heartbeat() {
 		select {
 		case <-time.After(wait):
 			ts := timestamp.GetTimestamp()
-			if ts-m.lastPongUnix > m.pongTimeout {
+			last := atomic.LoadInt64(&m.lastPongUnix)
+			if ts-last > m.pongTimeout {
 				atomic.AddInt64(&m.missedPongs, 1)
-				slog.WarnContext(m.Context, "muxer: heartbeat timed out; closing connection", slog.Int64("idle_seconds", ts-m.lastPongUnix))
+				slog.WarnContext(m.Context, "muxer: heartbeat timed out; closing connection", slog.Int64("idle_seconds", ts-last))
 				m.closeOnce.Do(func() {
 					_ = m.conn.Close()
 					if m.cancelFunc != nil {

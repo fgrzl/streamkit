@@ -24,6 +24,9 @@ type WebSocketBidiStreamProvider struct {
 	muxer *WebSocketMuxer
 	// reconnect RNG for jittered backoff
 	rng *rand.Rand
+	// testable hooks / configuration
+	dialFn          func() (*websocket.Conn, error)
+	maxDialAttempts int
 }
 
 // NewBidiStreamProvider creates a provider that uses a dedicated WebSocket connection per client.
@@ -39,6 +42,9 @@ func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.Bid
 		origin:   "http://localhost",
 		fetchJWT: fetchJWT,
 		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		// sensible defaults; tests may override
+		dialFn:          nil,
+		maxDialAttempts: 5,
 	}
 }
 
@@ -75,13 +81,19 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (*We
 	// reconnect/backoff strategy: exponential backoff with jitter
 	// quick attempts up to a ceiling to avoid infinite loops
 	var (
-		maxAttempts = 5
+		maxAttempts = p.maxDialAttempts
 		baseDelay   = time.Second // initial backoff
 	)
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		conn, err := p.dial()
+		var conn *websocket.Conn
+		var err error
+		if p.dialFn != nil {
+			conn, err = p.dialFn()
+		} else {
+			conn, err = p.dial()
+		}
 		if err == nil {
 			muxer := NewClientWebSocketMuxer(ctx, NewClientMuxerSession(), conn)
 			p.muxer = muxer
