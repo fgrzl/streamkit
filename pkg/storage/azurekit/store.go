@@ -286,11 +286,11 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 				return nil, fmt.Errorf("%s: %w", ErrUnmarshalTransaction, err)
 			}
 			if err := s.fanoutTransaction(ctx, transaction); err != nil {
-				slog.Error(LogErrorFanout, "error", err)
+				slog.ErrorContext(ctx, LogErrorFanout, "err", err)
 				return nil, err
 			}
 			if err := s.cleanupWAL(ctx, e.PartitionKey, e.RowKey); err != nil {
-				slog.Error(LogErrorWALCleanup, "error", err)
+				slog.ErrorContext(ctx, LogErrorWALCleanup, "err", err)
 				return nil, err
 			}
 			return transaction, nil

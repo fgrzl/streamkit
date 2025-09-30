@@ -43,12 +43,12 @@ func (s *streamStore) LoadEvents(ctx context.Context, entity es.Entity, minSeque
 		func(entry *streamkit.Entry) (es.DomainEvent, error) {
 			envelope := &polymorphic.Envelope{}
 			if err := json.Unmarshal(entry.Payload, envelope); err != nil {
-				slog.Error("Failed to unmarshal envelope", "error", err)
+				slog.ErrorContext(ctx, "Failed to unmarshal envelope", "err", err)
 				return nil, err
 			}
 			domainEvent, ok := envelope.Content.(es.DomainEvent)
 			if !ok {
-				slog.Error("Invalid DomainEvent type", "actualSpace", fmt.Sprintf("%T", envelope.Content))
+				slog.ErrorContext(ctx, "Invalid DomainEvent type", "actualType", fmt.Sprintf("%T", envelope.Content))
 				return nil, fmt.Errorf("failed to cast to DomainEvent: %T", envelope.Content)
 			}
 			return domainEvent, nil
@@ -67,7 +67,7 @@ func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events [
 			envelope := polymorphic.NewEnvelope(event)
 			payload, err := json.Marshal(envelope)
 			if err != nil {
-				slog.Error("Failed to marshal event", "error", err)
+				slog.ErrorContext(ctx, "Failed to marshal event", "err", err)
 				return nil, err
 			}
 			entry := &streamkit.Record{
@@ -79,7 +79,7 @@ func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events [
 
 	results := s.client.Produce(ctx, entity.TenantID, space, segment, records)
 	if err := enumerators.Consume(results); err != nil {
-		slog.Error("Failed to produce events", "error", err)
+		slog.ErrorContext(ctx, "Failed to produce events", "err", err)
 		return err
 	}
 

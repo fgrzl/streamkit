@@ -110,6 +110,7 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 	}
 
 	bidi := NewMuxerBidiStream(sendFn, cleanup)
+	bidi.SetChannelID(channelID)
 
 	m.channelsMu.Lock()
 	m.channels[channelID] = bidi
