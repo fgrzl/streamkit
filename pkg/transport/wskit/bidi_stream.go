@@ -131,6 +131,7 @@ func (c *MuxerBidiStream) CloseSend(err error) error {
 // Close tears down the stream and invokes the onClose hook.
 func (c *MuxerBidiStream) Close(err error) {
 	c.closeOnce.Do(func() {
+		// Attempt to notify remote of close; on network errors this may fail.
 		_ = c.CloseSend(err)
 		// mark closed and notify listeners; do not close recvChan to avoid send-on-closed panics
 		atomic.StoreUint32(&c.closedFlag, 1)
@@ -139,6 +140,26 @@ func (c *MuxerBidiStream) Close(err error) {
 			slog.Debug("bidi: stream closed", slog.String("channel_id", c.channelID.String()), slog.String("reason", err.Error()))
 		} else {
 			slog.Debug("bidi: stream closed", slog.String("channel_id", c.channelID.String()))
+		}
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+}
+
+// CloseLocal marks the stream as closed and runs the onClose hook, but
+// it does not attempt to send a close message to the remote side. Use
+// this when the network is unavailable and you still need to tear down
+// local resources without triggering additional network I/O.
+func (c *MuxerBidiStream) CloseLocal(err error) {
+	c.closeOnce.Do(func() {
+		// Do not call CloseSend since network may be down.
+		atomic.StoreUint32(&c.closedFlag, 1)
+		close(c.closed)
+		if err != nil {
+			slog.Debug("bidi: stream closed locally", slog.String("channel_id", c.channelID.String()), slog.String("reason", err.Error()))
+		} else {
+			slog.Debug("bidi: stream closed locally", slog.String("channel_id", c.channelID.String()))
 		}
 		if c.onClose != nil {
 			c.onClose()

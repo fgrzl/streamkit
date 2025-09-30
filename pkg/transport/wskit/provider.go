@@ -2,9 +2,11 @@ package wskit
 
 import (
 	"context"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -20,6 +22,8 @@ type WebSocketBidiStreamProvider struct {
 
 	mu    sync.Mutex
 	muxer *WebSocketMuxer
+	// reconnect RNG for jittered backoff
+	rng *rand.Rand
 }
 
 // NewBidiStreamProvider creates a provider that uses a dedicated WebSocket connection per client.
@@ -34,6 +38,7 @@ func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.Bid
 		addr:     a,
 		origin:   "http://localhost",
 		fetchJWT: fetchJWT,
+		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -62,18 +67,53 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (*We
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// If existing muxer is healthy, reuse it
 	if p.muxer != nil && p.muxer.Ping() {
 		return p.muxer, nil
 	}
 
-	conn, err := p.dial()
-	if err != nil {
-		return nil, err
+	// reconnect/backoff strategy: exponential backoff with jitter
+	// quick attempts up to a ceiling to avoid infinite loops
+	var (
+		maxAttempts = 5
+		baseDelay   = time.Second // initial backoff
+	)
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		conn, err := p.dial()
+		if err == nil {
+			muxer := NewClientWebSocketMuxer(ctx, NewClientMuxerSession(), conn)
+			p.muxer = muxer
+			return muxer, nil
+		}
+
+		lastErr = err
+
+		// compute jittered backoff: baseDelay * 2^(attempt-1) +/- 0..500ms
+		backoff := baseDelay * (1 << uint(attempt-1))
+		jitter := time.Duration(p.rng.Int63n(500)) * time.Millisecond
+		// randomize add/subtract
+		if p.rng.Intn(2) == 0 {
+			backoff = backoff + jitter
+		} else {
+			if backoff > jitter {
+				backoff = backoff - jitter
+			}
+		}
+
+		// release lock while sleeping to avoid blocking other callers
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		p.mu.Lock()
 	}
 
-	muxer := NewClientWebSocketMuxer(ctx, NewClientMuxerSession(), conn)
-	p.muxer = muxer
-	return muxer, nil
+	return nil, lastErr
 }
 
 // dial establishes the raw WebSocket connection with token-based auth.
