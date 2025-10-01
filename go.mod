@@ -11,7 +11,7 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.1.0
 	github.com/fgrzl/claims v0.0.1-alpha.19
 	github.com/fgrzl/enumerators v0.1.0-alpha.45
-	github.com/fgrzl/es v0.0.1-alpha.19
+	github.com/fgrzl/es v0.0.1-alpha.28
 	github.com/fgrzl/json v0.1.0-alpha.60
 	github.com/fgrzl/lexkey v0.1.0-alpha.35
 	github.com/fgrzl/messaging v0.0.1-alpha.67
