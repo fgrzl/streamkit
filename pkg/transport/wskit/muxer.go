@@ -388,6 +388,11 @@ func (m *WebSocketMuxer) readLoop() {
 				}
 			}
 
+			if bidi == nil {
+				// Optionally, notify client or log error here.
+				slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", slog.String("channel_id", msg.ChannelID.String()))
+				continue
+			}
 			if bidi.Offer(msg.Payload) {
 				if m.logger.Enabled(context.Background(), slog.LevelDebug) {
 					slog.DebugContext(ctx, "muxer: delivered message",
