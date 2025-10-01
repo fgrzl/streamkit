@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -52,13 +53,26 @@ func NewStoreFactory(options *AzureStoreOptions) (*StoreFactory, error) {
 		return nil, errors.New("azure store factory: credential strategy is required")
 	}
 
+	// Helpful warning: HTTP endpoint with DefaultAzureCredential usually indicates Azurite;
+	// AAD tokens won't work against Azurite. Prefer SharedKey in that case.
+	if strings.HasPrefix(strings.ToLower(options.Endpoint), "http://") && options.UseDefaultAzureCredential {
+		slog.WarnContext(context.Background(), "azure store factory: HTTP endpoint with DefaultAzureCredential detected; this likely requires SharedKey (Azurite)",
+			slog.String("endpoint", options.Endpoint))
+	}
+
 	f := &StoreFactory{options: options}
 	f.once.Do(func() {
 		f.cred, f.initErr = f.initCredential()
 	})
 	if f.initErr != nil {
+		slog.ErrorContext(context.Background(), "azure store factory: credential initialization failed", slog.String("err", f.initErr.Error()))
 		return nil, fmt.Errorf("azure store factory: credential initialization failed: %w", f.initErr)
 	}
+	slog.InfoContext(context.Background(), "azure store factory: initialized",
+		slog.String("endpoint", options.Endpoint),
+		slog.Bool("use_default_credential", options.UseDefaultAzureCredential),
+		slog.Bool("shared_key_provided", options.SharedKeyCredential != nil),
+	)
 	return f, nil
 }
 
@@ -70,6 +84,12 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 
 	tableName := sanitizeTableName(f.options.Prefix + storeID.String())
 	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(f.options.Endpoint, "/"), tableName)
+
+	slog.DebugContext(ctx, "azure store: creating client",
+		slog.String("url", url),
+		slog.String("table", tableName),
+		slog.Bool("aad", f.options.SharedKeyCredential == nil),
+	)
 
 	clientOpts := aztables.ClientOptions{}
 	var client *aztables.Client
@@ -83,6 +103,7 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 		client, err = aztables.NewClient(url, f.cred, &clientOpts)
 	}
 	if err != nil {
+		slog.ErrorContext(ctx, "azure store: failed to create client", slog.String("url", url), slog.String("err", err.Error()))
 		return nil, err
 	}
 
@@ -93,10 +114,17 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 // initCredential initializes and returns a shared TokenCredential if needed.
 func (f *StoreFactory) initCredential() (azcore.TokenCredential, error) {
 	if f.options.SharedKeyCredential != nil {
+		slog.InfoContext(context.Background(), "azure store factory: using SharedKey credential")
 		return nil, nil // Not used in this path
 	}
 	if f.options.UseDefaultAzureCredential {
-		return azidentity.NewDefaultAzureCredential(nil)
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			slog.ErrorContext(context.Background(), "azure store factory: DefaultAzureCredential creation failed", slog.String("err", err.Error()))
+			return nil, err
+		}
+		slog.InfoContext(context.Background(), "azure store factory: using DefaultAzureCredential")
+		return cred, nil
 	}
 	return nil, errors.New("azure store factory: no valid credential strategy configured")
 }

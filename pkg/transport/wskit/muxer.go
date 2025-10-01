@@ -62,11 +62,16 @@ type WebSocketMuxer struct {
 	pingJitter    int64 // seconds of jitter +/- around pingInterval
 	// runtime counters
 	pingsSent     int64
+	pingsReceived int64
 	pongsReceived int64
 	missedPongs   int64
 	writeErrors   int64
 	logger        *slog.Logger
 	rng           *rand.Rand
+	// debug log rate limiting (unix seconds)
+	lastPingLogUnix  int64
+	lastPongLogUnix  int64
+	debugLogInterval int64 // seconds; 0 disables throttling
 }
 
 // sentinel errors
@@ -79,18 +84,19 @@ var (
 func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *websocket.Conn) *WebSocketMuxer {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:       ctx,
-		session:       session,
-		name:          "client",
-		conn:          conn,
-		channels:      make(map[uuid.UUID]*MuxerBidiStream),
-		done:          make(chan struct{}),
-		pingInterval:  30,
-		pongTimeout:   90,
-		pingJitter:    5,
-		lastPongUnix:  timestamp.GetTimestamp(),
-		heartbeatStop: make(chan struct{}),
-		cancelFunc:    cancel,
+		Context:          ctx,
+		session:          session,
+		name:             "client",
+		conn:             conn,
+		channels:         make(map[uuid.UUID]*MuxerBidiStream),
+		done:             make(chan struct{}),
+		pingInterval:     30,
+		pongTimeout:      90,
+		pingJitter:       5,
+		lastPongUnix:     timestamp.GetTimestamp(),
+		heartbeatStop:    make(chan struct{}),
+		cancelFunc:       cancel,
+		debugLogInterval: 60,
 	}
 	m.logger = slog.With(slog.String("muxer", m.name))
 	// per-muxer logger with common fields
@@ -108,19 +114,20 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeManager node.NodeManager, conn *websocket.Conn) {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:       cctx,
-		session:       session,
-		name:          "server",
-		conn:          conn,
-		nodeManager:   nodeManager,
-		channels:      make(map[uuid.UUID]*MuxerBidiStream),
-		done:          make(chan struct{}),
-		pingInterval:  30,
-		pongTimeout:   90,
-		pingJitter:    5,
-		lastPongUnix:  timestamp.GetTimestamp(),
-		heartbeatStop: make(chan struct{}),
-		cancelFunc:    cancel,
+		Context:          cctx,
+		session:          session,
+		name:             "server",
+		conn:             conn,
+		nodeManager:      nodeManager,
+		channels:         make(map[uuid.UUID]*MuxerBidiStream),
+		done:             make(chan struct{}),
+		pingInterval:     30,
+		pongTimeout:      90,
+		pingJitter:       5,
+		lastPongUnix:     timestamp.GetTimestamp(),
+		heartbeatStop:    make(chan struct{}),
+		cancelFunc:       cancel,
+		debugLogInterval: 60,
 	}
 	// heartbeat should run concurrently
 	m.Context = cctx
@@ -234,6 +241,12 @@ func (m *WebSocketMuxer) readLoop() {
 	for {
 		var msg MuxerMsg
 		if err := websocket.JSON.Receive(m.conn, &msg); err != nil {
+			// Treat EOF as a normal, peer-initiated close
+			if err == io.EOF {
+				slog.InfoContext(m.Context, "muxer: websocket closed by peer")
+				m.shutdown(nil)
+				return
+			}
 			// Unwrap net errors for richer logs
 			var (
 				netErr net.Error
@@ -270,7 +283,19 @@ func (m *WebSocketMuxer) readLoop() {
 
 		switch msg.ControlType {
 		case ControlTypePing:
-			slog.DebugContext(ctx, "muxer: received ping")
+			// increment counter and rate-limit debug log
+			ts := timestamp.GetTimestamp()
+			total := atomic.AddInt64(&m.pingsReceived, 1)
+			if m.logger.Enabled(context.Background(), slog.LevelDebug) {
+				if m.debugLogInterval <= 0 {
+					m.logger.DebugContext(ctx, "muxer: received ping", slog.Int64("pings_total", total))
+				} else {
+					last := atomic.LoadInt64(&m.lastPingLogUnix)
+					if ts-last >= m.debugLogInterval && atomic.CompareAndSwapInt64(&m.lastPingLogUnix, last, ts) {
+						m.logger.DebugContext(ctx, "muxer: received ping", slog.Int64("pings_total", total))
+					}
+				}
+			}
 			_ = websocket.JSON.Send(m.conn, &MuxerMsg{
 				ControlType: ControlTypePong,
 			})
@@ -279,11 +304,20 @@ func (m *WebSocketMuxer) readLoop() {
 			continue
 
 		case ControlTypePong:
+			// increment counter and rate-limit debug log
+			ts := timestamp.GetTimestamp()
+			total := atomic.AddInt64(&m.pongsReceived, 1)
 			if m.logger.Enabled(context.Background(), slog.LevelDebug) {
-				slog.DebugContext(ctx, "muxer: received pong")
+				if m.debugLogInterval <= 0 {
+					m.logger.DebugContext(ctx, "muxer: received pong", slog.Int64("pongs_total", total))
+				} else {
+					last := atomic.LoadInt64(&m.lastPongLogUnix)
+					if ts-last >= m.debugLogInterval && atomic.CompareAndSwapInt64(&m.lastPongLogUnix, last, ts) {
+						m.logger.DebugContext(ctx, "muxer: received pong", slog.Int64("pongs_total", total))
+					}
+				}
 			}
-			atomic.AddInt64(&m.pongsReceived, 1)
-			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
+			atomic.StoreInt64(&m.lastPongUnix, ts)
 			continue
 
 		case ControlTypeClose:
@@ -328,17 +362,37 @@ func (m *WebSocketMuxer) readLoop() {
 					continue
 				}
 
-				bidi = m.register(msg.StoreID, msg.ChannelID)
-
+				// Acquire node instance before registering stream; if this fails, notify client and skip registering.
 				instance, err := m.nodeManager.GetOrCreate(ctx, msg.StoreID)
 				if err != nil {
-					slog.ErrorContext(ctx, "muxer: failed to get or create node")
+					slog.ErrorContext(ctx, "muxer: failed to get or create node",
+						slog.String("store_id", msg.StoreID.String()),
+						slog.String("err", err.Error()))
+					// Inform client that the store/node is unavailable
+					payload, _ := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
+					_ = websocket.JSON.Send(m.conn, &MuxerMsg{
+						ControlType: ControlTypeError,
+						StoreID:     msg.StoreID,
+						ChannelID:   msg.ChannelID,
+						Payload:     payload,
+					})
 					continue
 				}
 
-				go instance.Handle(ctx, bidi)
+				bidi = m.register(msg.StoreID, msg.ChannelID)
+				if bidi != nil {
+					// Start the instance handler only after successful registration.
+					go instance.Handle(ctx, bidi)
+				} else {
+					slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", slog.String("channel_id", msg.ChannelID.String()))
+				}
 			}
 
+			if bidi == nil {
+				// Optionally, notify client or log error here.
+				slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", slog.String("channel_id", msg.ChannelID.String()))
+				continue
+			}
 			if bidi.Offer(msg.Payload) {
 				if m.logger.Enabled(context.Background(), slog.LevelDebug) {
 					slog.DebugContext(ctx, "muxer: delivered message",
@@ -368,12 +422,22 @@ func (m *WebSocketMuxer) heartbeat() {
 	jitter := time.Duration(m.pingJitter) * time.Second
 
 	for {
-		// compute randomized wait: base +/- jitter
+		// compute randomized wait: (base - effectiveJitter, base]
+		// Cap the jitter to base so wait never becomes negative. If effectiveJitter
+		// is zero or negative, fall back to base interval.
 		var wait time.Duration
 		if jitter > 0 {
-			// m.rng.Int63n returns [0,n)
-			delta := time.Duration(m.rng.Int63n(int64(jitter*2))) - jitter
-			wait = base + delta
+			effectiveJitter := jitter
+			if effectiveJitter > base {
+				effectiveJitter = base
+			}
+			if effectiveJitter <= 0 {
+				wait = base
+			} else {
+				// choose a random amount in [0, effectiveJitter) and subtract from base
+				delta := time.Duration(m.rng.Int63n(int64(effectiveJitter)))
+				wait = base - delta
+			}
 		} else {
 			wait = base
 		}
@@ -386,6 +450,8 @@ func (m *WebSocketMuxer) heartbeat() {
 				atomic.AddInt64(&m.missedPongs, 1)
 				slog.WarnContext(m.Context, "muxer: heartbeat timed out; closing connection", slog.Int64("idle_seconds", ts-last))
 				m.closeOnce.Do(func() {
+					// best-effort notify peer
+					_ = websocket.JSON.Send(m.conn, &MuxerMsg{ControlType: ControlTypeClose})
 					_ = m.conn.Close()
 					if m.cancelFunc != nil {
 						m.cancelFunc()
@@ -426,6 +492,8 @@ func (m *WebSocketMuxer) heartbeat() {
 // shutdown performs an orderly shutdown of the muxer and all streams.
 func (m *WebSocketMuxer) shutdown(reason error) {
 	m.closeOnce.Do(func() {
+		// best-effort notify peer of close
+		_ = websocket.JSON.Send(m.conn, &MuxerMsg{ControlType: ControlTypeClose})
 		// best-effort close websocket
 		_ = m.conn.Close()
 		if m.cancelFunc != nil {
