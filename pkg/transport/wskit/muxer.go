@@ -417,7 +417,7 @@ func (m *WebSocketMuxer) heartbeat() {
 	jitter := time.Duration(m.pingJitter) * time.Second
 
 	for {
-		// compute randomized wait: base - [0, effectiveJitter)
+		// compute randomized wait: (base - effectiveJitter, base]
 		// Cap the jitter to base so wait never becomes negative. If effectiveJitter
 		// is zero or negative, fall back to base interval.
 		var wait time.Duration
