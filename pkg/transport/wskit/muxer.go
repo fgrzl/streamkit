@@ -380,7 +380,12 @@ func (m *WebSocketMuxer) readLoop() {
 				}
 
 				bidi = m.register(msg.StoreID, msg.ChannelID)
-				go instance.Handle(ctx, bidi)
+				if bidi != nil {
+					// Start the instance handler only after successful registration.
+					go instance.Handle(ctx, bidi)
+				} else {
+					slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", slog.String("channel_id", msg.ChannelID.String()))
+				}
 			}
 
 			if bidi.Offer(msg.Payload) {
@@ -412,15 +417,20 @@ func (m *WebSocketMuxer) heartbeat() {
 	jitter := time.Duration(m.pingJitter) * time.Second
 
 	for {
-		// compute randomized wait: base +/- jitter
+		// compute randomized wait: base - [0, effectiveJitter)
+		// Cap the jitter to base so wait never becomes negative. If effectiveJitter
+		// is zero or negative, fall back to base interval.
 		var wait time.Duration
 		if jitter > 0 {
-			// choose a random amount in [0, jitter) and subtract from base
-			// to ensure we never exceed the base interval (avoids upstream idle timeouts)
-			delta := time.Duration(m.rng.Int63n(int64(jitter)))
-			if delta > base {
-				wait = 0
+			effectiveJitter := jitter
+			if effectiveJitter > base {
+				effectiveJitter = base
+			}
+			if effectiveJitter <= 0 {
+				wait = base
 			} else {
+				// choose a random amount in [0, effectiveJitter) and subtract from base
+				delta := time.Duration(m.rng.Int63n(int64(effectiveJitter)))
 				wait = base - delta
 			}
 		} else {
