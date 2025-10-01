@@ -13,9 +13,9 @@ require (
 	github.com/fgrzl/enumerators v0.1.0-alpha.45
 	github.com/fgrzl/es v0.0.1-alpha.19
 	github.com/fgrzl/json v0.1.0-alpha.60
-	github.com/fgrzl/lexkey v0.1.0-alpha.32
+	github.com/fgrzl/lexkey v0.1.0-alpha.35
 	github.com/fgrzl/messaging v0.0.1-alpha.67
-	github.com/fgrzl/mux v0.0.1-alpha.112
+	github.com/fgrzl/mux v0.0.1-alpha.117
 	github.com/fgrzl/timestamp v0.1.0-alpha.11
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
@@ -32,7 +32,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cockroachdb/crlib v0.0.0-20250916151006-1094cb39adac // indirect
+	github.com/cockroachdb/crlib v0.0.0-20250930221522-ab3080fe2b5b // indirect
 	github.com/cockroachdb/errors v1.12.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20241215232642-bb51bb14a506 // indirect
 	github.com/cockroachdb/redact v1.1.6 // indirect

@@ -28,6 +28,8 @@ github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UF
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/cockroachdb/crlib v0.0.0-20250916151006-1094cb39adac h1:L+7nhSrQ9WzW91AJHP0LmjwMHEed2nl5b7PvN9eIw58=
 github.com/cockroachdb/crlib v0.0.0-20250916151006-1094cb39adac/go.mod h1:Gq51ZeKaFCXk6QwuGM0w1dnaOqc/F5zKT2zA9D6Xeac=
+github.com/cockroachdb/crlib v0.0.0-20250930221522-ab3080fe2b5b h1:4tkiNUaatTDw2XgxqEN1ILYSHds7idfMb25w4Zxzvog=
+github.com/cockroachdb/crlib v0.0.0-20250930221522-ab3080fe2b5b/go.mod h1:ae57yNis2F1FThSNdPdoXfiPOVi8G1TLreCBQYPOdqo=
 github.com/cockroachdb/datadriven v1.0.3-0.20250407164829-2945557346d5 h1:UycK/E0TkisVrQbSoxvU827FwgBBcZ95nRRmpj/12QI=
 github.com/cockroachdb/datadriven v1.0.3-0.20250407164829-2945557346d5/go.mod h1:jsaKMvD3RBCATk1/jbUZM8C9idWBJME9+VRZ5+Liq1g=
 github.com/cockroachdb/errors v1.12.0 h1:d7oCs6vuIMUQRVbi6jWWWEJZahLCfJpnJSVobd1/sUo=
@@ -59,10 +61,16 @@ github.com/fgrzl/json v0.1.0-alpha.60 h1:7FDbGuBruOfO85DFusCG5UOOHAvPpxPyd26NgwY
 github.com/fgrzl/json v0.1.0-alpha.60/go.mod h1:/aP1mi7tKisgNu8ZRDuCCNm2Sx5ZWCTNlHkSjGvBUoE=
 github.com/fgrzl/lexkey v0.1.0-alpha.32 h1:8UMk/VnYRl4ZRFAeJLcCdrL5VpGikiDcWAMnzzCSpOU=
 github.com/fgrzl/lexkey v0.1.0-alpha.32/go.mod h1:DfrNX28YpZvrxyDm+jYQ6Jv2pJbZxQoMS1dcBSwBv58=
+github.com/fgrzl/lexkey v0.1.0-alpha.35 h1:EILZ+R0bAhXqg2xbOmOueeWJ8YTs+kkX3730Kx2fDoU=
+github.com/fgrzl/lexkey v0.1.0-alpha.35/go.mod h1:hfwt8FsLiFD4s43ntKLgPXJBk114bF4AOWXQSEzO6BI=
 github.com/fgrzl/messaging v0.0.1-alpha.67 h1:G4l6qutpdWa9/TD2ouiYjpVt4+tdroz1MjfbzYGcRvM=
 github.com/fgrzl/messaging v0.0.1-alpha.67/go.mod h1:SznIFJXsyfNpagoI4PMwjtp2W+jUjW1Eam4K4Km/Q48=
 github.com/fgrzl/mux v0.0.1-alpha.112 h1:DZWCjuyDU4YbBzMinnJYVHHgGuYuClFiXeYu6oaDRio=
 github.com/fgrzl/mux v0.0.1-alpha.112/go.mod h1:NagSimQQ5K4YQg2mhcU2cA6xV0DvIqqCsbv6WVavTNs=
+github.com/fgrzl/mux v0.0.1-alpha.116 h1:8Aq5xtxDu0sADoGOUK2Jyy6WNoEZOoBph3p1/soK++k=
+github.com/fgrzl/mux v0.0.1-alpha.116/go.mod h1:NagSimQQ5K4YQg2mhcU2cA6xV0DvIqqCsbv6WVavTNs=
+github.com/fgrzl/mux v0.0.1-alpha.117 h1:F73n6yRwDZakj7piozCjXVPBARhQB3sAEiy85s06WAQ=
+github.com/fgrzl/mux v0.0.1-alpha.117/go.mod h1:NagSimQQ5K4YQg2mhcU2cA6xV0DvIqqCsbv6WVavTNs=
 github.com/fgrzl/telemetry v0.1.0-alpha.9 h1:pv8bfH66JP5P+MkqtKlCeyOTBJh+aThLLg1J5edB+Q8=
 github.com/fgrzl/telemetry v0.1.0-alpha.9/go.mod h1:gREmdSzbG2GSupTpSymib6y2QByRRf8LD07YqSMsNi0=
 github.com/fgrzl/timestamp v0.1.0-alpha.11 h1:9w612vVzmncbcUDLy7tGWWv9qDbHObB4anikeHzZDAk=
