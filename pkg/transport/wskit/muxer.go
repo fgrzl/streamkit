@@ -132,7 +132,6 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	m.bufPool = sync.Pool{New: func() any { return make([]byte, 0, 1024) }}
 	m.encoder = json.NewEncoder(conn)
 	m.decoder = json.NewDecoder(conn)
-	m.decoder = json.NewDecoder(conn)
 	m.writerDone = make(chan struct{})
 	m.logger = slog.With(slog.String("muxer", m.name))
 	// per-muxer logger with common fields
@@ -763,12 +762,15 @@ func (m *WebSocketMuxer) writePump() {
 			continue
 		}
 		// perform send using encoder if available, otherwise fall back to sendJSON
+		// Serialize all encoder/send calls with writeMu to avoid concurrent writes
 		var err error
+		m.writeMu.Lock()
 		if m.encoder != nil {
 			err = m.encoder.Encode(msg)
 		} else {
 			err = m.sendJSON(m.conn, msg)
 		}
+		m.writeMu.Unlock()
 		if err != nil {
 			atomic.AddInt64(&m.writeErrors, 1)
 			// best-effort detailed logging

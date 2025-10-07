@@ -4,13 +4,19 @@ services:
     container_name: azurite
     hostname: azurite
     ports:
-      - "10002:10002" # Table service port
-    command: "azurite --tableHost 0.0.0.0"
+      - "10002:10002"
+    command: >
+      azurite
+      --tableHost 0.0.0.0
+      --location /data
+      --skipApiVersionCheck
+    environment:
+      AZURITE_DISABLE_TABLE_PERSISTENCE: "true"
     volumes:
       - type: tmpfs
-        target: /data # Azurite's default workspace directory
+        target: /data
         tmpfs:
-          size: 1GiB # Adjust based on your needs (e.g., 1GiB)
+          size: 512m
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:10002/devstoreaccount1" ]
       interval: 10s
