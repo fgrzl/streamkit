@@ -1,5 +1,4 @@
 package eskit
-
 import (
 	"context"
 	"encoding/json"
