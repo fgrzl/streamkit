@@ -176,6 +176,20 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	m.sendJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Send(conn, v) }
 	m.recvJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Receive(conn, v) }
+	// Initialize write pump infrastructure like the client muxer so server
+	// behavior is symmetric and safe for concurrent use.
+	m.writeQueueSize = 1024
+	m.writeQueue = make(chan *MuxerMsg, m.writeQueueSize)
+	m.msgPool = sync.Pool{New: func() any { return &MuxerMsg{} }}
+	m.bufPool = sync.Pool{New: func() any { return make([]byte, 0, 1024) }}
+	if conn != nil {
+		m.encoder = json.NewEncoder(conn)
+		m.decoder = json.NewDecoder(conn)
+	}
+	m.writerDone = make(chan struct{})
+
+	// per-muxer logger and RNG already assigned above
+
 	go m.heartbeat()
 	go m.writePump()
 	m.readLoop()
@@ -805,10 +819,12 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 		if m.writeQueue != nil {
 			// close queue so writePump finishes
 			close(m.writeQueue)
-			// wait for writer to finish (best-effort)
-			select {
-			case <-m.writerDone:
-			case <-time.After(2 * time.Second):
+			// wait for writer to finish (best-effort) if writerDone is available
+			if m.writerDone != nil {
+				select {
+				case <-m.writerDone:
+				case <-time.After(2 * time.Second):
+				}
 			}
 		}
 		if m.conn != nil {
@@ -818,6 +834,15 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 		}
 		if m.cancelFunc != nil {
 			m.cancelFunc()
+		}
+		// signal heartbeat to stop if running
+		if m.heartbeatStop != nil {
+			select {
+			case <-m.heartbeatStop:
+				// already closed
+			default:
+				close(m.heartbeatStop)
+			}
 		}
 		// close done if not already closed
 		select {
