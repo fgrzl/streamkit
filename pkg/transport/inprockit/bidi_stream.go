@@ -142,7 +142,7 @@ func extractRawPayload(msg any, v any) (payload []byte, bufPtr *bytes.Buffer, ha
 // indicates caller should return (with provided error, which may be nil for
 // EndOfStreamError).
 func handleErrorMessage(msg any, payload []byte, bufPtr *bytes.Buffer) (error, bool) {
-	if payload != nil && len(payload) > 0 && payload[0] == '{' && bytes.Contains(payload, []byte(`"type"`)) {
+	if len(payload) > 0 && payload[0] == '{' && bytes.Contains(payload, []byte(`"type"`)) {
 		var errMsg ErrorMessage
 		if err := json.Unmarshal(payload, &errMsg); err == nil && errMsg.Type != "" {
 			if bufPtr != nil {
