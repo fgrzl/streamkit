@@ -3,7 +3,7 @@
 - All code must be covered with meaningful tests.
 - Use Go’s standard `testing` package with `testify/assert` for assertions and `testify/require` to short circuit when arrange sections fail.
 - Each test should only test one thing.
-- Use table driven tests when a test behaviour is operating on variation of the inputs
+- Use table driven tests when a test behavior is operating on variations of the inputs
 - Write tests in **behavioral style**, using names like:
 
   ```go

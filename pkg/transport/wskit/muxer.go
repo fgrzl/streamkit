@@ -754,12 +754,17 @@ func (m *WebSocketMuxer) writePump() {
 					if msg == nil {
 						continue
 					}
-					if err := m.sendJSONWithLock(msg, true); err != nil {
-						// sendJSONWithLock already logged and shutdown when requested
+					// ensure pooled resources are released regardless of send outcome
+					if ok := func(msg *MuxerMsg) bool {
+						defer m.releaseMsg(msg)
+						if err := m.sendJSONWithLock(msg, true); err != nil {
+							// sendJSONWithLock already logged and shutdown when requested
+							return false
+						}
+						return true
+					}(msg); !ok {
 						return
 					}
-					// release resources for successful send
-					m.releaseMsg(msg)
 				default:
 					// queue drained, exit
 					return
@@ -769,10 +774,16 @@ func (m *WebSocketMuxer) writePump() {
 			if msg == nil {
 				continue
 			}
-			if err := m.sendJSONWithLock(msg, true); err != nil {
+			// ensure pooled resources are released regardless of send outcome
+			if ok := func(msg *MuxerMsg) bool {
+				defer m.releaseMsg(msg)
+				if err := m.sendJSONWithLock(msg, true); err != nil {
+					return false
+				}
+				return true
+			}(msg); !ok {
 				return
 			}
-			m.releaseMsg(msg)
 		}
 	}
 }
