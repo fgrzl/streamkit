@@ -8,7 +8,7 @@ import (
 )
 
 func TestInProcBidiStream_EncodeDecode_Roundtrip(t *testing.T) {
-	stream := NewInProcBidiStream()
+	stream := NewInProcBidiStreamLoopback()
 	type msg struct{ Text string }
 	go func() {
 		_ = stream.Encode(msg{Text: "hello"})
@@ -21,7 +21,7 @@ func TestInProcBidiStream_EncodeDecode_Roundtrip(t *testing.T) {
 }
 
 func TestInProcBidiStream_EndOfStreamError(t *testing.T) {
-	stream := NewInProcBidiStream()
+	stream := NewInProcBidiStreamLoopback()
 	stream.Close(nil)
 	var out string
 	err := stream.Decode(&out)
@@ -29,7 +29,7 @@ func TestInProcBidiStream_EndOfStreamError(t *testing.T) {
 }
 
 func TestInProcBidiStream_ErrorMessageHandling(t *testing.T) {
-	stream := NewInProcBidiStream()
+	stream := NewInProcBidiStreamLoopback()
 	go func() {
 		_ = stream.Encode(ErrorMessage{Type: "error", Err: "fail"})
 		stream.Close(nil)
