@@ -246,56 +246,8 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte) 
 	// prepare pooled message (if available)
 	pooled := m.msgPool.Get()
 	if pooled == nil || m.writeQueue == nil {
-		// fallback to original synchronous behavior when pool or queue not initialized
-		m.writeMu.Lock()
-		defer m.writeMu.Unlock()
-		// if done is closed, fail fast
-		select {
-		case <-m.done:
-			return ErrMuxerClosed
-		default:
-		}
-
-		err := m.sendJSON(m.conn, &MuxerMsg{
-			ControlType: ControlTypeData,
-			StoreID:     storeID,
-			ChannelID:   channelID,
-			Payload:     payload,
-		})
-		if err != nil {
-			var (
-				netErr net.Error
-				opErr  *net.OpError
-			)
-			fields := []any{slog.String("channel_id", channelID.String()), slog.Int("bytes", len(payload))}
-			if errors.As(err, &netErr) {
-				fields = append(fields, slog.String("net_err", netErr.Error()), slog.Bool("temporary", netErr.Temporary()))
-			}
-			if errors.As(err, &opErr) && opErr != nil {
-				if opErr.Op != "" {
-					fields = append(fields, slog.String("op", opErr.Op))
-				}
-				if opErr.Net != "" {
-					fields = append(fields, slog.String("net", opErr.Net))
-				}
-				if opErr.Addr != nil {
-					fields = append(fields, slog.String("addr", opErr.Addr.String()))
-				}
-				if opErr.Err != nil {
-					fields = append(fields, slog.String("op_err", opErr.Err.Error()))
-				}
-			}
-			if err == io.EOF {
-				fields = append(fields, slog.String("err", "EOF"))
-			} else {
-				fields = append(fields, slog.String("err", err.Error()))
-			}
-			slog.ErrorContext(m.Context, "muxer: write/send failed", fields...)
-			m.shutdown(err)
-		} else {
-			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
-		}
-		return err
+		// synchronous fallback when pool or queue not initialized - shutdown on error
+		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
 	}
 
 	msg := pooled.(*MuxerMsg)
@@ -331,59 +283,8 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte) 
 	default:
 		// queue full; return msg to pool and perform synchronous send under lock
 		m.msgPool.Put(msg)
-		m.writeMu.Lock()
-		defer m.writeMu.Unlock()
-		// check closed again
-		select {
-		case <-m.done:
-			return ErrMuxerClosed
-		default:
-		}
-
-		err := m.sendJSON(m.conn, &MuxerMsg{
-			ControlType: ControlTypeData,
-			StoreID:     storeID,
-			ChannelID:   channelID,
-			Payload:     payload,
-		})
-		if err != nil {
-			// On write error, perform orderly shutdown of the muxer and affected streams.
-			// Unwrap common net errors for improved diagnostics.
-			var (
-				netErr net.Error
-				opErr  *net.OpError
-			)
-			fields := []any{slog.String("channel_id", channelID.String()), slog.Int("bytes", len(payload))}
-			if errors.As(err, &netErr) {
-				fields = append(fields, slog.String("net_err", netErr.Error()), slog.Bool("temporary", netErr.Temporary()))
-			}
-			if errors.As(err, &opErr) && opErr != nil {
-				if opErr.Op != "" {
-					fields = append(fields, slog.String("op", opErr.Op))
-				}
-				if opErr.Net != "" {
-					fields = append(fields, slog.String("net", opErr.Net))
-				}
-				if opErr.Addr != nil {
-					fields = append(fields, slog.String("addr", opErr.Addr.String()))
-				}
-				if opErr.Err != nil {
-					fields = append(fields, slog.String("op_err", opErr.Err.Error()))
-				}
-			}
-			// Always include the raw error string for context.
-			if err == io.EOF {
-				fields = append(fields, slog.String("err", "EOF"))
-			} else {
-				fields = append(fields, slog.String("err", err.Error()))
-			}
-			slog.ErrorContext(m.Context, "muxer: write/send failed", fields...)
-			m.shutdown(err)
-		} else {
-			// mark activity on successful send
-			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
-		}
-		return err
+		// perform synchronous send under lock (shutdown on error)
+		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
 	}
 }
 
@@ -515,56 +416,81 @@ func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) 
 }
 
 func (m *WebSocketMuxer) handleDataMessage(ctx context.Context, msg *MuxerMsg) {
-	if !m.session.CanAccessStore(msg.StoreID) {
-		payload, _ := json.Marshal(&ErrorMessage{Type: "err", Err: "access denied"})
-		_ = m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload)
+	if !m.canAccessOrSendError(ctx, msg.StoreID, msg.ChannelID) {
 		return
 	}
 
+	bidi, err := m.getOrCreateStream(ctx, msg)
+	if err != nil {
+		// getOrCreateStream already logged and sent an error control if appropriate
+		return
+	}
+
+	m.deliverToStream(bidi, ctx, msg)
+}
+
+// canAccessOrSendError checks store access and sends an error control frame on denial.
+func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, channelID uuid.UUID) bool {
+	if m.session.CanAccessStore(storeID) {
+		return true
+	}
+	payload, _ := json.Marshal(&ErrorMessage{Type: "err", Err: "access denied"})
+	_ = m.sendControl(ControlTypeError, storeID, channelID, payload)
+	return false
+}
+
+// getOrCreateStream returns a registered bidi stream for the message's channel.
+// If the stream doesn't exist, it attempts to use nodeManager to create the
+// node and register a new stream. On failure it logs and sends an error control.
+func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (*MuxerBidiStream, error) {
 	m.channelsMu.RLock()
 	bidi, exists := m.channels[msg.ChannelID]
 	m.channelsMu.RUnlock()
 
-	if !exists {
-		if m.nodeManager == nil {
-			if m.name == "server" {
-				slog.ErrorContext(ctx, "muxer: node manager is nil on server side")
-				return
-			}
-			return
-		}
-
-		instance, err := m.nodeManager.GetOrCreate(ctx, msg.StoreID)
-		if err != nil {
-			slog.ErrorContext(ctx, "muxer: failed to get or create node",
-				slog.String("store_id", msg.StoreID.String()),
-				slog.String("err", err.Error()))
-			payload, _ := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
-			_ = m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload)
-			return
-		}
-
-		bidi = m.register(msg.StoreID, msg.ChannelID)
-		if bidi != nil {
-			go instance.Handle(ctx, bidi)
-		} else {
-			slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", slog.String("channel_id", msg.ChannelID.String()))
-		}
+	if exists {
+		return bidi, nil
 	}
 
+	if m.nodeManager == nil {
+		if m.name == "server" {
+			slog.ErrorContext(ctx, "muxer: node manager is nil on server side")
+			return nil, errors.New("node manager nil")
+		}
+		return nil, errors.New("node manager nil")
+	}
+
+	instance, err := m.nodeManager.GetOrCreate(ctx, msg.StoreID)
+	if err != nil {
+		slog.ErrorContext(ctx, "muxer: failed to get or create node",
+			slog.String("store_id", msg.StoreID.String()),
+			slog.String("err", err.Error()))
+		payload, _ := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
+		_ = m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload)
+		return nil, err
+	}
+
+	bidi = m.register(msg.StoreID, msg.ChannelID)
+	if bidi != nil {
+		go instance.Handle(ctx, bidi)
+		return bidi, nil
+	}
+	slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", slog.String("channel_id", msg.ChannelID.String()))
+	return nil, errors.New("registration returned nil")
+}
+
+// deliverToStream offers the payload to the bidi stream and logs delivery or drop.
+func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Context, msg *MuxerMsg) {
 	if bidi == nil {
 		slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", slog.String("channel_id", msg.ChannelID.String()))
 		return
 	}
 	if bidi.Offer(msg.Payload) {
 		if m.logger.Enabled(context.Background(), slog.LevelDebug) {
-			slog.DebugContext(ctx, "muxer: delivered message",
-				slog.String("channel_id", msg.ChannelID.String()))
+			slog.DebugContext(ctx, "muxer: delivered message", slog.String("channel_id", msg.ChannelID.String()))
 		}
 	} else {
 		if m.logger.Enabled(context.Background(), slog.LevelDebug) {
-			slog.DebugContext(ctx, "muxer: dropped message for closed stream",
-				slog.String("channel_id", msg.ChannelID.String()))
+			slog.DebugContext(ctx, "muxer: dropped message for closed stream", slog.String("channel_id", msg.ChannelID.String()))
 		}
 	}
 }
@@ -641,21 +567,8 @@ func (m *WebSocketMuxer) sendControl(control ControlType, storeID, channelID uui
 
 	pooled := m.msgPool.Get()
 	if pooled == nil || m.writeQueue == nil {
-		// synchronous fallback
-		m.writeMu.Lock()
-		defer m.writeMu.Unlock()
-		if err := m.sendJSON(m.conn, &MuxerMsg{
-			ControlType: control,
-			StoreID:     storeID,
-			ChannelID:   channelID,
-			Payload:     payload,
-		}); err == nil {
-			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
-			return nil
-		} else {
-			atomic.AddInt64(&m.writeErrors, 1)
-			return err
-		}
+		// synchronous fallback - simple sender that increments writeErrors on failure
+		return m.syncSendIncrementOnError(&MuxerMsg{ControlType: control, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
 	}
 
 	msg := pooled.(*MuxerMsg)
@@ -687,22 +600,9 @@ func (m *WebSocketMuxer) sendControl(control ControlType, storeID, channelID uui
 	case m.writeQueue <- msg:
 		return nil
 	default:
-		// queue full -> synchronous fallback
+		// queue full -> synchronous fallback that increments writeErrors on failure
 		m.msgPool.Put(msg)
-		m.writeMu.Lock()
-		defer m.writeMu.Unlock()
-		if err := m.sendJSON(m.conn, &MuxerMsg{
-			ControlType: control,
-			StoreID:     storeID,
-			ChannelID:   channelID,
-			Payload:     payload,
-		}); err == nil {
-			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
-			return nil
-		} else {
-			atomic.AddInt64(&m.writeErrors, 1)
-			return err
-		}
+		return m.syncSendIncrementOnError(&MuxerMsg{ControlType: control, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
 	}
 }
 
@@ -713,15 +613,12 @@ func (m *WebSocketMuxer) sendPing() error {
 	// try enqueue first
 	pooled := m.msgPool.Get()
 	if pooled == nil || m.writeQueue == nil {
-		// synchronous fallback
-		m.writeMu.Lock()
-		defer m.writeMu.Unlock()
-		if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypePing}); err != nil {
-			atomic.AddInt64(&m.writeErrors, 1)
+		// synchronous fallback - increment writeErrors and warn on failure
+		err := m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypePing}, false)
+		if err != nil {
 			slog.WarnContext(m.Context, "muxer: ping send failed", slog.String("error", err.Error()))
-			return err
 		}
-		return nil
+		return err
 	}
 
 	msg := pooled.(*MuxerMsg)
@@ -746,6 +643,98 @@ func (m *WebSocketMuxer) sendPing() error {
 	}
 }
 
+// sendJSONWithLock performs a synchronous JSON send under m.writeMu and
+// optionally triggers m.shutdown on error. It also updates lastPongUnix on
+// success and increments writeErrors on failure. This consolidates repeated
+// send+log+shutdown patterns used across the muxer.
+func (m *WebSocketMuxer) sendJSONWithLock(msg *MuxerMsg, shutdownOnErr bool) error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	// fast-path: if done is closed, fail fast
+	select {
+	case <-m.done:
+		return ErrMuxerClosed
+	default:
+	}
+
+	err := m.sendJSON(m.conn, msg)
+	if err != nil {
+		atomic.AddInt64(&m.writeErrors, 1)
+		fields := m.buildSendErrorFields(err, msg)
+		slog.ErrorContext(m.Context, "muxer: write/send failed", fields...)
+		if shutdownOnErr {
+			m.shutdown(err)
+		}
+		return err
+	}
+
+	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
+	return nil
+}
+
+// buildSendErrorFields creates structured log fields for send errors. Extracted
+// to simplify sendJSONWithLock and centralize op/net error unwrapping.
+func (m *WebSocketMuxer) buildSendErrorFields(err error, msg *MuxerMsg) []any {
+	var (
+		netErr net.Error
+		opErr  *net.OpError
+	)
+	fields := []any{}
+	if msg != nil {
+		fields = append(fields, slog.String("channel_id", msg.ChannelID.String()))
+		fields = append(fields, slog.Int("bytes", len(msg.Payload)))
+	}
+	if errors.As(err, &netErr) {
+		fields = append(fields, slog.String("net_err", netErr.Error()), slog.Bool("temporary", netErr.Temporary()))
+	}
+	if errors.As(err, &opErr) && opErr != nil {
+		if opErr.Op != "" {
+			fields = append(fields, slog.String("op", opErr.Op))
+		}
+		if opErr.Net != "" {
+			fields = append(fields, slog.String("net", opErr.Net))
+		}
+		if opErr.Addr != nil {
+			fields = append(fields, slog.String("addr", opErr.Addr.String()))
+		}
+		if opErr.Err != nil {
+			fields = append(fields, slog.String("op_err", opErr.Err.Error()))
+		}
+	}
+	if err == io.EOF {
+		fields = append(fields, slog.String("err", "EOF"))
+	} else {
+		fields = append(fields, slog.String("err", err.Error()))
+	}
+	return fields
+}
+
+// syncSendIncrementOnError is a thin wrapper for sendJSONWithLock that always
+// increments writeErrors on failure and optionally does shutdown; it's kept for
+// call-site clarity during refactor.
+func (m *WebSocketMuxer) syncSendIncrementOnError(msg *MuxerMsg, shutdownOnErr bool) error {
+	return m.sendJSONWithLock(msg, shutdownOnErr)
+}
+
+// releaseMsg returns a message's payload buffer and the message itself back to
+// their pools, if they match expected shapes.
+func (m *WebSocketMuxer) releaseMsg(msg *MuxerMsg) {
+	if msg == nil {
+		return
+	}
+	if msg.Payload != nil {
+		if cap(msg.Payload) == 1024 {
+			m.bufPool.Put(msg.Payload[:0])
+		}
+	}
+	msg.ControlType = ""
+	msg.StoreID = uuid.Nil
+	msg.ChannelID = uuid.Nil
+	msg.Payload = nil
+	m.msgPool.Put(msg)
+}
+
 // writePump serializes outgoing messages to the websocket connection.
 // It owns the json.Encoder and returns message objects to the pool after send.
 func (m *WebSocketMuxer) writePump() {
@@ -765,27 +754,12 @@ func (m *WebSocketMuxer) writePump() {
 					if msg == nil {
 						continue
 					}
-					m.writeMu.Lock()
-					err := m.sendJSON(m.conn, msg)
-					m.writeMu.Unlock()
-					if err != nil {
-						atomic.AddInt64(&m.writeErrors, 1)
-						slog.WarnContext(m.Context, "muxer: write pump send failed", slog.String("err", err.Error()))
-						m.shutdown(err)
+					if err := m.sendJSONWithLock(msg, true); err != nil {
+						// sendJSONWithLock already logged and shutdown when requested
 						return
 					}
-					// mark activity
-					atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
-					if msg.Payload != nil {
-						if cap(msg.Payload) == 1024 {
-							m.bufPool.Put(msg.Payload[:0])
-						}
-					}
-					msg.ControlType = ""
-					msg.StoreID = uuid.Nil
-					msg.ChannelID = uuid.Nil
-					msg.Payload = nil
-					m.msgPool.Put(msg)
+					// release resources for successful send
+					m.releaseMsg(msg)
 				default:
 					// queue drained, exit
 					return
@@ -795,31 +769,10 @@ func (m *WebSocketMuxer) writePump() {
 			if msg == nil {
 				continue
 			}
-			m.writeMu.Lock()
-			err := m.sendJSON(m.conn, msg)
-			m.writeMu.Unlock()
-			if err != nil {
-				atomic.AddInt64(&m.writeErrors, 1)
-				slog.WarnContext(m.Context, "muxer: write pump send failed", slog.String("err", err.Error()))
-				m.shutdown(err)
+			if err := m.sendJSONWithLock(msg, true); err != nil {
 				return
 			}
-			// mark activity
-			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
-
-			// release payload buffer back to pool if it matches expected size
-			if msg.Payload != nil {
-				if cap(msg.Payload) == 1024 {
-					// zero-length slice with capacity preserved
-					m.bufPool.Put(msg.Payload[:0])
-				}
-			}
-			// release msg back to pool (clear fields)
-			msg.ControlType = ""
-			msg.StoreID = uuid.Nil
-			msg.ChannelID = uuid.Nil
-			msg.Payload = nil
-			m.msgPool.Put(msg)
+			m.releaseMsg(msg)
 		}
 	}
 }
