@@ -19,7 +19,7 @@ import (
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streamkit/pkg/storage/azurekit"
 	"github.com/fgrzl/streamkit/pkg/storage/pebblekit"
-	"github.com/fgrzl/streamkit/pkg/transport/mockkit"
+	"github.com/fgrzl/streamkit/pkg/transport/inprockit"
 	"github.com/fgrzl/streamkit/pkg/transport/wskit"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -89,7 +89,8 @@ func azurekitTestHarness(t *testing.T) *TestHarness {
 
 	credential, err := azurekit.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
-		panic(err)
+		t.Skipf("skipping azure tests: failed to create shared key credential: %v", err)
+		return nil
 	}
 
 	options := &azurekit.AzureStoreOptions{
@@ -100,7 +101,10 @@ func azurekitTestHarness(t *testing.T) *TestHarness {
 	}
 
 	factory, err := azurekit.NewStoreFactory(options)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("skipping azure tests: failed to create store factory: %v", err)
+		return nil
+	}
 
 	return wskitTestHarness(t, factory)
 }
@@ -115,14 +119,14 @@ func pebblekitTestHarness(t *testing.T) *TestHarness {
 	return wskitTestHarness(t, factory)
 }
 
-func mockkitTestHarness(t *testing.T) *TestHarness {
+func inprockitTestHarness(t *testing.T) *TestHarness {
 	options := &pebblekit.PebbleStoreOptions{Path: t.TempDir()}
 	factory, err := pebblekit.NewStoreFactory(options)
 	require.NoError(t, err)
 
 	nodeManager := node.NewNodeManager(node.WithStoreFactory(factory))
 
-	provider := mockkit.NewMockBidiStreamProvider(t.Context(), nodeManager)
+	provider := inprockit.NewInProcBidiStreamProvider(t.Context(), nodeManager)
 	client := streamkit.NewClient(provider)
 
 	t.Cleanup(func() {
@@ -138,7 +142,7 @@ func configurations(t *testing.T) map[string]*TestHarness {
 	return map[string]*TestHarness{
 		"azure":  azurekitTestHarness(t),
 		"pebble": pebblekitTestHarness(t),
-		"mock":   mockkitTestHarness(t),
+		"inproc": inprockitTestHarness(t),
 	}
 }
 

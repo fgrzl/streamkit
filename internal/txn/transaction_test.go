@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestShouldMarshalAndUnmarshalTransactionWhenGivenValidData(t *testing.T) {
+func TestShouldMarshalAndUnmarshalTransactionGivenValidData(t *testing.T) {
 	// Arrange
 	ts := timestamp.GetTimestamp()
 	trx := api.TRX{Node: uuid.New(), ID: uuid.New(), Number: 1}

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // helper to create a stream with a capturing encoder
@@ -115,20 +116,22 @@ func TestCloseInvokesOnCloseAndIsIdempotent(t *testing.T) {
 		onClose := func() { called++ }
 		s := NewMuxerBidiStream(enc, onClose)
 
+		// Act
 		s.Close(nil)
+
+		// Assert
 		assert.Equal(t, 1, called)
 		assert.True(t, s.IsClosed())
 		select {
 		case <-s.Closed():
 		default:
-			t.Fatalf("expected Closed channel to be closed")
+			require.Fail(t, "expected Closed channel to be closed")
 		}
 
+		// Act: idempotent close
 		s.Close(nil)
 		assert.Equal(t, 1, called)
-		if encCalled == 0 {
-			t.Fatalf("expected encoder to be called during Close")
-		}
+		require.Greater(t, encCalled, 0, "expected encoder to be called during Close")
 	})
 }
 

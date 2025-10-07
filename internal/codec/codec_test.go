@@ -26,42 +26,36 @@ func makeTestEntry(seq uint64) *api.Entry {
 	}
 }
 
-func TestEncodeDecodeEntryRoundtrip(t *testing.T) {
-	t.Run("Given an entry", func(t *testing.T) {
-		e := makeTestEntry(1)
+func TestShouldEncodeAndDecodeEntryRoundtrip(t *testing.T) {
+	// Arrange
+	e := makeTestEntry(1)
 
-		t.Run("When it is encoded and decoded", func(t *testing.T) {
-			data, err := EncodeEntry(e)
-			require.NoError(t, err)
+	// Act
+	data, err := EncodeEntry(e)
+	require.NoError(t, err)
 
-			got := &api.Entry{}
-			err = DecodeEntry(data, got)
-			require.NoError(t, err)
+	got := &api.Entry{}
+	err = DecodeEntry(data, got)
+	require.NoError(t, err)
 
-			t.Run("Then the decoded entry should match the original", func(t *testing.T) {
-				assert.Equal(t, e, got)
-			})
-		})
-	})
+	// Assert
+	assert.Equal(t, e, got)
 }
 
-func TestEncodeDecodeEntrySnappyRoundtrip(t *testing.T) {
-	t.Run("Given an entry", func(t *testing.T) {
-		e := makeTestEntry(2)
+func TestShouldEncodeAndDecodeEntrySnappyRoundtrip(t *testing.T) {
+	// Arrange
+	e := makeTestEntry(2)
 
-		t.Run("When it is encoded and decoded with snappy", func(t *testing.T) {
-			data, err := EncodeEntrySnappy(e)
-			require.NoError(t, err)
+	// Act
+	data, err := EncodeEntrySnappy(e)
+	require.NoError(t, err)
 
-			got := &api.Entry{}
-			err = DecodeEntrySnappy(data, got)
-			require.NoError(t, err)
+	got := &api.Entry{}
+	err = DecodeEntrySnappy(data, got)
+	require.NoError(t, err)
 
-			t.Run("Then the decoded entry should match the original", func(t *testing.T) {
-				assert.Equal(t, e, got)
-			})
-		})
-	})
+	// Assert
+	assert.Equal(t, e, got)
 }
 
 func makeTestTransaction() *txn.Transaction {
@@ -79,40 +73,34 @@ func makeTestTransaction() *txn.Transaction {
 	return &trx
 }
 
-func TestEncodeDecodeTransactionRoundtrip(t *testing.T) {
-	t.Run("Given a transaction", func(t *testing.T) {
-		tr := makeTestTransaction()
+func TestShouldEncodeAndDecodeTransactionRoundtrip(t *testing.T) {
+	// Arrange
+	tr := makeTestTransaction()
 
-		t.Run("When it is encoded and decoded", func(t *testing.T) {
-			data, err := EncodeTransaction(tr)
-			require.NoError(t, err)
+	// Act
+	data, err := EncodeTransaction(tr)
+	require.NoError(t, err)
 
-			got := &txn.Transaction{}
-			err = DecodeTransaction(data, got)
-			require.NoError(t, err)
+	got := &txn.Transaction{}
+	err = DecodeTransaction(data, got)
+	require.NoError(t, err)
 
-			t.Run("Then the decoded transaction should match the original", func(t *testing.T) {
-				assert.Equal(t, tr, got)
-			})
-		})
-	})
+	// Assert
+	assert.Equal(t, tr, got)
 }
 
-func TestEncodeDecodeTransactionSnappyRoundtrip(t *testing.T) {
-	t.Run("Given a transaction", func(t *testing.T) {
-		tr := makeTestTransaction()
+func TestShouldEncodeAndDecodeTransactionSnappyRoundtrip(t *testing.T) {
+	// Arrange
+	tr := makeTestTransaction()
 
-		t.Run("When it is encoded and decoded with snappy", func(t *testing.T) {
-			data, err := EncodeTransactionSnappy(tr)
-			require.NoError(t, err)
+	// Act
+	data, err := EncodeTransactionSnappy(tr)
+	require.NoError(t, err)
 
-			got := &txn.Transaction{}
-			err = DecodeTransactionSnappy(data, got)
-			require.NoError(t, err)
+	got := &txn.Transaction{}
+	err = DecodeTransactionSnappy(data, got)
+	require.NoError(t, err)
 
-			t.Run("Then the decoded transaction should match the original", func(t *testing.T) {
-				assert.Equal(t, tr, got)
-			})
-		})
-	})
+	// Assert
+	assert.Equal(t, tr, got)
 }

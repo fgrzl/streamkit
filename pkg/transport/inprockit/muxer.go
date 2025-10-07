@@ -1,4 +1,4 @@
-package mockkit
+package inprockit
 
 import (
 	"context"
@@ -9,28 +9,28 @@ import (
 	"github.com/google/uuid"
 )
 
-type MockMuxer struct {
+type InProcMuxer struct {
 	ctx         context.Context
 	nodeManager node.NodeManager
 
 	mu      sync.RWMutex
-	streams map[uuid.UUID]*MockBidiStream
+	streams map[uuid.UUID]*InProcBidiStream
 }
 
-// NewMockMuxer initializes a test muxer with an associated nodeManager.
-func NewMockMuxer(ctx context.Context, nodeManager node.NodeManager) *MockMuxer {
-	return &MockMuxer{
+// NewInProcMuxer initializes a test muxer with an associated nodeManager.
+func NewInProcMuxer(ctx context.Context, nodeManager node.NodeManager) *InProcMuxer {
+	return &InProcMuxer{
 		ctx:         ctx,
 		nodeManager: nodeManager,
-		streams:     make(map[uuid.UUID]*MockBidiStream),
+		streams:     make(map[uuid.UUID]*InProcBidiStream),
 	}
 }
 
 // Register creates a new bidirectional stream, wires it to a node, and returns the client side.
-func (m *MockMuxer) Register(storeID uuid.UUID) (api.BidiStream, error) {
+func (m *InProcMuxer) Register(storeID uuid.UUID) (api.BidiStream, error) {
 	channelID := uuid.New()
-	client := NewMockBidiStream()
-	server := NewMockBidiStream()
+	client := NewInProcBidiStream()
+	server := NewInProcBidiStream()
 	LinkStreams(client, server)
 
 	m.mu.Lock()
@@ -57,7 +57,7 @@ func (m *MockMuxer) Register(storeID uuid.UUID) (api.BidiStream, error) {
 }
 
 // Get returns a previously registered stream by channel ID, for test inspection.
-func (m *MockMuxer) Get(channelID uuid.UUID) (*MockBidiStream, bool) {
+func (m *InProcMuxer) Get(channelID uuid.UUID) (*InProcBidiStream, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	stream, ok := m.streams[channelID]

@@ -1,9 +1,9 @@
-// Package mockkit provides in-memory mock implementations of transport
+// Package inprockit provides in-memory in-process implementations of transport
 // interfaces for testing and development purposes.
 //
 // This package implements bidirectional streaming without network transport,
 // allowing for fast unit testing and local development of streamkit applications.
-package mockkit
+package inprockit
 
 import (
 	"context"
@@ -14,26 +14,26 @@ import (
 	"github.com/google/uuid"
 )
 
-// MockBidiStreamPair represents a connected pair of mock bidirectional streams.
-type MockBidiStreamPair struct {
-	Client *MockBidiStream
-	Server *MockBidiStream
+// InProcBidiStreamPair represents a connected pair of in-process bidirectional streams.
+type InProcBidiStreamPair struct {
+	Client *InProcBidiStream
+	Server *InProcBidiStream
 }
 
-// MockBidiStreamProvider provides mock bidirectional streams for testing.
-type MockBidiStreamProvider struct {
-	muxer *MockMuxer
+// InProcBidiStreamProvider provides in-process bidirectional streams for testing and local use.
+type InProcBidiStreamProvider struct {
+	muxer *InProcMuxer
 }
 
-// NewMockBidiStreamProvider initializes the provider with a backing MockMuxer.
-func NewMockBidiStreamProvider(ctx context.Context, nm node.NodeManager) *MockBidiStreamProvider {
-	return &MockBidiStreamProvider{
-		muxer: NewMockMuxer(ctx, nm),
+// NewInProcBidiStreamProvider initializes the provider with a backing InProcMuxer.
+func NewInProcBidiStreamProvider(ctx context.Context, nm node.NodeManager) *InProcBidiStreamProvider {
+	return &InProcBidiStreamProvider{
+		muxer: NewInProcMuxer(ctx, nm),
 	}
 }
 
 // CallStream creates a new logical stream via the muxer and records the client/server pair.
-func (p *MockBidiStreamProvider) CallStream(
+func (p *InProcBidiStreamProvider) CallStream(
 	ctx context.Context,
 	storeID uuid.UUID,
 	routeable api.Routeable,
