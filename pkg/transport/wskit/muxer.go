@@ -755,57 +755,93 @@ func (m *WebSocketMuxer) writePump() {
 		}
 	}()
 
-	for msg := range m.writeQueue {
-		if msg == nil {
-			continue
-		}
-		// perform send using encoder if available, otherwise fall back to sendJSON
-		// Serialize all encoder/send calls with writeMu to avoid concurrent writes
-		var err error
-		m.writeMu.Lock()
-		err = m.sendJSON(m.conn, msg)
-		m.writeMu.Unlock()
-
-		if err != nil {
-			atomic.AddInt64(&m.writeErrors, 1)
-			// best-effort detailed logging
-			slog.WarnContext(m.Context, "muxer: write pump send failed", slog.String("err", err.Error()))
-			m.shutdown(err)
-			// return early; shutdown will close m.done and trigger other cleanup
-			return
-		}
-		// mark activity
-		atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
-
-		// release payload buffer back to pool if it matches expected size
-		if msg.Payload != nil {
-			if cap(msg.Payload) == 1024 {
-				// zero-length slice with capacity preserved
-				m.bufPool.Put(msg.Payload[:0])
+	for {
+		select {
+		case <-m.done:
+			// shutdown signalled: drain any in-flight messages without blocking
+			for {
+				select {
+				case msg := <-m.writeQueue:
+					if msg == nil {
+						continue
+					}
+					m.writeMu.Lock()
+					err := m.sendJSON(m.conn, msg)
+					m.writeMu.Unlock()
+					if err != nil {
+						atomic.AddInt64(&m.writeErrors, 1)
+						slog.WarnContext(m.Context, "muxer: write pump send failed", slog.String("err", err.Error()))
+						m.shutdown(err)
+						return
+					}
+					// mark activity
+					atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
+					if msg.Payload != nil {
+						if cap(msg.Payload) == 1024 {
+							m.bufPool.Put(msg.Payload[:0])
+						}
+					}
+					msg.ControlType = ""
+					msg.StoreID = uuid.Nil
+					msg.ChannelID = uuid.Nil
+					msg.Payload = nil
+					m.msgPool.Put(msg)
+				default:
+					// queue drained, exit
+					return
+				}
 			}
+		case msg := <-m.writeQueue:
+			if msg == nil {
+				continue
+			}
+			m.writeMu.Lock()
+			err := m.sendJSON(m.conn, msg)
+			m.writeMu.Unlock()
+			if err != nil {
+				atomic.AddInt64(&m.writeErrors, 1)
+				slog.WarnContext(m.Context, "muxer: write pump send failed", slog.String("err", err.Error()))
+				m.shutdown(err)
+				return
+			}
+			// mark activity
+			atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
+
+			// release payload buffer back to pool if it matches expected size
+			if msg.Payload != nil {
+				if cap(msg.Payload) == 1024 {
+					// zero-length slice with capacity preserved
+					m.bufPool.Put(msg.Payload[:0])
+				}
+			}
+			// release msg back to pool (clear fields)
+			msg.ControlType = ""
+			msg.StoreID = uuid.Nil
+			msg.ChannelID = uuid.Nil
+			msg.Payload = nil
+			m.msgPool.Put(msg)
 		}
-		// release msg back to pool (clear fields)
-		msg.ControlType = ""
-		msg.StoreID = uuid.Nil
-		msg.ChannelID = uuid.Nil
-		msg.Payload = nil
-		m.msgPool.Put(msg)
 	}
 }
 
 // shutdown performs an orderly shutdown of the muxer and all streams.
 func (m *WebSocketMuxer) shutdown(reason error) {
 	m.closeOnce.Do(func() {
-		// best-effort notify peer of close: close the write queue and wait for writer
-		if m.writeQueue != nil {
-			// close queue so writePump finishes
-			close(m.writeQueue)
-			// wait for writer to finish (best-effort) if writerDone is available
-			if m.writerDone != nil {
-				select {
-				case <-m.writerDone:
-				case <-time.After(2 * time.Second):
-				}
+		// best-effort notify peer of close: signal done so senders stop and
+		// writePump can drain remaining messages. Do NOT close m.writeQueue here
+		// because concurrent senders may still be racing to enqueue and that
+		// would cause a send-on-closed-channel panic.
+		select {
+		case <-m.done:
+			// already closed
+		default:
+			close(m.done)
+		}
+		// wait for writer to finish (best-effort) if writerDone is available
+		if m.writerDone != nil {
+			select {
+			case <-m.writerDone:
+			case <-time.After(2 * time.Second):
 			}
 		}
 		if m.conn != nil {
@@ -825,13 +861,7 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 				close(m.heartbeatStop)
 			}
 		}
-		// close done if not already closed
-		select {
-		case <-m.done:
-			// already closed
-		default:
-			close(m.done)
-		}
+		// m.done already closed above to prevent races with writers
 
 		// close streams locally
 		m.channelsMu.RLock()

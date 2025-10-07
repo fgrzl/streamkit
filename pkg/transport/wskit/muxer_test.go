@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -240,4 +241,68 @@ func TestShouldSendAccessDeniedError(t *testing.T) {
 	var em ErrorMessage
 	require.NoError(t, json.Unmarshal(captured.Payload, &em))
 	assert.Equal(t, "access denied", em.Err)
+}
+
+func TestMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:        context.Background(),
+		name:           "test",
+		done:           make(chan struct{}),
+		writeQueueSize: 256,
+		writeQueue:     make(chan *MuxerMsg, 256),
+		msgPool:        sync.Pool{New: func() any { return &MuxerMsg{} }},
+		bufPool:        sync.Pool{New: func() any { return make([]byte, 0, 1024) }},
+		writerDone:     make(chan struct{}),
+		// dummy send that simulates a successful write
+		sendJSON: func(conn *websocket.Conn, v interface{}) error { return nil },
+	}
+
+	// start write pump
+	go m.writePump()
+
+	var wg sync.WaitGroup
+	nSenders := 50
+	perSender := 200
+
+	// start many concurrent senders
+	for i := 0; i < nSenders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perSender; j++ {
+				// call various send paths; ignore errors
+				_ = m.sendPing()
+				_ = m.sendControl(ControlTypePing, uuid.Nil, uuid.Nil, nil)
+				_ = m.sendData(uuid.Nil, uuid.Nil, []byte("hello"))
+				// small sleep to increase interleaving
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	// let senders run a short while then shutdown concurrently
+	time.Sleep(10 * time.Millisecond)
+	go m.shutdown(nil)
+
+	// wait for senders to finish
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// senders finished
+	case <-time.After(5 * time.Second):
+		t.Fatal("senders did not finish in time")
+	}
+
+	// wait for writer to finish (writerDone should be closed by writePump defer)
+	select {
+	case <-m.writerDone:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not finish after shutdown")
+	}
 }
