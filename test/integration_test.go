@@ -19,7 +19,7 @@ import (
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streamkit/pkg/storage/azurekit"
 	"github.com/fgrzl/streamkit/pkg/storage/pebblekit"
-	"github.com/fgrzl/streamkit/pkg/transport/mockkit"
+	"github.com/fgrzl/streamkit/pkg/transport/inprockit"
 	"github.com/fgrzl/streamkit/pkg/transport/wskit"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -115,14 +115,14 @@ func pebblekitTestHarness(t *testing.T) *TestHarness {
 	return wskitTestHarness(t, factory)
 }
 
-func mockkitTestHarness(t *testing.T) *TestHarness {
+func inprockitTestHarness(t *testing.T) *TestHarness {
 	options := &pebblekit.PebbleStoreOptions{Path: t.TempDir()}
 	factory, err := pebblekit.NewStoreFactory(options)
 	require.NoError(t, err)
 
 	nodeManager := node.NewNodeManager(node.WithStoreFactory(factory))
 
-	provider := mockkit.NewMockBidiStreamProvider(t.Context(), nodeManager)
+	provider := inprockit.NewInProcBidiStreamProvider(t.Context(), nodeManager)
 	client := streamkit.NewClient(provider)
 
 	t.Cleanup(func() {
@@ -138,7 +138,7 @@ func configurations(t *testing.T) map[string]*TestHarness {
 	return map[string]*TestHarness{
 		"azure":  azurekitTestHarness(t),
 		"pebble": pebblekitTestHarness(t),
-		"mock":   mockkitTestHarness(t),
+		"mock":   inprockitTestHarness(t),
 	}
 }
 

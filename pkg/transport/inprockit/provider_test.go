@@ -1,4 +1,4 @@
-package mockkit
+package inprockit
 
 import (
 	"context"
@@ -41,12 +41,12 @@ func (m *fakeNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (n
 func (m *fakeNodeManager) Remove(ctx context.Context, storeID uuid.UUID) {}
 func (m *fakeNodeManager) Close()                                        {}
 
-func TestMockProvider_CallStream_EnvelopeDelivered(t *testing.T) {
-	t.Run("Given a mock provider with a fake node", func(t *testing.T) {
+func TestInProcProvider_CallStream_EnvelopeDelivered(t *testing.T) {
+	t.Run("Given an inproc provider with a fake node", func(t *testing.T) {
 		fnode := &fakeNode{done: make(chan struct{})}
 		nm := &fakeNodeManager{node: fnode}
 
-		provider := NewMockBidiStreamProvider(context.Background(), nm)
+		provider := NewInProcBidiStreamProvider(context.Background(), nm)
 
 		t.Run("When CallStream is invoked with a route", func(t *testing.T) {
 			route := &api.GetSpaces{}

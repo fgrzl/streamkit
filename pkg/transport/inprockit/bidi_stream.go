@@ -1,4 +1,4 @@
-package mockkit
+package inprockit
 
 import (
 	"encoding/json"
@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-type MockBidiStream struct {
+type InProcBidiStream struct {
 	sendChan   chan any
 	recvChan   chan any
 	sendClosed sync.Once
@@ -18,15 +18,15 @@ type MockBidiStream struct {
 	closed     chan struct{}
 }
 
-func NewMockBidiStream() *MockBidiStream {
-	return &MockBidiStream{
+func NewInProcBidiStream() *InProcBidiStream {
+	return &InProcBidiStream{
 		sendChan: make(chan any, 10_000),
 		recvChan: make(chan any, 10_000),
 		closed:   make(chan struct{}),
 	}
 }
 
-func (s *MockBidiStream) Encode(m any) error {
+func (s *InProcBidiStream) Encode(m any) error {
 	if s.closeErr != nil {
 		return s.closeErr
 	}
@@ -42,7 +42,7 @@ func (s *MockBidiStream) Encode(m any) error {
 	}
 }
 
-func (s *MockBidiStream) Decode(v any) error {
+func (s *InProcBidiStream) Decode(v any) error {
 	msg, ok := <-s.recvChan
 	if !ok {
 		return s.EndOfStreamError()
@@ -83,12 +83,12 @@ func (s *MockBidiStream) Decode(v any) error {
 	return json.Unmarshal(payload, v)
 }
 
-func (s *MockBidiStream) CloseSend(err error) error {
+func (s *InProcBidiStream) CloseSend(err error) error {
 	s.closeSend(err)
 	return s.closeErr
 }
 
-func (s *MockBidiStream) Close(err error) {
+func (s *InProcBidiStream) Close(err error) {
 	s.closeSend(err)
 	s.closeRecv()
 	s.closeOnce.Do(func() {
@@ -96,15 +96,15 @@ func (s *MockBidiStream) Close(err error) {
 	})
 }
 
-func (s *MockBidiStream) Closed() <-chan struct{} {
+func (s *InProcBidiStream) Closed() <-chan struct{} {
 	return s.closed
 }
 
-func (s *MockBidiStream) EndOfStreamError() error {
+func (s *InProcBidiStream) EndOfStreamError() error {
 	return io.EOF
 }
 
-func LinkStreams(client, server *MockBidiStream) {
+func LinkStreams(client, server *InProcBidiStream) {
 	go func() {
 		defer server.closeRecv()
 		for msg := range client.sendChan {
@@ -119,14 +119,14 @@ func LinkStreams(client, server *MockBidiStream) {
 	}()
 }
 
-func (s *MockBidiStream) closeSend(err error) {
+func (s *InProcBidiStream) closeSend(err error) {
 	s.sendClosed.Do(func() {
 		s.closeErr = err
 		close(s.sendChan)
 	})
 }
 
-func (s *MockBidiStream) closeRecv() {
+func (s *InProcBidiStream) closeRecv() {
 	s.recvClosed.Do(func() {
 		close(s.recvChan)
 	})
