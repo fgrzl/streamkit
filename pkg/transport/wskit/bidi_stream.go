@@ -67,39 +67,14 @@ func (c *MuxerBidiStream) Decode(v any) error {
 			slog.Debug("bidi: recv channel closed -> EOF", slog.String("channel_id", c.channelID.String()))
 			return io.EOF
 		}
-
-		var payload []byte
-		switch m := msg.(type) {
-		case []byte:
-			payload = m
-		case string:
-			payload = []byte(m)
-		default:
-			var err error
-			payload, err = json.Marshal(m)
-			if err != nil {
-				return err
-			}
+		payload, err := c.payloadFromMsg(msg)
+		if err != nil {
+			return err
 		}
 
-		// Check if it's an ErrorMessage
-		var errMsg ErrorMessage
-		if err := json.Unmarshal(payload, &errMsg); err == nil && errMsg.Type != "" {
-			switch errMsg.Type {
-			case "close":
-				if errMsg.Err != "" {
-					slog.Warn("bidi: remote closed stream with error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
-					return fmt.Errorf("remote closed stream: %s", errMsg.Err)
-				}
-				slog.Debug("bidi: remote closed stream", slog.String("channel_id", c.channelID.String()))
-				return io.EOF
-			case "error":
-				slog.Warn("bidi: remote error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
-				return fmt.Errorf("remote error: %s", errMsg.Err)
-			default:
-				slog.Warn("bidi: unknown error type", slog.String("channel_id", c.channelID.String()), slog.String("type", errMsg.Type), slog.String("err", errMsg.Err))
-				return fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err)
-			}
+		// Check whether payload represents a control ErrorMessage and handle it
+		if handled, err := c.handleErrorMessage(payload); handled {
+			return err
 		}
 
 		// Normal decode
@@ -109,6 +84,49 @@ func (c *MuxerBidiStream) Decode(v any) error {
 		}
 		slog.Debug("bidi: received message", slog.String("channel_id", c.channelID.String()), slog.Int("bytes", len(payload)))
 		return nil
+	}
+}
+
+// payloadFromMsg converts the incoming message into a JSON payload byte slice.
+func (c *MuxerBidiStream) payloadFromMsg(msg any) ([]byte, error) {
+	switch m := msg.(type) {
+	case []byte:
+		return m, nil
+	case string:
+		return []byte(m), nil
+	default:
+		b, err := json.Marshal(m)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
+}
+
+// handleErrorMessage inspects the payload for an ErrorMessage. If the payload
+// contains a control message, it handles logging and returns (true, err) where
+// err is the appropriate error to return from Decode (or nil for EOF). If the
+// payload is not an ErrorMessage, (false, nil) is returned.
+func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
+	var errMsg ErrorMessage
+	if err := json.Unmarshal(payload, &errMsg); err != nil || errMsg.Type == "" {
+		return false, nil
+	}
+
+	switch errMsg.Type {
+	case "close":
+		if errMsg.Err != "" {
+			slog.Warn("bidi: remote closed stream with error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
+			return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
+		}
+		slog.Debug("bidi: remote closed stream", slog.String("channel_id", c.channelID.String()))
+		return true, io.EOF
+	case "error":
+		slog.Warn("bidi: remote error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
+		return true, fmt.Errorf("remote error: %s", errMsg.Err)
+	default:
+		slog.Warn("bidi: unknown error type", slog.String("channel_id", c.channelID.String()), slog.String("type", errMsg.Type), slog.String("err", errMsg.Err))
+		return true, fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err)
 	}
 }
 

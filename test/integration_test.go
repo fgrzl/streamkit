@@ -142,7 +142,7 @@ func configurations(t *testing.T) map[string]*TestHarness {
 	return map[string]*TestHarness{
 		"azure":  azurekitTestHarness(t),
 		"pebble": pebblekitTestHarness(t),
-		"mock":   inprockitTestHarness(t),
+		"inproc": inprockitTestHarness(t),
 	}
 }
 

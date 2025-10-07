@@ -41,32 +41,28 @@ func (m *fakeNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (n
 func (m *fakeNodeManager) Remove(ctx context.Context, storeID uuid.UUID) {}
 func (m *fakeNodeManager) Close()                                        {}
 
-func TestInProcProvider_CallStream_EnvelopeDelivered(t *testing.T) {
-	t.Run("Given an inproc provider with a fake node", func(t *testing.T) {
-		fnode := &fakeNode{done: make(chan struct{})}
-		nm := &fakeNodeManager{node: fnode}
+func TestShouldDeliverEnvelopeToNodeWhenCallStreamInvoked(t *testing.T) {
+	// Arrange
+	fnode := &fakeNode{done: make(chan struct{})}
+	nm := &fakeNodeManager{node: fnode}
+	provider := NewInProcBidiStreamProvider(context.Background(), nm)
 
-		provider := NewInProcBidiStreamProvider(context.Background(), nm)
+	// Act
+	route := &api.GetSpaces{}
+	client, err := provider.CallStream(context.Background(), uuid.New(), route)
+	require.NoError(t, err)
 
-		t.Run("When CallStream is invoked with a route", func(t *testing.T) {
-			route := &api.GetSpaces{}
-			client, err := provider.CallStream(context.Background(), uuid.New(), route)
-			require.NoError(t, err)
+	// wait for fake node to signal receipt (avoid hanging on client.Closed())
+	select {
+	case <-fnode.done:
+	case <-time.After(1 * time.Second):
+		require.FailNow(t, "timeout waiting for node to receive envelope")
+	}
 
-			// wait for fake node to signal receipt (avoid hanging on client.Closed())
-			select {
-			case <-fnode.done:
-			case <-time.After(1 * time.Second):
-				require.FailNow(t, "timeout waiting for node to receive envelope")
-			}
+	// Assert
+	require.NotNil(t, fnode.received)
+	require.IsType(t, &api.GetSpaces{}, fnode.received)
 
-			t.Run("Then the node should receive the decoded envelope content", func(t *testing.T) {
-				require.NotNil(t, fnode.received)
-				require.IsType(t, &api.GetSpaces{}, fnode.received)
-			})
-
-			// close client to let muxer cleanup if needed
-			client.Close(nil)
-		})
-	})
+	// close client to let muxer cleanup if needed
+	client.Close(nil)
 }

@@ -7,57 +7,61 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestSetGet(t *testing.T) {
-	t.Run("Given a cache with short TTL", func(t *testing.T) {
-		c := NewExpiringCache(500*time.Millisecond, 100*time.Millisecond)
-		defer c.Close()
+func TestShouldSetAndGetValueFromCache(t *testing.T) {
+	// Arrange
+	c := NewExpiringCache(500*time.Millisecond, 100*time.Millisecond)
+	defer c.Close()
 
-		t.Run("When a key is set and retrieved", func(t *testing.T) {
-			c.Set("k1", "v1")
-			v, ok := c.Get("k1")
-			assert.True(t, ok, "expected key present")
-			assert.Equal(t, "v1", v.(string))
-		})
-	})
+	// Act
+	c.Set("k1", "v1")
+	v, ok := c.Get("k1")
+
+	// Assert
+	require.True(t, ok, "expected key present")
+	assert.Equal(t, "v1", v.(string))
 }
 
-func TestExpiration(t *testing.T) {
-	t.Run("Given a cache with very short TTL", func(t *testing.T) {
-		c := NewExpiringCache(100*time.Millisecond, 50*time.Millisecond)
-		defer c.Close()
+func TestShouldExpireKeyAfterTTL(t *testing.T) {
+	// Arrange
+	c := NewExpiringCache(100*time.Millisecond, 50*time.Millisecond)
+	defer c.Close()
 
-		t.Run("When a key expires", func(t *testing.T) {
-			c.Set("k2", "v2")
-			time.Sleep(250 * time.Millisecond)
+	// Act
+	c.Set("k2", "v2")
+	time.Sleep(250 * time.Millisecond)
 
-			_, ok := c.Get("k2")
-			assert.False(t, ok, "expected key to be expired")
-		})
-	})
+	// Assert
+	_, ok := c.Get("k2")
+	assert.False(t, ok, "expected key to be expired")
 }
 
-func TestConcurrentSetGet(t *testing.T) {
+func TestShouldSupportConcurrentSetAndGet(t *testing.T) {
+	// Arrange
 	c := NewExpiringCache(1*time.Second, 100*time.Millisecond)
 	defer c.Close()
 
 	var wg sync.WaitGroup
 	n := 100
 
-	t.Run("When many goroutines set and get keys concurrently", func(t *testing.T) {
-		for i := 0; i < n; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				key := "k" + strconv.Itoa(i)
-				c.Set(key, i)
-				if v, ok := c.Get(key); ok {
-					_ = v
-				}
-			}(i)
-		}
+	// Act
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := "k" + strconv.Itoa(i)
+			c.Set(key, i)
+			if v, ok := c.Get(key); ok {
+				_ = v
+			}
+		}(i)
+	}
 
-		wg.Wait()
-	})
+	wg.Wait()
+
+	// Assert
+	// If we reach here without race or panics the concurrent access passed.
+	assert.True(t, true)
 }

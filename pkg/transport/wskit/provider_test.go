@@ -7,16 +7,19 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/net/websocket"
 )
 
-func TestNewBidiStreamProviderAddressNormalization(t *testing.T) {
+func TestShouldNormalizeAddressWhenCreatingProvider(t *testing.T) {
+	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil })
+
+	// Act
 	wp, ok := p.(*WebSocketBidiStreamProvider)
-	if !ok {
-		t.Fatalf("expected provider type")
-	}
-	// ensure address ends with /streamz and no double slashes
+
+	// Assert
+	require.True(t, ok, "expected provider to be WebSocketBidiStreamProvider")
 	assert.Equal(t, "https://example.com/streamz", wp.addr)
 }
 
@@ -31,14 +34,13 @@ func TestGetOrCreateMuxerRetries(t *testing.T) {
 		return nil, errors.New("dial failed")
 	}
 
-	// call getOrCreateMuxer and ensure it returns an error after exhausting attempts
+	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	m, err := p.getOrCreateMuxer(ctx)
-	// the fake dialFn returns nil conn, so NewClientWebSocketMuxer will panic or misbehave;
-	// instead we expect an error or nil muxer; the important assertion here is that dialFn was called multiple times
+
+	// Assert
 	assert.Equal(t, 3, calls, "expected dialFn to be called until max attempts")
-	// ensure returned muxer is nil (since dialFn didn't produce a usable connection)
 	assert.Nil(t, m)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }
