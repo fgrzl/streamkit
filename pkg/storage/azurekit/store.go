@@ -166,12 +166,16 @@ func (s *AzureStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegmen
 		return decodeEntry(e.Value)
 	})
 
-	return enumerators.TakeWhile(entries, func(e *api.Entry) bool {
+	// Filter entries that match the bounds
+	// Note: MinSeq/MinTS are exclusive bounds, MaxSeq/MaxTS are inclusive
+	filtered := enumerators.Filter(entries, func(e *api.Entry) bool {
 		return e.Sequence > bounds.MinSeq &&
 			e.Sequence <= bounds.MaxSeq &&
 			e.Timestamp > bounds.MinTS &&
 			e.Timestamp <= bounds.MaxTS
 	})
+
+	return filtered
 }
 
 func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
