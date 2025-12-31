@@ -336,6 +336,10 @@ func (s *AzureStore) fanoutTransaction(ctx context.Context, transaction *txn.Tra
 		return fmt.Errorf("%s: %w", ErrBatchPrepare, err)
 	}
 
+	if len(batch) == 0 {
+		return fmt.Errorf("%s: empty batch", ErrBatchPrepare)
+	}
+
 	errChan := make(chan error, 3)
 	var wg sync.WaitGroup
 	wg.Add(3)

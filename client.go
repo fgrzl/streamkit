@@ -131,7 +131,8 @@ func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment str
 	if err != nil {
 		return nil, err
 	}
-	//defer stream.Close(nil)
+	defer bidi.Close(nil)
+
 	entry := &api.Entry{}
 	if err := bidi.Decode(&entry); err != nil {
 		return nil, err
@@ -219,20 +220,23 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 	go func() {
 		defer close(done)
 		for {
+			// Check for cancellation, but don't block if not cancelled
 			select {
 			case <-ctx.Done():
 				slog.DebugContext(ctx, "subscription canceled")
 				bidi.Close(ctx.Err())
 				return
 			default:
-				var status SegmentStatus
-				if err := bidi.Decode(&status); err != nil {
-					slog.ErrorContext(ctx, "subscription closed", "err", err)
-					bidi.Close(err)
-					return
-				}
-				handler(&status)
 			}
+
+			// Now block on Decode - this prevents busy-wait
+			var status SegmentStatus
+			if err := bidi.Decode(&status); err != nil {
+				slog.ErrorContext(ctx, "subscription closed", "err", err)
+				bidi.Close(err)
+				return
+			}
+			handler(&status)
 		}
 	}()
 

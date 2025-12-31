@@ -4,8 +4,6 @@ import (
 	"runtime"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // CacheItem stores the value and expiration time
@@ -50,7 +48,11 @@ func (c *ExpiringCache) Get(key string) (interface{}, bool) {
 		return nil, false
 	}
 
-	cacheItem := item.(CacheItem)
+	cacheItem, ok := item.(CacheItem)
+	if !ok {
+		c.store.Delete(key)
+		return nil, false
+	}
 	if time.Now().UnixNano() > cacheItem.Expiration {
 		c.store.Delete(key)
 		return nil, false
@@ -60,7 +62,7 @@ func (c *ExpiringCache) Get(key string) (interface{}, bool) {
 }
 
 // Delete removes a key manually
-func (c *ExpiringCache) Delete(key uuid.UUID) {
+func (c *ExpiringCache) Delete(key string) {
 	c.store.Delete(key)
 }
 
@@ -77,7 +79,12 @@ func (c *ExpiringCache) cleanupExpiredEntries() {
 		case <-ticker.C:
 			now := time.Now().UnixNano()
 			c.store.Range(func(key, value any) bool {
-				if value.(CacheItem).Expiration < now {
+				if item, ok := value.(CacheItem); ok {
+					if item.Expiration < now {
+						c.store.Delete(key)
+					}
+				} else {
+					// Remove malformed entries
 					c.store.Delete(key)
 				}
 				return true

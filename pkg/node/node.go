@@ -202,10 +202,15 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
-	// Clean up on bidi close
+	// Clean up on bidi close or context cancellation
 	go func() {
-		<-bidi.Closed() // blocks until closed
-		sub.Unsubscribe()
+		select {
+		case <-bidi.Closed():
+			sub.Unsubscribe()
+		case <-ctx.Done():
+			sub.Unsubscribe()
+			bidi.Close(ctx.Err())
+		}
 	}()
 }
 

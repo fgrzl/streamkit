@@ -86,7 +86,7 @@ func (m *nodeManager) Remove(ctx context.Context, storeID uuid.UUID) {
 	defer m.mu.Unlock()
 
 	if node, ok := m.nodes[storeID]; ok {
-		node.Close() // ignore error, optionally log it
+		node.Close()
 		delete(m.nodes, storeID)
 	}
 }

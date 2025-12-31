@@ -112,7 +112,7 @@ func (s *PebbleStore) filterSpaceEntries(ctx context.Context, lower, upper lexke
 	return enumerators.TakeWhile(
 		s.enumerateEntries(ctx, lower, upper),
 		func(entry *api.Entry) bool {
-			return entry.Timestamp > bounds.Min || entry.Timestamp <= bounds.Max
+			return entry.Timestamp > bounds.Min && entry.Timestamp <= bounds.Max
 		})
 }
 
@@ -304,9 +304,9 @@ func (s *PebbleStore) filterSegmentEntries(ctx context.Context, lower, upper lex
 	return enumerators.TakeWhile(
 		s.enumerateEntries(ctx, lower, upper),
 		func(entry *api.Entry) bool {
-			return entry.Sequence > bounds.MinSeq ||
-				entry.Sequence <= bounds.MaxSeq ||
-				entry.Timestamp > bounds.MinTS ||
+			return entry.Sequence > bounds.MinSeq &&
+				entry.Sequence <= bounds.MaxSeq &&
+				entry.Timestamp > bounds.MinTS &&
 				entry.Timestamp <= bounds.MaxTS
 		})
 }
