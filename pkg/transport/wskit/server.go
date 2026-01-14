@@ -10,13 +10,13 @@ import (
 	"context"
 
 	"github.com/fgrzl/mux"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"golang.org/x/net/websocket"
 )
 
 // ConfigureWebSocketServer configures a WebSocket endpoint on the provided router
 // that integrates with the node manager for handling streaming requests.
-func ConfigureWebSocketServer(router *mux.Router, manager node.NodeManager) {
+func ConfigureWebSocketServer(router *mux.Router, manager server.NodeManager) {
 	server := &webSocketServer{
 		manager: manager,
 	}
@@ -24,7 +24,7 @@ func ConfigureWebSocketServer(router *mux.Router, manager node.NodeManager) {
 }
 
 type webSocketServer struct {
-	manager node.NodeManager
+	manager server.NodeManager
 }
 
 func (s *webSocketServer) connect(c mux.RouteContext) {
@@ -46,7 +46,7 @@ func (s *webSocketServer) connect(c mux.RouteContext) {
 type webSocketHandler struct {
 	ctx     context.Context
 	session MuxerSession
-	manager node.NodeManager
+	manager server.NodeManager
 }
 
 func (h *webSocketHandler) handle(conn *websocket.Conn) {

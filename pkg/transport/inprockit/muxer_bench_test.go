@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
 )
 
@@ -22,7 +22,7 @@ func (n *mockNode) Close() {}
 // mockNodeManager returns a mockNode for every GetOrCreate call.
 type mockNodeManager struct{}
 
-func (m *mockNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (node.Node, error) {
+func (m *mockNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (server.Node, error) {
 	return &mockNode{}, nil
 }
 

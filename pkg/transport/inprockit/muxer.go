@@ -5,20 +5,20 @@ import (
 	"sync"
 
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
 )
 
 type InProcMuxer struct {
 	ctx         context.Context
-	nodeManager node.NodeManager
+	nodeManager server.NodeManager
 
 	mu      sync.RWMutex
 	streams map[uuid.UUID]*InProcBidiStream
 }
 
 // NewInProcMuxer initializes a test muxer with an associated nodeManager.
-func NewInProcMuxer(ctx context.Context, nodeManager node.NodeManager) *InProcMuxer {
+func NewInProcMuxer(ctx context.Context, nodeManager server.NodeManager) *InProcMuxer {
 	return &InProcMuxer{
 		ctx:         ctx,
 		nodeManager: nodeManager,
@@ -30,14 +30,14 @@ func NewInProcMuxer(ctx context.Context, nodeManager node.NodeManager) *InProcMu
 func (m *InProcMuxer) Register(storeID uuid.UUID) (api.BidiStream, error) {
 	channelID := uuid.New()
 	client := NewInProcBidiStream()
-	server := NewInProcBidiStream()
-	LinkStreams(client, server)
+	serverStream := NewInProcBidiStream()
+	LinkStreams(client, serverStream)
 
 	m.mu.Lock()
-	m.streams[channelID] = server
+	m.streams[channelID] = serverStream
 	m.mu.Unlock()
 
-	ctx := node.WithChannelID(m.ctx, channelID)
+	ctx := server.WithChannelID(m.ctx, channelID)
 
 	instance, err := m.nodeManager.GetOrCreate(ctx, storeID)
 	if err != nil {
@@ -45,9 +45,9 @@ func (m *InProcMuxer) Register(storeID uuid.UUID) (api.BidiStream, error) {
 	}
 
 	go func() {
-		instance.Handle(ctx, server)
+		instance.Handle(ctx, serverStream)
 		// Optional: cleanup after stream closes
-		<-server.Closed()
+		<-serverStream.Closed()
 		m.mu.Lock()
 		delete(m.streams, channelID)
 		m.mu.Unlock()

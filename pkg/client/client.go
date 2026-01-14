@@ -1,12 +1,12 @@
-// Package streamkit provides a high-throughput, hierarchical event streaming platform
-// designed for scalable, organized, and reliable data flows.
+// Package client provides a high-throughput, hierarchical event streaming client
+// for interacting with streamkit servers.
 //
 // The package offers a client interface for interacting with streaming stores,
 // spaces, and segments. A Store provides physical separation at the storage level,
 // acting as the root for all spaces and segments. A Space is a top-level logical
 // container for related streams, while Segments are independent, ordered sub-streams
 // within a Space.
-package streamkit
+package client
 
 import (
 	"context"
@@ -148,17 +148,22 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 
 	go func(bidi api.BidiStream, entries enumerators.Enumerator[*Record]) {
 		defer entries.Dispose()
+		count := 0
 		for entries.MoveNext() {
 			entry, err := entries.Current()
 			if err != nil {
+				slog.DebugContext(ctx, "client: produce goroutine error getting entry", "err", err, "count", count)
 				bidi.CloseSend(err)
 				return
 			}
 			if err := bidi.Encode(entry); err != nil {
+				slog.DebugContext(ctx, "client: produce goroutine error encoding entry", "err", err, "count", count)
 				bidi.CloseSend(err)
 				return
 			}
+			count++
 		}
+		slog.DebugContext(ctx, "client: produce goroutine finished writing records", "count", count, "err", entries.Err())
 		bidi.CloseSend(entries.Err())
 	}(bidi, entries)
 

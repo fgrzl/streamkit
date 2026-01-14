@@ -14,8 +14,8 @@ import (
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/mux"
-	"github.com/fgrzl/streamkit"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/client"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streamkit/pkg/storage/azurekit"
 	"github.com/fgrzl/streamkit/pkg/storage/pebblekit"
@@ -37,7 +37,7 @@ func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 		Secret: secret,
 	}
 
-	nodeManager := node.NewNodeManager(node.WithStoreFactory(factory))
+	nodeManager := server.NewNodeManager(server.WithStoreFactory(factory))
 
 	router := mux.NewRouter()
 
@@ -73,10 +73,10 @@ func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 
 	addr := "ws://" + url.Host
 	provider := wskit.NewBidiStreamProvider(addr, func() (string, error) { return token, nil })
-	client := streamkit.NewClient(provider)
+	clientInstance := client.NewClient(provider)
 
 	harness := &TestHarness{
-		Client: client,
+		Client: clientInstance,
 	}
 	return harness
 }
@@ -124,17 +124,17 @@ func inprockitTestHarness(t *testing.T) *TestHarness {
 	factory, err := pebblekit.NewStoreFactory(options)
 	require.NoError(t, err)
 
-	nodeManager := node.NewNodeManager(node.WithStoreFactory(factory))
+	nodeManager := server.NewNodeManager(server.WithStoreFactory(factory))
 
 	provider := inprockit.NewInProcBidiStreamProvider(t.Context(), nodeManager)
-	client := streamkit.NewClient(provider)
+	clientInstance := client.NewClient(provider)
 
 	t.Cleanup(func() {
 		nodeManager.Close()
 	})
 
 	return &TestHarness{
-		Client: client,
+		Client: clientInstance,
 	}
 }
 
@@ -159,7 +159,7 @@ func TestShouldAllowMultiplexedCallsWhenUsingDifferentSegments(t *testing.T) {
 
 				// Assert
 				require.NoError(t, err)
-				assert.Equal(t, &streamkit.Entry{Space: space, Segment: segment}, entry)
+				assert.Equal(t, &client.Entry{Space: space, Segment: segment}, entry)
 			}
 		})
 	}
@@ -257,7 +257,7 @@ func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 
 		t.Run("should consume segment "+name, func(t *testing.T) {
 			// Arrange
-			args := &streamkit.ConsumeSegment{
+			args := &client.ConsumeSegment{
 				Space:   "space0",
 				Segment: "segment0",
 			}
@@ -280,7 +280,7 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 
 		t.Run("should consume segment with exclusive min "+name, func(t *testing.T) {
 			// Arrange
-			args := &streamkit.ConsumeSegment{
+			args := &client.ConsumeSegment{
 				Space:       "space0",
 				Segment:     "segment0",
 				MinSequence: 233,
@@ -304,7 +304,7 @@ func TestShouldConsumeAllEntriesWhenGivenValidSpace(t *testing.T) {
 			ctx := t.Context()
 			setupConsumerData(t, storeID, h.Client)
 
-			args := &streamkit.ConsumeSpace{
+			args := &client.ConsumeSpace{
 				Space: "space0",
 			}
 
@@ -328,7 +328,7 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 			setupConsumerData(t, storeID, h.Client)
 			runtime.Gosched()
 
-			args := &streamkit.Consume{
+			args := &client.Consume{
 				Offsets: map[string]lexkey.LexKey{
 					"space0": {},
 					"space1": {},

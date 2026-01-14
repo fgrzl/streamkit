@@ -43,7 +43,7 @@ jobs:
         run: go build ./...
 
       - name: Setup Test Infrastructure
-        run: docker compose -f test/compose.yaml up -d
+        run: docker compose up -d --build
 
       - name: Run Tests
         run: go test ./... -v -cover

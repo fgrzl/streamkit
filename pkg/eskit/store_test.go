@@ -9,8 +9,8 @@ import (
 	"github.com/fgrzl/es"
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/messaging"
-	"github.com/fgrzl/streamkit"
-	api "github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/client"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -71,15 +71,15 @@ func (f *fakeDomainEvent) MarshalJSON() ([]byte, error) {
 
 // fakeClient implements the subset of streamkit.Client used by streamStore.
 type fakeClient struct {
-	consume  enumerators.Enumerator[*streamkit.Entry]
-	produced []*streamkit.Record
+	consume  enumerators.Enumerator[*client.Entry]
+	produced []*client.Record
 }
 
-func (f *fakeClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *streamkit.ConsumeSegment) enumerators.Enumerator[*streamkit.Entry] {
+func (f *fakeClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *client.ConsumeSegment) enumerators.Enumerator[*client.Entry] {
 	return f.consume
 }
 
-func (f *fakeClient) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*streamkit.Record]) enumerators.Enumerator[*streamkit.SegmentStatus] {
+func (f *fakeClient) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*client.Record]) enumerators.Enumerator[*client.SegmentStatus] {
 	// Synchronously consume records and capture them
 	for entries.MoveNext() {
 		r, err := entries.Current()
@@ -88,7 +88,7 @@ func (f *fakeClient) Produce(ctx context.Context, storeID uuid.UUID, space, segm
 		}
 		f.produced = append(f.produced, r)
 	}
-	return enumerators.Slice([]*streamkit.SegmentStatus{{}})
+	return enumerators.Slice([]*client.SegmentStatus{{}})
 }
 
 // other client methods not used in these tests
@@ -98,22 +98,22 @@ func (f *fakeClient) GetSpaces(ctx context.Context, storeID uuid.UUID) enumerato
 func (f *fakeClient) GetSegments(ctx context.Context, storeID uuid.UUID, space string) enumerators.Enumerator[string] {
 	return enumerators.Slice([]string{})
 }
-func (f *fakeClient) Consume(ctx context.Context, storeID uuid.UUID, args *streamkit.Consume) enumerators.Enumerator[*streamkit.Entry] {
-	return enumerators.Slice([]*streamkit.Entry{})
+func (f *fakeClient) Consume(ctx context.Context, storeID uuid.UUID, args *client.Consume) enumerators.Enumerator[*client.Entry] {
+	return enumerators.Slice([]*client.Entry{})
 }
-func (f *fakeClient) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *streamkit.ConsumeSpace) enumerators.Enumerator[*streamkit.Entry] {
-	return enumerators.Slice([]*streamkit.Entry{})
+func (f *fakeClient) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *client.ConsumeSpace) enumerators.Enumerator[*client.Entry] {
+	return enumerators.Slice([]*client.Entry{})
 }
-func (f *fakeClient) Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*streamkit.Entry, error) {
-	return &streamkit.Entry{}, nil
+func (f *fakeClient) Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*client.Entry, error) {
+	return &client.Entry{}, nil
 }
 func (f *fakeClient) Publish(ctx context.Context, storeID uuid.UUID, space, segment string, payload []byte, metadata map[string]string) error {
 	return nil
 }
-func (f *fakeClient) SubscribeToSpace(ctx context.Context, storeID uuid.UUID, space string, handler func(*streamkit.SegmentStatus)) (api.Subscription, error) {
+func (f *fakeClient) SubscribeToSpace(ctx context.Context, storeID uuid.UUID, space string, handler func(*client.SegmentStatus)) (api.Subscription, error) {
 	return nil, nil
 }
-func (f *fakeClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*streamkit.SegmentStatus)) (api.Subscription, error) {
+func (f *fakeClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*client.SegmentStatus)) (api.Subscription, error) {
 	return nil, nil
 }
 
@@ -125,8 +125,8 @@ func TestLoadEventsShouldUnmarshalDomainEvents(t *testing.T) {
 	payload, err := json.Marshal(env)
 	require.NoError(t, err)
 
-	entry := &streamkit.Entry{Payload: payload}
-	fc := &fakeClient{consume: enumerators.Slice([]*streamkit.Entry{entry})}
+	entry := &client.Entry{Payload: payload}
+	fc := &fakeClient{consume: enumerators.Slice([]*client.Entry{entry})}
 	s := &streamStore{client: fc}
 
 	// Act

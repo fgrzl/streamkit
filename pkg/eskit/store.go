@@ -15,24 +15,24 @@ import (
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/es"
 	"github.com/fgrzl/json/polymorphic"
-	"github.com/fgrzl/streamkit"
+	"github.com/fgrzl/streamkit/pkg/client"
 )
 
 // NewStreamStore creates a new event store implementation backed by a streamkit client.
-func NewStreamStore(client streamkit.Client) es.Store {
+func NewStreamStore(client client.Client) es.Store {
 	return &streamStore{
 		client: client,
 	}
 }
 
 type streamStore struct {
-	client streamkit.Client
+	client client.Client
 }
 
 func (s *streamStore) LoadEvents(ctx context.Context, entity es.Entity, minSequence uint64) ([]es.DomainEvent, error) {
 	slog.Debug("Loading events", "space", entity.Area, "segment", entity.ID.String(), "minSequence", minSequence)
 
-	args := &streamkit.ConsumeSegment{
+	args := &client.ConsumeSegment{
 		Space:       entity.Area,
 		Segment:     entity.ID.String(),
 		MinSequence: minSequence,
@@ -40,7 +40,7 @@ func (s *streamStore) LoadEvents(ctx context.Context, entity es.Entity, minSeque
 
 	domainEvents := enumerators.Map(
 		s.client.ConsumeSegment(ctx, entity.TenantID, args),
-		func(entry *streamkit.Entry) (es.DomainEvent, error) {
+		func(entry *client.Entry) (es.DomainEvent, error) {
 			envelope := &polymorphic.Envelope{}
 			if err := json.Unmarshal(entry.Payload, envelope); err != nil {
 				slog.ErrorContext(ctx, "Failed to unmarshal envelope", "err", err)
@@ -63,14 +63,14 @@ func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events [
 	space, segment := entity.Area, entity.ID.String()
 	records := enumerators.Map(
 		enumerators.Slice(events),
-		func(event es.DomainEvent) (*streamkit.Record, error) {
+		func(event es.DomainEvent) (*client.Record, error) {
 			envelope := polymorphic.NewEnvelope(event)
 			payload, err := json.Marshal(envelope)
 			if err != nil {
 				slog.ErrorContext(ctx, "Failed to marshal event", "err", err)
 				return nil, err
 			}
-			entry := &streamkit.Record{
+			entry := &client.Record{
 				Sequence: event.GetSequence(),
 				Payload:  payload,
 			}

@@ -102,10 +102,9 @@ type AzureStore struct {
 }
 
 func (s *AzureStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
-	query := buildQuery(
-		lexkey.EncodeFirst(api.INVENTORY, api.SPACES).ToHexString(),
-		lexkey.EncodeLast(api.INVENTORY, api.SPACES).ToHexString(),
-	)
+	// All spaces stored in single partition
+	pKey := lexkey.Encode(api.INVENTORY, api.SPACES).ToHexString()
+	query := fmt.Sprintf("PartitionKey eq '%s'", pKey)
 
 	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
@@ -121,19 +120,39 @@ func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) e
 	ts := timestamp.GetTimestamp()
 	bounds := calculateTimeBounds(ts, args.MinTimestamp, args.MaxTimestamp)
 
-	query := buildQuery(
-		getSpaceLowerBound(args.Space, bounds.Min, args.Offset).ToHexString(),
-		lexkey.EncodeLast(api.DATA, api.SPACES, args.Space).ToHexString(),
-	)
+	// PartitionKey is constant for all entries in a space
+	pKey := lexkey.Encode(api.DATA, api.SPACES, args.Space).ToHexString()
 
-	return s.queryEntries(ctx, query, bounds.Min, bounds.Max)
+	// RowKey encodes timestamp + segment + sequence, so we filter on timestamp range
+	var rLower, rUpper string
+	if len(args.Offset) > 0 {
+		rLower = args.Offset.ToHexString()
+	} else {
+		rLower = lexkey.EncodeFirst(bounds.Min).ToHexString()
+	}
+	rUpper = lexkey.EncodeLast(bounds.Max).ToHexString()
+
+	query := fmt.Sprintf("PartitionKey eq '%s' and RowKey gt '%s' and RowKey le '%s'", pKey, rLower, rUpper)
+
+	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
+		Filter: &query,
+		Format: ptr(aztables.MetadataFormatNone),
+	}))
+
+	entries := enumerators.Map(entities, func(e *entity) (*api.Entry, error) {
+		return decodeEntry(e.Value)
+	})
+
+	// Note: MinTS is exclusive, MaxTS is inclusive
+	return enumerators.TakeWhile(entries, func(e *api.Entry) bool {
+		return e.Timestamp > bounds.Min && e.Timestamp <= bounds.Max
+	})
 }
 
 func (s *AzureStore) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
-	query := buildQuery(
-		lexkey.EncodeFirst(api.INVENTORY, api.SEGMENTS, space).ToHexString(),
-		lexkey.EncodeLast(api.INVENTORY, api.SEGMENTS, space).ToHexString(),
-	)
+	// All segments for a space stored in single partition
+	pKey := lexkey.Encode(api.INVENTORY, api.SEGMENTS, space).ToHexString()
+	query := fmt.Sprintf("PartitionKey eq '%s'", pKey)
 
 	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
@@ -149,13 +168,13 @@ func (s *AzureStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegmen
 	ts := timestamp.GetTimestamp()
 	bounds := calculateSegmentBounds(ts, args)
 
-	pLower := lexkey.EncodeFirst(api.DATA, api.SEGMENTS, args.Space, args.Segment).ToHexString()
-	pUpper := lexkey.EncodeLast(api.DATA, api.SEGMENTS, args.Space, args.Segment).ToHexString()
+	// All entries for a segment share the same partition key
+	partitionKey := lexkey.Encode(api.DATA, api.SEGMENTS, args.Space, args.Segment).ToHexString()
 	rLower := lexkey.EncodeFirst(bounds.MinSeq).ToHexString()
 	rUpper := lexkey.EncodeLast(bounds.MaxSeq).ToHexString()
 
-	query := fmt.Sprintf("PartitionKey ge '%s' and PartitionKey le '%s' and RowKey ge '%s' and RowKey le '%s'",
-		pLower, pUpper, rLower, rUpper)
+	query := fmt.Sprintf("PartitionKey eq '%s' and RowKey ge '%s' and RowKey le '%s'",
+		partitionKey, rLower, rUpper)
 
 	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
@@ -379,10 +398,18 @@ func (s *AzureStore) writeLastEntry(ctx context.Context, entry batchEntry, errCh
 func (s *AzureStore) writeSegmentBatch(ctx context.Context, entries []batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	if len(entries) == 0 {
+		return
+	}
+
+	// Write each entry individually since they share the same partition (space+segment)
+	// but Azure batch transactions require all operations to target the EXACT same partition key
+	partitionKey := lexkey.Encode(api.DATA, api.SEGMENTS, entries[0].Entry.Space, entries[0].Entry.Segment).ToHexString()
+
 	entities := make([]entity, len(entries))
 	for i, entry := range entries {
 		entities[i] = entity{
-			PartitionKey: lexkey.Encode(api.DATA, api.SEGMENTS, entry.Entry.Space, entry.Entry.Segment, entry.Entry.TRX.Number).ToHexString(),
+			PartitionKey: partitionKey,
 			RowKey:       lexkey.Encode(entry.Entry.Sequence).ToHexString(),
 			Value:        entry.EncodedValue,
 		}
@@ -396,11 +423,19 @@ func (s *AzureStore) writeSegmentBatch(ctx context.Context, entries []batchEntry
 func (s *AzureStore) writeSpaceBatch(ctx context.Context, entries []batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	if len(entries) == 0 {
+		return
+	}
+
+	// All space entries for a given space share the same partition key
+	// RowKey encodes: timestamp + segment + sequence for uniqueness and proper ordering
+	partitionKey := lexkey.Encode(api.DATA, api.SPACES, entries[0].Entry.Space).ToHexString()
+
 	entities := make([]entity, len(entries))
 	for i, entry := range entries {
 		entities[i] = entity{
-			PartitionKey: lexkey.Encode(api.DATA, api.SPACES, entry.Entry.Space, entry.Entry.Timestamp, entry.Entry.Segment).ToHexString(),
-			RowKey:       lexkey.Encode(entry.Entry.Sequence).ToHexString(),
+			PartitionKey: partitionKey,
+			RowKey:       lexkey.Encode(entry.Entry.Timestamp, entry.Entry.Segment, entry.Entry.Sequence).ToHexString(),
 			Value:        entry.EncodedValue,
 		}
 	}
@@ -431,32 +466,34 @@ func (s *AzureStore) writeBatch(ctx context.Context, entities []entity) error {
 }
 
 func (s *AzureStore) updateInventory(ctx context.Context, space, segment string) error {
-	segmentKey := lexkey.Encode(api.INVENTORY, api.SEGMENTS, space, segment).ToHexString()
+	cacheKey := fmt.Sprintf("inventory:%s:%s", space, segment)
 
-	_, ok := s.cache.Get(segmentKey)
+	_, ok := s.cache.Get(cacheKey)
 	if ok {
 		return nil
 	}
 
 	updateOptions := &aztables.UpsertEntityOptions{UpdateMode: aztables.UpdateModeReplace}
 
+	// Write segment to space-specific partition
+	segmentPK := lexkey.Encode(api.INVENTORY, api.SEGMENTS, space).ToHexString()
 	if _, err := s.client.UpsertEntity(ctx, mustMarshal(entity{
-		PartitionKey: segmentKey,
+		PartitionKey: segmentPK,
 		RowKey:       segment,
 	}), updateOptions); err != nil {
 		return fmt.Errorf("%s: %w", ErrSegmentInventory, err)
 	}
 
-	spaceKey := lexkey.Encode(api.INVENTORY, api.SPACES, space).ToHexString()
-
+	// Write space to global spaces partition
+	spacePK := lexkey.Encode(api.INVENTORY, api.SPACES).ToHexString()
 	if _, err := s.client.UpsertEntity(ctx, mustMarshal(entity{
-		PartitionKey: spaceKey,
+		PartitionKey: spacePK,
 		RowKey:       space,
 	}), updateOptions); err != nil {
 		return fmt.Errorf("%s: %w", ErrSpaceInventory, err)
 	}
 
-	s.cache.Set(segmentKey, struct{}{})
+	s.cache.Set(cacheKey, struct{}{})
 	return nil
 }
 

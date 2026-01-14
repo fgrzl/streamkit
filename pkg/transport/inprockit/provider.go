@@ -10,7 +10,7 @@ import (
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
 )
 
@@ -26,7 +26,7 @@ type InProcBidiStreamProvider struct {
 }
 
 // NewInProcBidiStreamProvider initializes the provider with a backing InProcMuxer.
-func NewInProcBidiStreamProvider(ctx context.Context, nm node.NodeManager) *InProcBidiStreamProvider {
+func NewInProcBidiStreamProvider(ctx context.Context, nm server.NodeManager) *InProcBidiStreamProvider {
 	return &InProcBidiStreamProvider{
 		muxer: NewInProcMuxer(ctx, nm),
 	}

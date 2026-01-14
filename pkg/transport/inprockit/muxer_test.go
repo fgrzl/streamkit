@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -23,11 +23,11 @@ func (n *testNode) Handle(ctx context.Context, bidi api.BidiStream) {
 func (n *testNode) Close() {}
 
 type testNodeManager struct {
-	node node.Node
+	node server.Node
 	fail bool
 }
 
-func (m *testNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (node.Node, error) {
+func (m *testNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (server.Node, error) {
 	if m.fail {
 		return nil, errors.New("fail")
 	}

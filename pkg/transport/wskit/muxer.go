@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
 	"golang.org/x/net/websocket"
 )
@@ -59,7 +59,7 @@ type WebSocketMuxer struct {
 	channelsMu  sync.RWMutex
 	writeMu     sync.Mutex
 	done        chan struct{}
-	nodeManager node.NodeManager
+	nodeManager server.NodeManager
 	closeOnce   sync.Once
 
 	// outbound write pump
@@ -148,7 +148,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 // NewServerWebSocketMuxer will start a blocking read loop to keep the websocket connection open
 // NewServerWebSocketMuxer constructs a server-side muxer, starts the
 // heartbeat goroutine and blocks in readLoop until the connection closes.
-func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeManager node.NodeManager, conn *websocket.Conn) {
+func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeManager server.NodeManager, conn *websocket.Conn) {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
 		Context:          cctx,
@@ -350,7 +350,7 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 // processMessage handles a single decoded MuxerMsg. It contains the large
 // control-type switch extracted from readLoop so the loop itself stays concise.
 func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
-	ctx := node.WithChannelID(m.Context, msg.ChannelID)
+	ctx := server.WithChannelID(m.Context, msg.ChannelID)
 	switch msg.ControlType {
 	case ControlTypePing:
 		m.handlePing(ctx)

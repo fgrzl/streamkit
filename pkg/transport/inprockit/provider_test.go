@@ -7,7 +7,7 @@ import (
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/fgrzl/streamkit/pkg/node"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -31,10 +31,10 @@ func (f *fakeNode) Handle(ctx context.Context, bidi api.BidiStream) {
 func (f *fakeNode) Close() {}
 
 type fakeNodeManager struct {
-	node node.Node
+	node server.Node
 }
 
-func (m *fakeNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (node.Node, error) {
+func (m *fakeNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (server.Node, error) {
 	return m.node, nil
 }
 

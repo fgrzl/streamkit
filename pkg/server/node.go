@@ -1,11 +1,11 @@
-// Package node provides the core request handling and coordination logic
+// Package server provides the core server-side request handling and coordination logic
 // for the streamkit streaming platform.
 //
 // This package implements the Node interface which processes incoming
 // requests and coordinates with storage backends to fulfill streaming
 // operations. It also manages node lifecycle and provides notification
 // capabilities for real-time updates.
-package node
+package server
 
 import (
 	"context"
@@ -129,12 +129,16 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 }
 
 func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi api.BidiStream) {
+	slog.DebugContext(ctx, "node: handleProduce called", "space", args.Space, "segment", args.Segment, "store_id", n.storeID)
 	entries := api.NewStreamEnumerator[*api.Record](bidi)
 	results := n.store.Produce(ctx, args, entries)
 
 	bus := n.getBus(ctx)
 
+	count := 0
 	err := enumerators.ForEach(results, func(result *api.SegmentStatus) error {
+		count++
+		slog.DebugContext(ctx, "node: received produce result", "space", result.Space, "segment", result.Segment, "first_seq", result.FirstSequence, "last_seq", result.LastSequence, "count", count)
 		if err := bidi.Encode(result); err != nil {
 			return err
 		}
@@ -149,6 +153,7 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 		}
 		return nil
 	})
+	slog.DebugContext(ctx, "node: handleProduce complete", "results_count", count, "err", err)
 	if err != nil {
 		slog.ErrorContext(ctx, "produce failed", "err", err)
 		bidi.CloseSend(err)
