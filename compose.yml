@@ -1,0 +1,10 @@
+services:
+  fazure:
+    image: ghcr.io/fgrzl/fazure:latest
+    container_name: fazure
+    hostname: fazure
+    ports:
+      - "10000:10000" # Blob service
+      - "10001:10001" # Queue service
+      - "10002:10002" # Table service
+    restart: unless-stopped
