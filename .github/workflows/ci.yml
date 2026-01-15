@@ -43,10 +43,7 @@ jobs:
         run: go build ./...
 
       - name: Setup Test Infrastructure
-        run: docker compose up -d --build
+        run: docker compose up -d
 
       - name: Run Tests
-        run: go test ./... -v -cover
-
-      - name: Workflow Cleanup
-        uses: fgrzl/actions/workflow-cleanup@v0.0.6
+        run: go test ./... -v
