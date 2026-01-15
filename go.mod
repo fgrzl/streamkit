@@ -12,7 +12,7 @@ require (
 	github.com/fgrzl/es v0.0.1-alpha.36
 	github.com/fgrzl/json v0.1.0-alpha.62
 	github.com/fgrzl/lexkey v0.1.0-alpha.35
-	github.com/fgrzl/messaging v1.0.0-alpha.3
+	github.com/fgrzl/messaging v1.0.0-alpha.4
 	github.com/fgrzl/mux v0.0.1-alpha.140
 	github.com/fgrzl/timestamp v1.0.0-alpha.2
 	github.com/golang/snappy v1.0.0
