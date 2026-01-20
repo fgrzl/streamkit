@@ -545,9 +545,11 @@ func (m *WebSocketMuxer) computeHeartbeatWait(base, jitter time.Duration) time.D
 func (m *WebSocketMuxer) checkHeartbeatTimeout() bool {
 	ts := timestamp.GetTimestamp()
 	last := atomic.LoadInt64(&m.lastPongUnix)
-	if ts-last > m.pongTimeout {
+	pongTimeoutMs := m.pongTimeout * 1000
+	idleMs := ts - last
+	if idleMs > pongTimeoutMs {
 		atomic.AddInt64(&m.missedPongs, 1)
-		slog.WarnContext(m.Context, "muxer: heartbeat timed out; closing connection", slog.Int64("idle_seconds", ts-last))
+		slog.WarnContext(m.Context, "muxer: heartbeat timed out; closing connection", slog.Int64("idle_ms", idleMs))
 		// Reuse shutdown to avoid duplicating close semantics. Provide a specific
 		// ErrHeartbeatTimeout so streams receive the appropriate error.
 		m.shutdown(ErrHeartbeatTimeout)
