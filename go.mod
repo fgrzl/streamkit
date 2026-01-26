@@ -13,7 +13,7 @@ require (
 	github.com/fgrzl/json v0.1.0-alpha.62
 	github.com/fgrzl/lexkey v0.1.0-alpha.35
 	github.com/fgrzl/messaging v1.0.0-alpha.4
-	github.com/fgrzl/mux v0.0.1-alpha.140
+	github.com/fgrzl/mux v0.0.1-alpha.158
 	github.com/fgrzl/timestamp v1.0.0-alpha.2
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
@@ -63,7 +63,7 @@ require (
 	github.com/prometheus/procfs v0.10.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.63.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.64.0 // indirect
 	go.opentelemetry.io/otel v1.39.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.39.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.39.0 // indirect
