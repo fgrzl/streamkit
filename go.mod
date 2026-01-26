@@ -6,7 +6,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.4.1
-	github.com/cockroachdb/pebble/v2 v2.1.3
+	github.com/cockroachdb/pebble/v2 v2.1.4
 	github.com/fgrzl/claims v0.0.1-alpha.22
 	github.com/fgrzl/enumerators v1.0.0-alpha.3
 	github.com/fgrzl/es v0.0.1-alpha.36
@@ -25,7 +25,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.6.0 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect
-	github.com/RaduBerinde/axisds v0.0.0-20250419182453-5135a0650657 // indirect
+	github.com/RaduBerinde/axisds v0.1.0 // indirect
 	github.com/RaduBerinde/btreemap v0.0.0-20250419174037-3d62b7205d54 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
