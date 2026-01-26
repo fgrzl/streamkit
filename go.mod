@@ -10,7 +10,7 @@ require (
 	github.com/fgrzl/claims v0.0.1-alpha.22
 	github.com/fgrzl/enumerators v1.0.0-alpha.3
 	github.com/fgrzl/es v0.0.1-alpha.36
-	github.com/fgrzl/json v0.1.0-alpha.62
+	github.com/fgrzl/json v1.0.0-alpha.5
 	github.com/fgrzl/lexkey v0.1.0-alpha.35
 	github.com/fgrzl/messaging v1.0.0-alpha.4
 	github.com/fgrzl/mux v0.0.1-alpha.140
