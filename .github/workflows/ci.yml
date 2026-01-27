@@ -5,10 +5,20 @@ on:
   push:
     branches:
       - "**"
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/**'
   pull_request:
     branches:
       - main
       - develop
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
@@ -28,22 +38,26 @@ jobs:
       - name: Set Up Go
         uses: actions/setup-go@v6
         with:
-          go-version: 1.25
+          go-version: "1.25"
 
-      - name: Install Dependencies
+      - name: Ensure dependencies
         run: go mod tidy
 
-      - name: Download Dependencies
-        run: go mod download
-
-      - name: Vet Project
+      - name: Vet
         run: go vet ./...
 
-      - name: Build Project
+      - name: Build
         run: go build ./...
 
-      - name: Setup Test Infrastructure
+      - name: Pull Containers
+        run: docker compose pull
+
+      - name: Start Containers
         run: docker compose up -d
 
       - name: Run Tests
         run: go test ./... -v
+
+      - name: Stop Containers
+        if: always()
+        run: docker compose down --volumes
