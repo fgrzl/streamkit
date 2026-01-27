@@ -152,18 +152,15 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 		for entries.MoveNext() {
 			entry, err := entries.Current()
 			if err != nil {
-				slog.DebugContext(ctx, "client: produce goroutine error getting entry", "err", err, "count", count)
 				bidi.CloseSend(err)
 				return
 			}
 			if err := bidi.Encode(entry); err != nil {
-				slog.DebugContext(ctx, "client: produce goroutine error encoding entry", "err", err, "count", count)
 				bidi.CloseSend(err)
 				return
 			}
 			count++
 		}
-		slog.DebugContext(ctx, "client: produce goroutine finished writing records", "count", count, "err", entries.Err())
 		bidi.CloseSend(entries.Err())
 	}(bidi, entries)
 
@@ -228,7 +225,6 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			// Check for cancellation, but don't block if not cancelled
 			select {
 			case <-ctx.Done():
-				slog.DebugContext(ctx, "subscription canceled")
 				bidi.Close(ctx.Err())
 				return
 			default:

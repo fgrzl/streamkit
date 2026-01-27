@@ -89,11 +89,6 @@ type WebSocketMuxer struct {
 	// Tests may override these to simulate network behavior.
 	sendJSON func(conn *websocket.Conn, v interface{}) error
 	recvJSON func(conn *websocket.Conn, v interface{}) error
-
-	// debug log rate limiting (unix seconds); 0 disables throttling
-	lastPingLogUnix  int64
-	lastPongLogUnix  int64
-	debugLogInterval int64
 }
 
 // sentinel errors
@@ -108,19 +103,18 @@ var (
 func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *websocket.Conn) *WebSocketMuxer {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:          ctx,
-		session:          session,
-		name:             "client",
-		conn:             conn,
-		channels:         make(map[uuid.UUID]*MuxerBidiStream),
-		done:             make(chan struct{}),
-		pingInterval:     30,
-		pongTimeout:      90,
-		pingJitter:       5,
-		lastPongUnix:     timestamp.GetTimestamp(),
-		heartbeatStop:    make(chan struct{}),
-		cancelFunc:       cancel,
-		debugLogInterval: 60,
+		Context:       ctx,
+		session:       session,
+		name:          "client",
+		conn:          conn,
+		channels:      make(map[uuid.UUID]*MuxerBidiStream),
+		done:          make(chan struct{}),
+		pingInterval:  30,
+		pongTimeout:   90,
+		pingJitter:    5,
+		lastPongUnix:  timestamp.GetTimestamp(),
+		heartbeatStop: make(chan struct{}),
+		cancelFunc:    cancel,
 	}
 
 	// write pump defaults
@@ -151,20 +145,19 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeManager server.NodeManager, conn *websocket.Conn) {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:          cctx,
-		session:          session,
-		name:             "server",
-		conn:             conn,
-		nodeManager:      nodeManager,
-		channels:         make(map[uuid.UUID]*MuxerBidiStream),
-		done:             make(chan struct{}),
-		pingInterval:     30,
-		pongTimeout:      90,
-		pingJitter:       5,
-		lastPongUnix:     timestamp.GetTimestamp(),
-		heartbeatStop:    make(chan struct{}),
-		cancelFunc:       cancel,
-		debugLogInterval: 60,
+		Context:       cctx,
+		session:       session,
+		name:          "server",
+		conn:          conn,
+		nodeManager:   nodeManager,
+		channels:      make(map[uuid.UUID]*MuxerBidiStream),
+		done:          make(chan struct{}),
+		pingInterval:  30,
+		pongTimeout:   90,
+		pingJitter:    5,
+		lastPongUnix:  timestamp.GetTimestamp(),
+		heartbeatStop: make(chan struct{}),
+		cancelFunc:    cancel,
 	}
 	m.Context = cctx
 	m.logger = slog.With(slog.String("muxer", m.name))
@@ -218,7 +211,6 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 		m.channelsMu.Lock()
 		defer m.channelsMu.Unlock()
 		delete(m.channels, channelID)
-		slog.DebugContext(m.Context, "muxer: stream unregistered", slog.String("channel_id", channelID.String()))
 	}
 
 	bidi := NewMuxerBidiStream(sendFn, cleanup)
@@ -228,7 +220,6 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 	m.channels[channelID] = bidi
 	m.channelsMu.Unlock()
 
-	slog.DebugContext(m.Context, "muxer: stream registered", slog.String("channel_id", channelID.String()))
 	return bidi
 }
 
@@ -370,35 +361,14 @@ func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 }
 
 func (m *WebSocketMuxer) handlePing(ctx context.Context) {
-	ts := timestamp.GetTimestamp()
-	total := atomic.AddInt64(&m.pingsReceived, 1)
-	if m.logger.Enabled(context.Background(), slog.LevelDebug) {
-		if m.debugLogInterval <= 0 {
-			m.logger.DebugContext(ctx, "muxer: received ping", slog.Int64("pings_total", total))
-		} else {
-			last := atomic.LoadInt64(&m.lastPingLogUnix)
-			if ts-last >= m.debugLogInterval && atomic.CompareAndSwapInt64(&m.lastPingLogUnix, last, ts) {
-				m.logger.DebugContext(ctx, "muxer: received ping", slog.Int64("pings_total", total))
-			}
-		}
-	}
+	atomic.AddInt64(&m.pingsReceived, 1)
 	_ = m.sendControl(ControlTypePong, uuid.Nil, uuid.Nil, nil)
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 }
 
 func (m *WebSocketMuxer) handlePong(ctx context.Context) {
 	ts := timestamp.GetTimestamp()
-	total := atomic.AddInt64(&m.pongsReceived, 1)
-	if m.logger.Enabled(context.Background(), slog.LevelDebug) {
-		if m.debugLogInterval <= 0 {
-			m.logger.DebugContext(ctx, "muxer: received pong", slog.Int64("pongs_total", total))
-		} else {
-			last := atomic.LoadInt64(&m.lastPongLogUnix)
-			if ts-last >= m.debugLogInterval && atomic.CompareAndSwapInt64(&m.lastPongLogUnix, last, ts) {
-				m.logger.DebugContext(ctx, "muxer: received pong", slog.Int64("pongs_total", total))
-			}
-		}
-	}
+	atomic.AddInt64(&m.pongsReceived, 1)
 	atomic.StoreInt64(&m.lastPongUnix, ts)
 }
 
@@ -484,15 +454,7 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", slog.String("channel_id", msg.ChannelID.String()))
 		return
 	}
-	if bidi.Offer(msg.Payload) {
-		if m.logger.Enabled(context.Background(), slog.LevelDebug) {
-			slog.DebugContext(ctx, "muxer: delivered message", slog.String("channel_id", msg.ChannelID.String()))
-		}
-	} else {
-		if m.logger.Enabled(context.Background(), slog.LevelDebug) {
-			slog.DebugContext(ctx, "muxer: dropped message for closed stream", slog.String("channel_id", msg.ChannelID.String()))
-		}
-	}
+	bidi.Offer(msg.Payload)
 }
 
 // heartbeat periodically sends ping control frames and verifies a timely pong or activity.

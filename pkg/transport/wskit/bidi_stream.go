@@ -36,7 +36,6 @@ func NewMuxerBidiStream(
 		closed:   make(chan struct{}),
 		onClose:  onClose,
 	}
-	slog.Debug("bidi: stream created")
 	return s
 }
 
@@ -51,7 +50,6 @@ func (c *MuxerBidiStream) Encode(m any) error {
 		slog.Error("bidi: encode send failed", "err", err, slog.String("channel_id", c.channelID.String()), slog.Int("bytes", len(payload)))
 		return err
 	}
-	slog.Debug("bidi: sent message", slog.String("channel_id", c.channelID.String()), slog.Int("bytes", len(payload)))
 	return nil
 }
 
@@ -59,12 +57,10 @@ func (c *MuxerBidiStream) Encode(m any) error {
 func (c *MuxerBidiStream) Decode(v any) error {
 	select {
 	case <-c.closed:
-		slog.Debug("bidi: decode on closed stream -> EOF", slog.String("channel_id", c.channelID.String()))
 		return io.EOF
 
 	case msg, ok := <-c.recvChan:
 		if !ok {
-			slog.Debug("bidi: recv channel closed -> EOF", slog.String("channel_id", c.channelID.String()))
 			return io.EOF
 		}
 		payload, err := c.payloadFromMsg(msg)
@@ -82,7 +78,6 @@ func (c *MuxerBidiStream) Decode(v any) error {
 			slog.Warn("bidi: decode unmarshal failed", slog.String("channel_id", c.channelID.String()), "err", err)
 			return err
 		}
-		slog.Debug("bidi: received message", slog.String("channel_id", c.channelID.String()), slog.Int("bytes", len(payload)))
 		return nil
 	}
 }
@@ -119,7 +114,6 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 			slog.Warn("bidi: remote closed stream with error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
 			return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
 		}
-		slog.Debug("bidi: remote closed stream", slog.String("channel_id", c.channelID.String()))
 		return true, io.EOF
 	case "error":
 		slog.Warn("bidi: remote error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
@@ -142,7 +136,6 @@ func (c *MuxerBidiStream) CloseSend(err error) error {
 		slog.Warn("bidi: failed to send close", slog.String("channel_id", c.channelID.String()), "err", encErr)
 		return encErr
 	}
-	slog.Debug("bidi: sent close", slog.String("channel_id", c.channelID.String()), slog.String("reason", msg.Err))
 	return nil
 }
 
@@ -154,11 +147,6 @@ func (c *MuxerBidiStream) Close(err error) {
 		// mark closed and notify listeners; do not close recvChan to avoid send-on-closed panics
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
-		if err != nil {
-			slog.Debug("bidi: stream closed", slog.String("channel_id", c.channelID.String()), slog.String("reason", err.Error()))
-		} else {
-			slog.Debug("bidi: stream closed", slog.String("channel_id", c.channelID.String()))
-		}
 		if c.onClose != nil {
 			c.onClose()
 		}
@@ -174,11 +162,6 @@ func (c *MuxerBidiStream) CloseLocal(err error) {
 		// Do not call CloseSend since network may be down.
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
-		if err != nil {
-			slog.Debug("bidi: stream closed locally", slog.String("channel_id", c.channelID.String()), slog.String("reason", err.Error()))
-		} else {
-			slog.Debug("bidi: stream closed locally", slog.String("channel_id", c.channelID.String()))
-		}
 		if c.onClose != nil {
 			c.onClose()
 		}
@@ -198,16 +181,13 @@ func (c *MuxerBidiStream) RecvChan() chan<- any {
 func (c *MuxerBidiStream) Offer(msg any) (ok bool) {
 	// Fast-path: if closed, skip without attempting to send.
 	if atomic.LoadUint32(&c.closedFlag) != 0 {
-		slog.Debug("bidi: offer on closed stream", slog.String("channel_id", c.channelID.String()))
 		return false
 	}
 
 	select {
 	case c.recvChan <- msg:
-		slog.Debug("bidi: offered message", slog.String("channel_id", c.channelID.String()))
 		return true
 	case <-c.closed:
-		slog.Debug("bidi: offer dropped, stream closed", slog.String("channel_id", c.channelID.String()))
 		return false
 	}
 }
@@ -239,7 +219,4 @@ type ErrorMessage struct {
 // SetChannelID attaches a channel ID to the stream for contextual logging.
 func (c *MuxerBidiStream) SetChannelID(id uuid.UUID) {
 	c.channelID = id
-	if id != uuid.Nil {
-		slog.Debug("bidi: set channel id", slog.String("channel_id", id.String()))
-	}
 }
