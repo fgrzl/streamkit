@@ -25,12 +25,17 @@ import (
 
 // Constants
 const (
-	BatchSize            int           = 100
+	// Azure Table Storage batch transaction limit is 100 operations
+	// All operations in a batch must share the EXACT same PartitionKey
+	MaxBatchSize int = 100
+	// Use smaller chunk size to account for encoding overhead and stay under 4MB per transaction
+	BatchSize            int           = 90
 	CacheTTL             time.Duration = time.Second * 97
 	CacheCleanupInterval time.Duration = time.Second * 59
 	ShutdownTimeout      time.Duration = time.Second * 59
 	InitialRetryDelay    time.Duration = time.Millisecond * 100
-	MaxRetryAttempts     int           = 3
+	MaxRetryDelay        time.Duration = time.Second * 10
+	MaxRetryAttempts     int           = 5
 	LAST_ENTRY           string        = "LAST_ENTRY"
 )
 
@@ -105,9 +110,15 @@ func (s *AzureStore) GetSpaces(ctx context.Context) enumerators.Enumerator[strin
 	// All spaces stored in single partition
 	pKey := lexkey.Encode(api.INVENTORY, api.SPACES).ToHexString()
 	query := fmt.Sprintf("PartitionKey eq '%s'", pKey)
+	// Optimize: only select RowKey to reduce bandwidth
+	selectColumns := "RowKey"
+	// Optimize: limit page size for better performance with large result sets
+	top := int32(1000)
 
 	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
+		Select: &selectColumns,
+		Top:    &top,
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
@@ -133,9 +144,12 @@ func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) e
 	rUpper = lexkey.EncodeLast(bounds.Max).ToHexString()
 
 	query := fmt.Sprintf("PartitionKey eq '%s' and RowKey gt '%s' and RowKey le '%s'", pKey, rLower, rUpper)
+	// Optimize: limit page size to reduce memory and improve response time
+	top := int32(1000)
 
 	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
+		Top:    &top,
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
@@ -153,9 +167,15 @@ func (s *AzureStore) GetSegments(ctx context.Context, space string) enumerators.
 	// All segments for a space stored in single partition
 	pKey := lexkey.Encode(api.INVENTORY, api.SEGMENTS, space).ToHexString()
 	query := fmt.Sprintf("PartitionKey eq '%s'", pKey)
+	// Optimize: only select RowKey to reduce bandwidth
+	selectColumns := "RowKey"
+	// Optimize: limit page size for better performance with large result sets
+	top := int32(1000)
 
 	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
+		Select: &selectColumns,
+		Top:    &top,
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
@@ -175,9 +195,12 @@ func (s *AzureStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegmen
 
 	query := fmt.Sprintf("PartitionKey eq '%s' and RowKey ge '%s' and RowKey le '%s'",
 		partitionKey, rLower, rUpper)
+	// Optimize: limit page size to reduce memory and improve response time
+	top := int32(1000)
 
 	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
+		Top:    &top,
 		Format: ptr(aztables.MetadataFormatNone),
 	}))
 
@@ -269,7 +292,16 @@ func (s *AzureStore) processChunkWithRetry(ctx context.Context, space, segment s
 			return nil, err
 		}
 		lastErr = err
-		time.Sleep(InitialRetryDelay * time.Duration(attempt+1)) // Changed from bit shift to multiplication
+		// Exponential backoff with jitter: 100ms, 200ms, 400ms, 800ms, 1600ms (capped at MaxRetryDelay)
+		if attempt < MaxRetryAttempts-1 {
+			backoff := InitialRetryDelay * time.Duration(1<<uint(attempt))
+			if backoff > MaxRetryDelay {
+				backoff = MaxRetryDelay
+			}
+			// Add jitter: random 0-25% of backoff to prevent thundering herd
+			jitter := time.Duration(float64(backoff) * 0.25 * float64(time.Now().UnixNano()%100) / 100.0)
+			time.Sleep(backoff + jitter)
+		}
 	}
 	return nil, fmt.Errorf("failed after %d attempts: %w", MaxRetryAttempts, lastErr)
 }
@@ -294,11 +326,19 @@ func (s *AzureStore) processChunk(ctx context.Context, space, segment string, ch
 }
 
 func (s *AzureStore) recoverWAL(ctx context.Context) error {
+	// Note: This query scans across multiple partitions by design
+	// Transaction PartitionKeys are: TRANSACTION + Space + Segment + TrxNumber
+	// This is the only multi-partition query in the system and only runs at startup
+	// Mitigation: transactions are cleaned up immediately after fanout, so the scan
+	// should find very few (ideally zero) uncommitted transactions in normal operation
 	lower, upper := lexkey.EncodeFirst(api.TRANSACTION).ToHexString(), lexkey.EncodeLast(api.TRANSACTION).ToHexString()
-	query := fmt.Sprintf("PartitionKey ge '%s' and PartitionKey le '%s'", lower, upper)
+	query := fmt.Sprintf("PartitionKey ge '%s' and PartitionKey lt '%s'", lower, upper)
+	// Optimize: limit page size for WAL recovery
+	top := int32(1000)
 
 	pager := s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &query,
+		Top:    &top,
 		Format: ptr(aztables.MetadataFormatNone),
 	})
 	transactions := enumerators.Map(
@@ -450,6 +490,32 @@ func (s *AzureStore) writeBatch(ctx context.Context, entities []entity) error {
 		return nil
 	}
 
+	// Azure Table Storage batch transaction constraints:
+	// 1. Max 100 operations per batch
+	// 2. All operations must have the SAME PartitionKey
+	// 3. Max 4MB per transaction
+	if len(entities) > MaxBatchSize {
+		// Process in chunks of MaxBatchSize
+		for i := 0; i < len(entities); i += MaxBatchSize {
+			end := i + MaxBatchSize
+			if end > len(entities) {
+				end = len(entities)
+			}
+			if err := s.writeBatch(ctx, entities[i:end]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Validate all entities share the same partition key
+	partitionKey := entities[0].PartitionKey
+	for i := 1; i < len(entities); i++ {
+		if entities[i].PartitionKey != partitionKey {
+			return fmt.Errorf("%s: partition key mismatch in batch - all operations must target same partition", ErrBatchWrite)
+		}
+	}
+
 	actions := make([]aztables.TransactionAction, len(entities))
 	for i := range entities {
 		actions[i] = aztables.TransactionAction{
@@ -526,8 +592,11 @@ func (s *AzureStore) createTableIfNotExists(ctx context.Context) error {
 }
 
 func (s *AzureStore) queryEntries(ctx context.Context, filter string, minTS, maxTS int64) enumerators.Enumerator[*api.Entry] {
+	// Optimize: limit page size to reduce memory and improve response time
+	top := int32(1000)
 	pager := s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
 		Filter: &filter,
+		Top:    &top,
 		Format: ptr(aztables.MetadataFormatNone),
 	})
 
@@ -648,10 +717,6 @@ func mustMarshal(v interface{}) []byte {
 		panic(fmt.Sprintf("failed to marshal: %v", err))
 	}
 	return data
-}
-
-func buildQuery(lower, upper string) string {
-	return fmt.Sprintf("PartitionKey ge '%s' and PartitionKey le '%s'", lower, upper)
 }
 
 func calculateTimeBounds(current, min, max int64) struct{ Min, Max int64 } {
