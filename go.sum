@@ -67,8 +67,8 @@ github.com/fgrzl/lexkey v0.1.0-alpha.35 h1:EILZ+R0bAhXqg2xbOmOueeWJ8YTs+kkX3730K
 github.com/fgrzl/lexkey v0.1.0-alpha.35/go.mod h1:hfwt8FsLiFD4s43ntKLgPXJBk114bF4AOWXQSEzO6BI=
 github.com/fgrzl/messaging v1.0.0-alpha.7 h1:nZAiO2RGwEhZ3D1l52WBoqcDhMpX5TNt2fUPe3URmjU=
 github.com/fgrzl/messaging v1.0.0-alpha.7/go.mod h1:6ZfUgoluufDl6H+EryOoGxWrUBJhbllwtFAF0tk82yc=
-github.com/fgrzl/mux v0.0.1-alpha.158 h1:h2sU46Hj+LAroU5EZTjrH6DrCORox7Y+FYgJu3YiXX8=
-github.com/fgrzl/mux v0.0.1-alpha.158/go.mod h1:QyHjSmYRGBezGtMBz/fZWkqcImehhBpRVwWA0v5Ojgg=
+github.com/fgrzl/mux v0.0.1-alpha.162 h1:tKry6c0j/FITNk1l9zgldVlFNzDusxmYZ1BDPc6vtBs=
+github.com/fgrzl/mux v0.0.1-alpha.162/go.mod h1:M+QSD+QkXkjfSsyUGzAm5Ujfy2dkPFo9re4R2LybXaY=
 github.com/fgrzl/telemetry v0.1.0-alpha.9 h1:pv8bfH66JP5P+MkqtKlCeyOTBJh+aThLLg1J5edB+Q8=
 github.com/fgrzl/telemetry v0.1.0-alpha.9/go.mod h1:gREmdSzbG2GSupTpSymib6y2QByRRf8LD07YqSMsNi0=
 github.com/fgrzl/timestamp v1.0.0-alpha.2 h1:UI8a7WMzWVoipZM/DfzQ9BRoDWThWP6GRwHVczJXGJg=
