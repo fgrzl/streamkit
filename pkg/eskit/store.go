@@ -52,18 +52,23 @@ func (s *streamStore) LoadEvents(ctx context.Context, entity es.Entity, minSeque
 			return domainEvent, nil
 		})
 
-	return enumerators.ToSlice(domainEvents)
+	events, err := enumerators.ToSlice(domainEvents)
+	if err != nil {
+		return nil, err
+	}
+
+	return events, nil
 }
 
 func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events []es.DomainEvent, expectedSequence uint64) error {
 	space, segment := entity.Area, entity.ID.String()
+
 	records := enumerators.Map(
 		enumerators.Slice(events),
 		func(event es.DomainEvent) (*client.Record, error) {
 			envelope := polymorphic.NewEnvelope(event)
 			payload, err := json.Marshal(envelope)
 			if err != nil {
-				slog.ErrorContext(ctx, "Failed to marshal event", "err", err)
 				return nil, err
 			}
 			entry := &client.Record{
@@ -74,9 +79,21 @@ func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events [
 		})
 
 	results := s.client.Produce(ctx, entity.TenantID, space, segment, records)
-	if err := enumerators.Consume(results); err != nil {
-		slog.ErrorContext(ctx, "Failed to produce events", "err", err)
+
+	// Track status updates to ensure all records are acknowledged
+	statusCount := 0
+	err := enumerators.ForEach(results, func(status *client.SegmentStatus) error {
+		statusCount++
+		return nil
+	})
+
+	if err != nil {
 		return err
+	}
+
+	// Validate that we received at least one status update
+	if statusCount == 0 {
+		return fmt.Errorf("no status updates received from producer")
 	}
 
 	return nil

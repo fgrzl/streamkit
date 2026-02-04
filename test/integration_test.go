@@ -278,7 +278,7 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 		ctx := t.Context()
 		setupConsumerData(t, storeID, h.Client)
 
-		t.Run("should consume segment with exclusive min "+name, func(t *testing.T) {
+		t.Run("should consume segment with inclusive min "+name, func(t *testing.T) {
 			// Arrange
 			args := &client.ConsumeSegment{
 				Space:       "space0",
@@ -290,9 +290,9 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 			results := h.Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
-			// Assert
+			// Assert - MinSequence is inclusive, so sequences 233-253 = 21 entries
 			require.NoError(t, err)
-			assert.Len(t, entries, 20)
+			assert.Len(t, entries, 21)
 		})
 	}
 }

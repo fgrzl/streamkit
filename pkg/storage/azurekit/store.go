@@ -190,7 +190,8 @@ func (s *AzureStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegmen
 
 	// All entries for a segment share the same partition key
 	partitionKey := lexkey.Encode(api.DATA, api.SEGMENTS, args.Space, args.Segment).ToHexString()
-	rLower := lexkey.EncodeFirst(bounds.MinSeq).ToHexString()
+	// Use Encode (not EncodeFirst) for inclusive lower bound - entry RowKey is Encode(seq)
+	rLower := lexkey.Encode(bounds.MinSeq).ToHexString()
 	rUpper := lexkey.EncodeLast(bounds.MaxSeq).ToHexString()
 
 	query := fmt.Sprintf("PartitionKey eq '%s' and RowKey ge '%s' and RowKey le '%s'",
@@ -209,9 +210,9 @@ func (s *AzureStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegmen
 	})
 
 	// Filter entries that match the bounds
-	// Note: MinSeq/MinTS are exclusive bounds, MaxSeq/MaxTS are inclusive
+	// Note: MinSeq is inclusive, MaxSeq is inclusive, MinTS/MaxTS are exclusive/inclusive respectively
 	filtered := enumerators.Filter(entries, func(e *api.Entry) bool {
-		return e.Sequence > bounds.MinSeq &&
+		return e.Sequence >= bounds.MinSeq &&
 			e.Sequence <= bounds.MaxSeq &&
 			e.Timestamp > bounds.MinTS &&
 			e.Timestamp <= bounds.MaxTS
@@ -259,6 +260,12 @@ func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enu
 	if lastEntry == nil {
 		lastEntry = &api.Entry{Sequence: 0, TRX: api.TRX{Number: 0}}
 	}
+
+	slog.InfoContext(ctx, "Produce starting",
+		"space", args.Space,
+		"segment", args.Segment,
+		"peek_last_sequence", lastEntry.Sequence,
+	)
 
 	chunks := enumerators.ChunkByCount(records, BatchSize)
 	var lastSeq, lastTrx = lastEntry.Sequence, lastEntry.TRX.Number
@@ -319,6 +326,12 @@ func (s *AzureStore) processChunk(ctx context.Context, space, segment string, ch
 	if err := s.executeTransaction(ctx, transaction); err != nil {
 		return nil, err
 	}
+
+	// Update the Peek cache with the last entry we just wrote
+	// This is more efficient than deleting and forcing a re-fetch
+	cacheKey := fmt.Sprintf("peek:%s:%s", space, segment)
+	lastEntry := entries[len(entries)-1]
+	s.cache.Set(cacheKey, lastEntry)
 
 	status := createSegmentStatus(space, segment, entries)
 

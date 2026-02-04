@@ -288,7 +288,9 @@ func (s *PebbleStore) calculateSegmentBounds(ts int64, args *api.ConsumeSegment)
 func (s *PebbleStore) getSegmentBounds(space, segment string, minSeq, maxSeq uint64) (lexkey.LexKey, lexkey.LexKey) {
 	lower := lexkey.EncodeFirst(api.DATA, api.SEGMENTS, space, segment)
 	if minSeq > 0 {
-		lower = lexkey.EncodeFirst(api.DATA, api.SEGMENTS, space, segment, minSeq)
+		// Use Encode (not EncodeFirst) for inclusive lower bound - the entry key is Encode(..., minSeq)
+		// and we want to include it in the range scan
+		lower = lexkey.Encode(api.DATA, api.SEGMENTS, space, segment, minSeq)
 	}
 	upper := lexkey.EncodeLast(api.DATA, api.SEGMENTS, space, segment)
 	if maxSeq > 0 {
@@ -304,7 +306,7 @@ func (s *PebbleStore) filterSegmentEntries(ctx context.Context, lower, upper lex
 	return enumerators.TakeWhile(
 		s.enumerateEntries(ctx, lower, upper),
 		func(entry *api.Entry) bool {
-			return entry.Sequence > bounds.MinSeq &&
+			return entry.Sequence >= bounds.MinSeq &&
 				entry.Sequence <= bounds.MaxSeq &&
 				entry.Timestamp > bounds.MinTS &&
 				entry.Timestamp <= bounds.MaxTS

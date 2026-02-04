@@ -3,6 +3,7 @@ package eskit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/fgrzl/enumerators"
@@ -73,6 +74,8 @@ func (f *fakeDomainEvent) MarshalJSON() ([]byte, error) {
 type fakeClient struct {
 	consume  enumerators.Enumerator[*client.Entry]
 	produced []*client.Record
+	// Produce can be overridden in tests to customize behavior
+	ProduceFunc func(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*client.Record]) enumerators.Enumerator[*client.SegmentStatus]
 }
 
 func (f *fakeClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *client.ConsumeSegment) enumerators.Enumerator[*client.Entry] {
@@ -80,7 +83,11 @@ func (f *fakeClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args
 }
 
 func (f *fakeClient) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*client.Record]) enumerators.Enumerator[*client.SegmentStatus] {
-	// Synchronously consume records and capture them
+	if f.ProduceFunc != nil {
+		return f.ProduceFunc(ctx, storeID, space, segment, entries)
+	}
+
+	// Default implementation: consume records and capture them
 	for entries.MoveNext() {
 		r, err := entries.Current()
 		if err != nil {
@@ -156,4 +163,49 @@ func TestSaveEventsShouldProduceMarshaledRecords(t *testing.T) {
 	require.Len(t, fc.produced, 2)
 	assert.Equal(t, uint64(7), fc.produced[0].Sequence)
 	assert.Equal(t, uint64(8), fc.produced[1].Sequence)
+}
+
+func TestSaveEventsShouldReturnErrorWhenProducerFailsWithSequenceMismatch(t *testing.T) {
+	// Arrange
+	sequenceMismatchErr := errors.New("sequence mismatch")
+	polymorphic.RegisterType[fakeDomainEvent]()
+	events := []es.DomainEvent{&fakeDomainEvent{seq: 1}, &fakeDomainEvent{seq: 2}}
+
+	fc := &fakeClient{}
+	// Override Produce to return error after consuming records
+	fc.ProduceFunc = func(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*client.Record]) enumerators.Enumerator[*client.SegmentStatus] {
+		enumerators.Consume(entries)
+		return enumerators.Error[*client.SegmentStatus](sequenceMismatchErr)
+	}
+
+	s := &streamStore{client: fc}
+
+	// Act
+	err := s.SaveEvents(context.Background(), es.Entity{Area: "teams", ID: uuid.New(), TenantID: uuid.New()}, events, 0)
+
+	// Assert
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, sequenceMismatchErr)
+}
+
+func TestSaveEventsShouldReturnErrorWhenNoStatusUpdatesReceived(t *testing.T) {
+	// Arrange
+	polymorphic.RegisterType[fakeDomainEvent]()
+	events := []es.DomainEvent{&fakeDomainEvent{seq: 1}}
+
+	fc := &fakeClient{}
+	// Override Produce to return empty enumerator (no status updates)
+	fc.ProduceFunc = func(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*client.Record]) enumerators.Enumerator[*client.SegmentStatus] {
+		enumerators.Consume(entries)
+		return enumerators.Empty[*client.SegmentStatus]()
+	}
+
+	s := &streamStore{client: fc}
+
+	// Act
+	err := s.SaveEvents(context.Background(), es.Entity{Area: "teams", ID: uuid.New(), TenantID: uuid.New()}, events, 0)
+
+	// Assert
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no status updates received")
 }
