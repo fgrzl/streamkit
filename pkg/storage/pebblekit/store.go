@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/fgrzl/enumerators"
@@ -40,7 +42,21 @@ func NewPebbleStore(path string, cache *cache.ExpiringCache) (*PebbleStore, erro
 
 func (s *PebbleStore) Close() {
 	s.closeOnce.Do(func() {
-		s.db.Close()
+		done := make(chan struct{})
+		go func() {
+			if err := s.db.Close(); err != nil {
+				slog.Error("pebble: close failed", "err", err)
+			}
+			close(done)
+		}()
+
+		// Wait up to 10 seconds for close to complete
+		select {
+		case <-done:
+			// Clean close
+		case <-time.After(10 * time.Second):
+			slog.Warn("pebble: close timeout after 10s, forcing shutdown")
+		}
 	})
 }
 

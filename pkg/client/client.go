@@ -11,6 +11,7 @@ package client
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -152,11 +153,15 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 		for entries.MoveNext() {
 			entry, err := entries.Current()
 			if err != nil {
+				slog.Error("produce: failed to get current entry", "err", err, "count", count)
 				bidi.CloseSend(err)
+				bidi.Close(err) // Close local stream so status enumerator fails immediately
 				return
 			}
 			if err := bidi.Encode(entry); err != nil {
+				slog.Error("produce: failed to encode entry", "err", err, "count", count)
 				bidi.CloseSend(err)
+				bidi.Close(err) // Close local stream so status enumerator fails immediately
 				return
 			}
 			count++
@@ -211,33 +216,64 @@ func (c *client) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, spac
 }
 
 func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg api.Routeable, handler func(*SegmentStatus)) (api.Subscription, error) {
-	bidi, err := c.provider.CallStream(ctx, storeID, initMsg)
-	if err != nil {
-		return nil, err
-	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 
 	go func() {
 		defer close(done)
+
+		backoff := time.Second
+		maxBackoff := 30 * time.Second
+		attempt := 0
+
 		for {
-			// Check for cancellation, but don't block if not cancelled
+			// Check for cancellation before attempting (re)subscription
 			select {
 			case <-ctx.Done():
-				bidi.Close(ctx.Err())
 				return
 			default:
 			}
 
-			// Now block on Decode - this prevents busy-wait
-			var status SegmentStatus
-			if err := bidi.Decode(&status); err != nil {
-				slog.ErrorContext(ctx, "subscription closed", "err", err)
-				bidi.Close(err)
-				return
+			// Create new stream (initial or reconnect)
+			attempt++
+			stream, err := c.provider.CallStream(ctx, storeID, initMsg)
+			if err != nil {
+				slog.WarnContext(ctx, "subscription stream failed, retrying", "attempt", attempt, "backoff", backoff, "err", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+					// Exponential backoff with max
+					backoff = backoff * 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					continue
+				}
 			}
-			handler(&status)
+
+			// Reset backoff on successful connection
+			backoff = time.Second
+			slog.InfoContext(ctx, "subscription stream connected", "attempt", attempt)
+
+			// Read from stream until it fails
+			for {
+				select {
+				case <-ctx.Done():
+					stream.Close(ctx.Err())
+					return
+				default:
+				}
+
+				var status SegmentStatus
+				if err := stream.Decode(&status); err != nil {
+					slog.WarnContext(ctx, "subscription decode failed, reconnecting", "err", err)
+					stream.Close(err)
+					break // inner loop - will reconnect
+				}
+				handler(&status)
+			}
+			// Stream failed, loop will retry
 		}
 	}()
 

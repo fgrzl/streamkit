@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/json/polymorphic"
@@ -52,6 +53,8 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 
 	defer func() {
 		if r := recover(); r != nil {
+			stack := string(debug.Stack())
+			slog.ErrorContext(ctx, "handler panic recovered", "panic", r, "stack", stack)
 			bidi.Close(fmt.Errorf("panic: %v", r))
 		}
 	}()

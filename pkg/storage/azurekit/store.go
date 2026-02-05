@@ -41,6 +41,8 @@ const (
 	MaxTransactionPayloadBytes int = 4*1024*1024 - 256*1024 // ~3.75MB
 	// Number of parallel AddEntity operations within a payload-chunk
 	AddWorkers int = 8
+	// WAL monitoring interval for orphaned transactions
+	WALMonitorInterval time.Duration = 5 * time.Minute
 )
 
 // Error Constants
@@ -82,9 +84,10 @@ type batchEntry struct {
 
 func NewAzureStore(ctx context.Context, client *aztables.Client, cache *cache.ExpiringCache, options *AzureStoreOptions) (*AzureStore, error) {
 	store := &AzureStore{
-		client: client,
-		cache:  cache,
-		opts:   options,
+		client:         client,
+		cache:          cache,
+		opts:           options,
+		stopWALMonitor: make(chan struct{}),
 	}
 
 	// Validate and apply defaults
@@ -108,6 +111,10 @@ func NewAzureStore(ctx context.Context, client *aztables.Client, cache *cache.Ex
 	if err := store.recoverWAL(ctx); err != nil {
 		return nil, fmt.Errorf("recover WAL failed: %w", err)
 	}
+
+	// Start background WAL monitor for orphaned transactions
+	go store.walMonitorLoop(ctx)
+
 	return store, nil
 }
 
@@ -130,11 +137,12 @@ func NewAzureStore(ctx context.Context, client *aztables.Client, cache *cache.Ex
 //
 // These invariants are intentionally explicit to avoid accidental correctness regressions.
 type AzureStore struct {
-	client    *aztables.Client
-	cache     *cache.ExpiringCache
-	wg        sync.WaitGroup
-	closeOnce sync.Once
-	opts      *AzureStoreOptions
+	client         *aztables.Client
+	cache          *cache.ExpiringCache
+	wg             sync.WaitGroup
+	closeOnce      sync.Once
+	opts           *AzureStoreOptions
+	stopWALMonitor chan struct{}
 }
 
 func (s *AzureStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
@@ -308,6 +316,8 @@ func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enu
 
 func (s *AzureStore) Close() {
 	s.closeOnce.Do(func() {
+		// Stop WAL monitor
+		close(s.stopWALMonitor)
 		if !s.waitForTasks(ShutdownTimeout) {
 			slog.Warn(LogWarnTimeoutTasks)
 		}
@@ -471,6 +481,27 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 		})
 
 	return enumerators.Consume(transactions)
+}
+
+// walMonitorLoop periodically scans for orphaned WAL transactions and recovers them.
+// This handles the case where a process crashes after writing WAL but before fanout completion.
+func (s *AzureStore) walMonitorLoop(ctx context.Context) {
+	ticker := time.NewTicker(WALMonitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopWALMonitor:
+			return
+		case <-ticker.C:
+			// Create a timeout context for the recovery operation
+			recoveryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := s.recoverWAL(recoveryCtx); err != nil {
+				slog.WarnContext(ctx, "WAL monitor: recovery failed", "err", err)
+			}
+			cancel()
+		}
+	}
 }
 
 func (s *AzureStore) executeTransaction(ctx context.Context, transaction *txn.Transaction) error {
