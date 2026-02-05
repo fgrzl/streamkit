@@ -51,3 +51,13 @@ func (p *InProcBidiStreamProvider) CallStream(
 
 	return client, nil
 }
+
+// RegisterReconnectListener is a no-op for in-process provider (never disconnects)
+func (p *InProcBidiStreamProvider) RegisterReconnectListener(listener api.ReconnectListener) {
+	// In-process streams never disconnect, so no-op
+}
+
+// UnregisterReconnectListener is a no-op for in-process provider (never disconnects)
+func (p *InProcBidiStreamProvider) UnregisterReconnectListener(listener api.ReconnectListener) {
+	// In-process streams never disconnect, so no-op
+}

@@ -123,6 +123,9 @@ func (f *fakeClient) SubscribeToSpace(ctx context.Context, storeID uuid.UUID, sp
 func (f *fakeClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*client.SegmentStatus)) (api.Subscription, error) {
 	return nil, nil
 }
+func (f *fakeClient) GetSubscriptionStatus(id string) *client.SubscriptionStatus {
+	return &client.SubscriptionStatus{}
+}
 
 func TestLoadEventsShouldUnmarshalDomainEvents(t *testing.T) {
 	// Arrange

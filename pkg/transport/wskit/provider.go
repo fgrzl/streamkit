@@ -46,6 +46,12 @@ type WebSocketBidiStreamProvider struct {
 	reconnectCtx    context.Context
 	reconnectCancel context.CancelFunc
 	stopped         atomic.Bool
+
+	// reconnect listener management
+	listenersMu sync.RWMutex
+	listeners   []api.ReconnectListener
+	// hasConnected tracks if we've ever successfully connected (vs initial connect)
+	hasConnected atomic.Bool
 }
 
 // NewBidiStreamProvider creates a provider that uses a dedicated WebSocket connection per client.
@@ -336,8 +342,20 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 		}
 		if err == nil {
 			m := p.newClientMuxer(ctx, NewClientMuxerSession(), conn)
+
+			// Check if this is a reconnect (not initial connect)
+			isReconnect := p.hasConnected.Load()
 			p.replaceMuxer(m)
-			slog.InfoContext(ctx, "provider: initial muxer created")
+
+			if isReconnect {
+				slog.InfoContext(ctx, "provider: muxer recreated after reconnection")
+				// Notify listeners of reconnection - use uuid.Nil to indicate all stores
+				go p.notifyReconnected(p.reconnectCtx, uuid.Nil)
+			} else {
+				slog.InfoContext(ctx, "provider: initial muxer created")
+				p.hasConnected.Store(true)
+			}
+
 			// start background reconnect loop now that we have an initial muxer
 			p.startReconnectLoop()
 			return m, nil
@@ -453,4 +471,38 @@ func (p *WebSocketBidiStreamProvider) dial() (*websocket.Conn, error) {
 	cfg.Header.Set("Authorization", "Bearer "+token)
 
 	return websocket.DialConfig(cfg)
+}
+
+// RegisterReconnectListener registers a listener to be notified when the provider reconnects.
+func (p *WebSocketBidiStreamProvider) RegisterReconnectListener(listener api.ReconnectListener) {
+	p.listenersMu.Lock()
+	defer p.listenersMu.Unlock()
+	p.listeners = append(p.listeners, listener)
+}
+
+// UnregisterReconnectListener removes a previously registered reconnect listener.
+func (p *WebSocketBidiStreamProvider) UnregisterReconnectListener(listener api.ReconnectListener) {
+	p.listenersMu.Lock()
+	defer p.listenersMu.Unlock()
+	for i, l := range p.listeners {
+		if l == listener {
+			p.listeners = append(p.listeners[:i], p.listeners[i+1:]...)
+			break
+		}
+	}
+}
+
+// notifyReconnected calls all registered listeners to notify them of a successful reconnect.
+// This is called when the provider establishes a new muxer connection.
+func (p *WebSocketBidiStreamProvider) notifyReconnected(ctx context.Context, storeID uuid.UUID) {
+	p.listenersMu.RLock()
+	listeners := make([]api.ReconnectListener, len(p.listeners))
+	copy(listeners, p.listeners)
+	p.listenersMu.RUnlock()
+
+	for _, listener := range listeners {
+		if err := listener.OnReconnected(ctx, storeID); err != nil {
+			slog.WarnContext(ctx, "reconnect listener failed", "err", err)
+		}
+	}
 }
