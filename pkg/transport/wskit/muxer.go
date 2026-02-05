@@ -180,9 +180,32 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	m.readLoop()
 }
 
-// Ping sends a control ping and returns true on success. It uses the same
-// metrics and locking as the heartbeat's ping path.
+// Ping sends a control ping and returns true if:
+// 1. The muxer is not closed
+// 2. The ping can be sent/queued successfully
+// 3. We've received recent activity within the pong timeout window
+// This provides a more accurate health check than just checking if send works.
 func (m *WebSocketMuxer) Ping() bool {
+	// Fast fail if already closed
+	select {
+	case <-m.done:
+		return false
+	default:
+	}
+
+	// Check if we've had recent activity - if lastPongUnix is too old,
+	// the connection is likely dead even if sendPing would succeed
+	ts := timestamp.GetTimestamp()
+	last := atomic.LoadInt64(&m.lastPongUnix)
+	pongTimeoutMs := m.pongTimeout * 1000
+	idleMs := ts - last
+	if idleMs > pongTimeoutMs {
+		slog.Debug("muxer: ping health check failed due to stale activity",
+			slog.Int64("idle_ms", idleMs),
+			slog.Int64("timeout_ms", pongTimeoutMs))
+		return false
+	}
+
 	if err := m.sendPing(); err == nil {
 		return true
 	}

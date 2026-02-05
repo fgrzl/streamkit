@@ -32,8 +32,9 @@ type WebSocketBidiStreamProvider struct {
 	mu      sync.Mutex
 	muxer   providerMuxer
 	dialing atomic.Bool // prevents concurrent dial storms
-	// reconnect RNG for jittered backoff
-	rng *rand.Rand
+	// reconnect RNG for jittered backoff (protected by rngMu for thread-safety)
+	rng   *rand.Rand
+	rngMu sync.Mutex
 	// testable hooks / configuration
 	dialFn          func() (*websocket.Conn, error)
 	maxDialAttempts int
@@ -104,14 +105,17 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 					slog.Int("maxAttempts", maxEncodeAttempts),
 					slog.String("channelID", channelID.String()))
 
+				// Force invalidate the current muxer to ensure next attempt creates fresh connection
+				p.invalidateMuxer()
+
 				// exponential backoff with jitter: baseDelay * 2^(attempt-1) +/- up to 10% jitter
 				backoff := baseDelay * (1 << uint(attempt-1))
 				if backoff > maxDelay {
 					backoff = maxDelay
 				}
 				// Add jitter: +/- 10% of backoff
-				jitter := time.Duration(p.rng.Int63n(int64(backoff/5))) * time.Nanosecond
-				if p.rng.Intn(2) == 0 {
+				jitter := time.Duration(p.randInt63n(int64(backoff/5))) * time.Nanosecond
+				if p.randIntn(2) == 0 {
 					backoff = backoff + jitter
 				} else {
 					backoff = backoff - jitter
@@ -141,9 +145,55 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 		slog.ErrorContext(ctx, "provider: exhausted all retry attempts",
 			slog.Int("maxAttempts", maxEncodeAttempts),
 			slog.String("lastError", lastErr.Error()))
+
+		// Final fallback: if all retries failed with muxer closed, attempt one final aggressive recovery
+		// by forcing a complete muxer invalidation and trying once more. This handles the case where
+		// the muxer becomes unhealthy right after Ping() succeeds due to race conditions.
+		if errors.Is(lastErr, ErrMuxerClosed) || lastErr == ErrMuxerClosed {
+			slog.WarnContext(ctx, "provider: attempting final recovery with forced muxer recreation")
+			p.invalidateMuxer()
+
+			// Give a brief moment for any pending closure to complete
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			// Final attempt: create completely fresh muxer
+			muxer, err := p.getOrCreateMuxer(ctx)
+			if err == nil {
+				channelID := uuid.New()
+				bidi := muxer.Register(storeID, channelID)
+				envelope := polymorphic.NewEnvelope(msg)
+				if err = bidi.Encode(envelope); err == nil {
+					slog.InfoContext(ctx, "provider: final recovery attempt succeeded")
+					return bidi, nil
+				}
+				bidi.Close(err)
+				slog.WarnContext(ctx, "provider: final recovery attempt failed",
+					slog.String("error", err.Error()),
+					slog.String("channelID", channelID.String()))
+			}
+		}
+
 		return nil, lastErr
 	}
 	return nil, errors.New("failed to call stream")
+}
+
+// randInt63n returns a thread-safe random int64 in [0,n)
+func (p *WebSocketBidiStreamProvider) randInt63n(n int64) int64 {
+	p.rngMu.Lock()
+	defer p.rngMu.Unlock()
+	return p.rng.Int63n(n)
+}
+
+// randIntn returns a thread-safe random int in [0,n)
+func (p *WebSocketBidiStreamProvider) randIntn(n int) int {
+	p.rngMu.Lock()
+	defer p.rngMu.Unlock()
+	return p.rng.Intn(n)
 }
 
 // startReconnectLoop ensures a background goroutine keeps a healthy muxer alive.
@@ -171,6 +221,20 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					continue
 				}
 
+				// Coordinate with getOrCreateMuxer: if another goroutine is already dialing,
+				// skip this iteration and wait. This prevents the race condition where
+				// reconnect loop creates a new muxer that immediately replaces one just
+				// created by getOrCreateMuxer, causing "muxer closed" errors on in-flight streams.
+				if !p.dialing.CompareAndSwap(false, true) {
+					slog.Debug("provider: reconnect loop skipping dial, another dial in progress")
+					select {
+					case <-p.reconnectCtx.Done():
+						return
+					case <-time.After(500 * time.Millisecond):
+					}
+					continue
+				}
+
 				slog.Debug("provider: reconnect loop attempting dial", slog.Duration("backoff", backoff))
 
 				// attempt to dial and create a new muxer
@@ -193,11 +257,14 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					slog.Warn("provider: reconnect dial failed", slog.String("error", err.Error()))
 				}
 
+				// Release dialing lock before sleeping
+				p.dialing.Store(false)
+
 				// jittered backoff before next attempt
 				select {
 				case <-p.reconnectCtx.Done():
 					return
-				case <-time.After(backoff + time.Duration(p.rng.Int63n(500))*time.Millisecond):
+				case <-time.After(backoff + time.Duration(p.randInt63n(500))*time.Millisecond):
 				}
 				if backoff < 30*time.Second {
 					backoff *= 2
@@ -281,9 +348,9 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 
 		// compute jittered backoff: baseDelay * 2^(attempt-1) +/- 0..500ms
 		backoff := baseDelay * (1 << uint(attempt-1))
-		jitter := time.Duration(p.rng.Int63n(500)) * time.Millisecond
+		jitter := time.Duration(p.randInt63n(500)) * time.Millisecond
 		// randomize add/subtract
-		if p.rng.Intn(2) == 0 {
+		if p.randIntn(2) == 0 {
 			backoff = backoff + jitter
 		} else {
 			if backoff > jitter {
@@ -302,10 +369,33 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 }
 
 // replaceMuxer safely replaces the current muxer, closing the old one to prevent leaks.
+// Includes a grace period to allow in-flight streams on the old muxer to complete.
 func (p *WebSocketBidiStreamProvider) replaceMuxer(newMuxer providerMuxer) {
 	p.mu.Lock()
 	oldMuxer := p.muxer
 	p.muxer = newMuxer
+	p.mu.Unlock()
+
+	// Close old muxer outside the lock with a grace period to allow
+	// in-flight operations to complete. This prevents the race where
+	// a stream is registered and trying to encode just as the muxer is replaced.
+	if oldMuxer != nil {
+		go func(m providerMuxer) {
+			// Wait for any in-flight encode operations to complete
+			time.Sleep(500 * time.Millisecond)
+			p.closeMuxer(m)
+		}(oldMuxer)
+	}
+}
+
+// invalidateMuxer clears the current muxer without replacing it,
+// forcing the next getOrCreateMuxer call to dial and create a fresh connection.
+// This is used when a muxer closure is detected during encode to prevent
+// reusing a closed or closing muxer.
+func (p *WebSocketBidiStreamProvider) invalidateMuxer() {
+	p.mu.Lock()
+	oldMuxer := p.muxer
+	p.muxer = nil
 	p.mu.Unlock()
 
 	// Close old muxer outside the lock to prevent deadlock
