@@ -138,24 +138,25 @@ func inprockitTestHarness(t *testing.T) *TestHarness {
 	}
 }
 
-func configurations(t *testing.T) map[string]*TestHarness {
-	return map[string]*TestHarness{
-		"azure":  azurekitTestHarness(t),
-		"pebble": pebblekitTestHarness(t),
-		"inproc": inprockitTestHarness(t),
+func configurations() map[string]func(*testing.T) *TestHarness {
+	return map[string]func(*testing.T) *TestHarness{
+		"azure":  azurekitTestHarness,
+		"pebble": pebblekitTestHarness,
+		"inproc": inprockitTestHarness,
 	}
 }
 
 func TestShouldAllowMultiplexedCallsWhenUsingDifferentSegments(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("should allow for multiplexed calls "+name, func(t *testing.T) {
+			harness := h(t)
 			for i := range 3 {
 				// Arrange
 				ctx := t.Context()
 				space, segment := "space0", "segment"+strconv.Itoa(i)
 
 				// Act
-				entry, err := h.Client.Peek(ctx, storeID, space, segment)
+				entry, err := harness.Client.Peek(ctx, storeID, space, segment)
 
 				// Assert
 				require.NoError(t, err)
@@ -166,15 +167,16 @@ func TestShouldAllowMultiplexedCallsWhenUsingDifferentSegments(t *testing.T) {
 }
 
 func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("should produce "+name, func(t *testing.T) {
+			harness := h(t)
 			for i := range 3 {
 				// Arrange
 				ctx := t.Context()
 				space, segment, records := "space0", "segment"+strconv.Itoa(i), generateRange(0, 5)
 
 				// Act
-				results := h.Client.Produce(ctx, storeID, space, segment, records)
+				results := harness.Client.Produce(ctx, storeID, space, segment, records)
 				statuses, err := enumerators.ToSlice(results)
 
 				// Assert
@@ -186,8 +188,9 @@ func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
 }
 
 func TestConcurrentProducersDetectConflict(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("concurrent producers "+name, func(t *testing.T) {
+			harness := h(t)
 			ctx := t.Context()
 			space, segment := "space-concurrent", "segment-conflict"
 
@@ -197,11 +200,11 @@ func TestConcurrentProducersDetectConflict(t *testing.T) {
 
 			ch := make(chan error, 2)
 			go func() {
-				_, err := enumerators.ToSlice(h.Client.Produce(ctx, storeID, space, segment, recA))
+				_, err := enumerators.ToSlice(harness.Client.Produce(ctx, storeID, space, segment, recA))
 				ch <- err
 			}()
 			go func() {
-				_, err := enumerators.ToSlice(h.Client.Produce(ctx, storeID, space, segment, recB))
+				_, err := enumerators.ToSlice(harness.Client.Produce(ctx, storeID, space, segment, recB))
 				ch <- err
 			}()
 
@@ -210,7 +213,7 @@ func TestConcurrentProducersDetectConflict(t *testing.T) {
 			t.Logf("producer errors: err1=%v err2=%v", err1, err2)
 
 			// Verify final segment is consistent: we expect exactly 200 entries with contiguous sequences
-			enum := h.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
+			enum := harness.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
 			entries, err := enumerators.ToSlice(enum)
 			require.NoError(t, err)
 			require.Len(t, entries, 200)
@@ -230,8 +233,9 @@ func TestConcurrentProducersDetectConflict(t *testing.T) {
 }
 
 func TestProduceLargeRecordsChunking(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("large produce "+name, func(t *testing.T) {
+			harness := h(t)
 			if name == "azure" {
 				t.Skip("skipping azure for large produce test due to entity size limits")
 			}
@@ -239,10 +243,10 @@ func TestProduceLargeRecordsChunking(t *testing.T) {
 			space, segment := "space-large", "segment-large"
 
 			recs := generateLargeRange(0, 100, 16*1024) // 16KB payloads -> trigger payload chunking
-			_, err := enumerators.ToSlice(h.Client.Produce(ctx, storeID, space, segment, recs))
+			_, err := enumerators.ToSlice(harness.Client.Produce(ctx, storeID, space, segment, recs))
 			require.NoError(t, err)
 
-			enum := h.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
+			enum := harness.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
 			entries, err := enumerators.ToSlice(enum)
 			require.NoError(t, err)
 			require.Len(t, entries, 100)
@@ -251,14 +255,15 @@ func TestProduceLargeRecordsChunking(t *testing.T) {
 }
 
 func TestShouldReturnAllSpacesWhenRequested(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("should get spaces "+name, func(t *testing.T) {
+			harness := h(t)
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, storeID, h.Client)
+			setupConsumerData(t, storeID, harness.Client)
 
 			// Act
-			enumerator := h.Client.GetSpaces(ctx, storeID)
+			enumerator := harness.Client.GetSpaces(ctx, storeID)
 			spaces, err := enumerators.ToSlice(enumerator)
 
 			// Assert
@@ -274,14 +279,15 @@ func TestShouldReturnAllSpacesWhenRequested(t *testing.T) {
 }
 
 func TestShouldReturnAllSegmentsWhenGivenValidSpace(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("should get segments "+name, func(t *testing.T) {
+			harness := h(t)
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, storeID, h.Client)
+			setupConsumerData(t, storeID, harness.Client)
 
 			// Act
-			enumerator := h.Client.GetSegments(ctx, storeID, "space0")
+			enumerator := harness.Client.GetSegments(ctx, storeID, "space0")
 			segments, err := enumerators.ToSlice(enumerator)
 
 			// Assert
@@ -297,14 +303,15 @@ func TestShouldReturnAllSegmentsWhenGivenValidSpace(t *testing.T) {
 }
 
 func TestShouldReturnCorrectEntryWhenPeekingAtSegment(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("should peek "+name, func(t *testing.T) {
+			harness := h(t)
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, storeID, h.Client)
+			setupConsumerData(t, storeID, harness.Client)
 
 			// Act
-			peek, err := h.Client.Peek(ctx, storeID, "space0", "segment0")
+			peek, err := harness.Client.Peek(ctx, storeID, "space0", "segment0")
 
 			// Assert
 			require.NoError(t, err)
@@ -316,9 +323,9 @@ func TestShouldReturnCorrectEntryWhenPeekingAtSegment(t *testing.T) {
 }
 
 func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		ctx := t.Context()
-		setupConsumerData(t, storeID, h.Client)
+		setupConsumerData(t, storeID, h(t).Client)
 
 		t.Run("should consume segment "+name, func(t *testing.T) {
 			// Arrange
@@ -328,7 +335,7 @@ func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 			}
 
 			// Act
-			results := h.Client.ConsumeSegment(ctx, storeID, args)
+			results := h(t).Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
@@ -339,9 +346,9 @@ func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 }
 
 func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		ctx := t.Context()
-		setupConsumerData(t, storeID, h.Client)
+		setupConsumerData(t, storeID, h(t).Client)
 
 		t.Run("should consume segment with inclusive min "+name, func(t *testing.T) {
 			// Arrange
@@ -352,7 +359,7 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 			}
 
 			// Act
-			results := h.Client.ConsumeSegment(ctx, storeID, args)
+			results := h(t).Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert - MinSequence is inclusive, so sequences 233-253 = 21 entries
@@ -363,18 +370,19 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 }
 
 func TestShouldConsumeAllEntriesWhenGivenValidSpace(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("should consume space "+name, func(t *testing.T) {
+			harness := h(t)
 			// Arrange
 			ctx := t.Context()
-			setupConsumerData(t, storeID, h.Client)
+			setupConsumerData(t, storeID, harness.Client)
 
 			args := &client.ConsumeSpace{
 				Space: "space0",
 			}
 
 			// Act
-			results := h.Client.ConsumeSpace(ctx, storeID, args)
+			results := harness.Client.ConsumeSpace(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
@@ -385,12 +393,13 @@ func TestShouldConsumeAllEntriesWhenGivenValidSpace(t *testing.T) {
 }
 
 func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
-	for name, h := range configurations(t) {
+	for name, h := range configurations() {
 		t.Run("should consume interleaved spaces "+name, func(t *testing.T) {
+			harness := h(t)
 			// Arrange
 			ctx := t.Context()
 
-			setupConsumerData(t, storeID, h.Client)
+			setupConsumerData(t, storeID, harness.Client)
 			runtime.Gosched()
 
 			args := &client.Consume{
@@ -404,7 +413,7 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 			}
 
 			// Act
-			results := h.Client.Consume(ctx, storeID, args)
+			results := harness.Client.Consume(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
