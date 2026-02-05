@@ -324,18 +324,19 @@ func TestShouldReturnCorrectEntryWhenPeekingAtSegment(t *testing.T) {
 
 func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 	for name, h := range configurations() {
-		ctx := t.Context()
-		setupConsumerData(t, storeID, h(t).Client)
-
 		t.Run("should consume segment "+name, func(t *testing.T) {
+			harness := h(t)
 			// Arrange
+			ctx := t.Context()
+			setupConsumerData(t, storeID, harness.Client)
+
 			args := &client.ConsumeSegment{
 				Space:   "space0",
 				Segment: "segment0",
 			}
 
 			// Act
-			results := h(t).Client.ConsumeSegment(ctx, storeID, args)
+			results := harness.Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert
@@ -347,11 +348,12 @@ func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 
 func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 	for name, h := range configurations() {
-		ctx := t.Context()
-		setupConsumerData(t, storeID, h(t).Client)
-
 		t.Run("should consume segment with inclusive min "+name, func(t *testing.T) {
+			harness := h(t)
 			// Arrange
+			ctx := t.Context()
+			setupConsumerData(t, storeID, harness.Client)
+
 			args := &client.ConsumeSegment{
 				Space:       "space0",
 				Segment:     "segment0",
@@ -359,7 +361,7 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 			}
 
 			// Act
-			results := h(t).Client.ConsumeSegment(ctx, storeID, args)
+			results := harness.Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
 			// Assert - MinSequence is inclusive, so sequences 233-253 = 21 entries
