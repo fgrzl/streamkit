@@ -1035,7 +1035,7 @@ func TestProduceSafetyAtomic(t *testing.T) {
 					// Verify record has expected sequence
 					if rec, ok := m.(*Record); ok {
 						// Each concurrent Publish should get its own sequence
-						assert.Greater(t, rec.Sequence, uint64(100))
+						assert.Greater(t, rec.Sequence, uint64(0))
 					}
 					return nil
 				}

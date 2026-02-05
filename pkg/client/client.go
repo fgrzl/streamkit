@@ -353,9 +353,11 @@ func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment str
 	defer bidi.Close(nil)
 
 	entry := &api.Entry{}
-	if err := bidi.Decode(&entry); err != nil {
+	if err := bidi.Decode(entry); err != nil {
 		return nil, err
 	}
+	// Debug: log returned peek entry
+	slog.InfoContext(ctx, "peek: returned entry", "space", space, "segment", segment, "seq", entry.Sequence)
 	return entry, nil
 }
 
@@ -435,6 +437,21 @@ func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment 
 	peek, err := c.Peek(ctx, storeID, space, segment)
 	if err != nil {
 		return err
+	}
+	// Debug: log peeked sequence for diagnostics
+	slog.InfoContext(ctx, "publish: peek sequence", "space", space, "segment", segment, "seq", peek.Sequence)
+	// If peek returns sequence 0, retry a few times to handle transient peek anomalies.
+	for i := 0; i < 3 && peek.Sequence == 0; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+			peek, err = c.Peek(ctx, storeID, space, segment)
+			if err != nil {
+				return err
+			}
+			slog.InfoContext(ctx, "publish: retry peek sequence", "space", space, "segment", segment, "seq", peek.Sequence, "attempt", i+1)
+		}
 	}
 
 	var bidi api.BidiStream
