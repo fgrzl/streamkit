@@ -13,13 +13,14 @@ import (
 )
 
 type InProcBidiStream struct {
-	sendChan   chan any
-	recvChan   chan any
-	recvOwned  bool
-	sendClosed sync.Once
-	closeOnce  sync.Once
-	closeErr   error
-	closed     chan struct{}
+	sendChan    chan any
+	recvChan    chan any
+	recvOwned   bool
+	sendClosed  sync.Once
+	sendCloseMu sync.Mutex
+	closeOnce   sync.Once
+	closeErr    error
+	closed      chan struct{}
 }
 
 var payloadBufPool = sync.Pool{
@@ -410,10 +411,21 @@ func LinkStreams(client, server *InProcBidiStream) {
 }
 
 func (s *InProcBidiStream) closeSend(err error) {
+	var didClose bool
 	s.sendClosed.Do(func() {
 		s.closeErr = err
+		didClose = true
 		close(s.sendChan)
 	})
+	// If a later caller attempts to close with a non-nil error, prefer the non-nil error
+	// over a previously set nil to ensure remote-side errors are observable locally.
+	if !didClose && err != nil {
+		s.sendCloseMu.Lock()
+		if s.closeErr == nil {
+			s.closeErr = err
+		}
+		s.sendCloseMu.Unlock()
+	}
 }
 
 type ErrorMessage struct {

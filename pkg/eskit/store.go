@@ -61,6 +61,32 @@ func (s *streamStore) LoadEvents(ctx context.Context, entity es.Entity, minSeque
 }
 
 func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events []es.DomainEvent, expectedSequence uint64) error {
+	// ExpectedSequence contract:
+	// - The caller must provide the last known sequence for the aggregate (expectedSequence).
+	// - The first event's sequence MUST equal expectedSequence + 1.
+	// - Events must be strictly sequential (each next event seq == prev+1).
+	// Partial appends and retries are possible due to the underlying at-least-once fanout.
+	// Consumers should rely on sequence continuity for idempotency and correctness.
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Validate expected sequence
+	firstSeq := events[0].GetSequence()
+	if firstSeq != expectedSequence+1 {
+		return fmt.Errorf("expected sequence mismatch: expected %d, got %d", expectedSequence+1, firstSeq)
+	}
+
+	// Validate contiguous sequences
+	prev := firstSeq
+	for i := 1; i < len(events); i++ {
+		seq := events[i].GetSequence()
+		if seq != prev+1 {
+			return fmt.Errorf("non-contiguous sequence at index %d: expected %d, got %d", i, prev+1, seq)
+		}
+		prev = seq
+	}
+
 	space, segment := entity.Area, entity.ID.String()
 
 	records := enumerators.Map(

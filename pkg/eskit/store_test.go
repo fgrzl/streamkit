@@ -156,7 +156,8 @@ func TestSaveEventsShouldProduceMarshaledRecords(t *testing.T) {
 	s := &streamStore{client: fc}
 
 	// Act
-	err := s.SaveEvents(context.Background(), es.Entity{Area: "sp", ID: uuid.New(), TenantID: uuid.New()}, events, 0)
+	// expectedSequence of 6 indicates last known sequence for the aggregate was 6
+	err := s.SaveEvents(context.Background(), es.Entity{Area: "sp", ID: uuid.New(), TenantID: uuid.New()}, events, 6)
 
 	// Assert
 	require.NoError(t, err)
@@ -186,6 +187,26 @@ func TestSaveEventsShouldReturnErrorWhenProducerFailsWithSequenceMismatch(t *tes
 	// Assert
 	assert.Error(t, err)
 	assert.ErrorIs(t, err, sequenceMismatchErr)
+}
+
+func TestSaveEventsValidatesExpectedSequence(t *testing.T) {
+	polymorphic.RegisterType[fakeDomainEvent]()
+	fc := &fakeClient{}
+	s := &streamStore{client: fc}
+	// first event sequence is 2 but expectedSequence is 0 -> expect error
+	events := []es.DomainEvent{&fakeDomainEvent{seq: 2}}
+	err := s.SaveEvents(context.Background(), es.Entity{Area: "teams", ID: uuid.New(), TenantID: uuid.New()}, events, 0)
+	require.Error(t, err)
+}
+
+func TestSaveEventsValidatesContiguousSequences(t *testing.T) {
+	polymorphic.RegisterType[fakeDomainEvent]()
+	fc := &fakeClient{}
+	s := &streamStore{client: fc}
+	// non-contiguous sequences (1,3)
+	events := []es.DomainEvent{&fakeDomainEvent{seq: 1}, &fakeDomainEvent{seq: 3}}
+	err := s.SaveEvents(context.Background(), es.Entity{Area: "teams", ID: uuid.New(), TenantID: uuid.New()}, events, 0)
+	require.Error(t, err)
 }
 
 func TestSaveEventsShouldReturnErrorWhenNoStatusUpdatesReceived(t *testing.T) {
