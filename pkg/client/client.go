@@ -250,20 +250,22 @@ func (e *resilienceEnumerator) MoveNext() bool {
 			return true
 		}
 
-		// Stream ended, check if we should retry with new position
+		// Stream ended - check if it was an error or clean EOF
+		var streamErr error
 		if e.innerEnum != nil {
+			streamErr = e.innerEnum.Err()
 			e.innerEnum.Dispose()
 			e.innerEnum = nil
 		}
 
-		// If last entry was consumed, try to resume from next position (Issue 8)
-		if e.lastEntry != nil {
+		// Only retry if there was an actual error (disconnect), not on clean EOF
+		if streamErr != nil && e.lastEntry != nil {
 			if e.attemptCount < e.maxAttempts {
 				// Update the consume args with new position
 				e.updateConsumePosition()
 				e.attemptCount++
 				e.disconnectedAt = time.Now()
-				slog.InfoContext(e.ctx, "resilience enumerator: retrying from last position", "sequence", e.lastEntry.Sequence, "attempt", e.attemptCount)
+				slog.InfoContext(e.ctx, "resilience enumerator: retrying from last position", "sequence", e.lastEntry.Sequence, "attempt", e.attemptCount, "err", streamErr)
 				continue
 			}
 		}
