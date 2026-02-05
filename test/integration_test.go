@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"runtime"
 	"strconv"
+	"fmt"
 	"testing"
 	"time"
 
@@ -402,7 +402,31 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 			ctx := t.Context()
 
 			setupConsumerData(t, storeID, harness.Client)
-			runtime.Gosched()
+
+			// Wait/retry until per-space counts are visible to avoid intermittent snapshot misses.
+			ensureSpaceCounts := func() {
+				var lastCounts [5]int
+				for attempt := 0; attempt < 20; attempt++ {
+					ok := true
+					for i := 0; i < 5; i++ {
+						space := fmt.Sprintf("space%d", i)
+						enum := harness.Client.ConsumeSpace(ctx, storeID, &client.ConsumeSpace{Space: space})
+						entries, err := enumerators.ToSlice(enum)
+						lastCounts[i] = len(entries)
+						if err != nil || len(entries) != 1_265 {
+							ok = false
+							t.Logf("attempt %d: space %s has %d entries (err=%v)", attempt, space, len(entries), err)
+						}
+					}
+					if ok {
+						return
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				// If we get here, counts didn't stabilize - fail with detailed counts
+				t.Fatalf("setupConsumerData did not stabilize after retries, lastCounts=%v", lastCounts)
+			}
+			ensureSpaceCounts()
 
 			args := &client.Consume{
 				Offsets: map[string]lexkey.LexKey{
@@ -414,9 +438,18 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 				},
 			}
 
-			// Act
-			results := harness.Client.Consume(ctx, storeID, args)
-			entries, err := enumerators.ToSlice(results)
+			// Act + retry until the interleaved view stabilizes (addresses intermittent snapshot timing)
+			var entries []*client.Entry
+			var err error
+			for attempt := 0; attempt < 20; attempt++ {
+				results := harness.Client.Consume(ctx, storeID, args)
+				entries, err = enumerators.ToSlice(results)
+				if err == nil && len(entries) == 6_325 {
+					break
+				}
+				t.Logf("attempt %d: interleaved returned %d entries (err=%v)", attempt, len(entries), err)
+				time.Sleep(50 * time.Millisecond)
+			}
 
 			// Assert
 			require.NoError(t, err)
