@@ -1,4 +1,4 @@
-﻿package client
+package client
 
 import (
 	"context"
@@ -1011,14 +1011,14 @@ func TestConsumeResilient(t *testing.T) {
 func TestProduceSafetyAtomic(t *testing.T) {
 	var peekSequence uint64 = 100
 	var callCount int32
+	sequences := make(chan uint64, 16)
 
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 
-			// Handle Peek and Produce differently
-			if peek, ok := routeable.(*api.Peek); ok {
-				_ = peek
+			// Handle Peek
+			if _, ok := routeable.(*api.Peek); ok {
 				stream.decodeFn = func(m interface{}) error {
 					if entry, ok := m.(*Entry); ok {
 						*entry = Entry{Sequence: atomic.LoadUint64(&peekSequence)}
@@ -1028,24 +1028,22 @@ func TestProduceSafetyAtomic(t *testing.T) {
 				return stream, nil
 			}
 
-			if prod, ok := routeable.(*api.Produce); ok {
-				_ = prod
+			// Handle Produce
+			if _, ok := routeable.(*api.Produce); ok {
 				atomic.AddInt32(&callCount, 1)
 				stream.encodeFn = func(m interface{}) error {
-					// Verify record has expected sequence
 					if rec, ok := m.(*Record); ok {
-						// Each concurrent Publish should get its own sequence
-						t.Logf("produce: seq=%d", rec.Sequence)
-						// no strict assertion here to avoid flakiness
+						// record produced sequence and advance server-side sequence
+						sequences <- rec.Sequence
+						atomic.StoreUint64(&peekSequence, rec.Sequence)
 					}
 					return nil
 				}
 				stream.decodeFn = func(m interface{}) error {
-					// Return a mock status
 					if status, ok := m.(*SegmentStatus); ok {
 						*status = SegmentStatus{Space: "test", Segment: "seg"}
 					}
-					return nil
+					return errors.New("stream ended")
 				}
 			}
 
@@ -1057,12 +1055,40 @@ func TestProduceSafetyAtomic(t *testing.T) {
 	ctx := context.Background()
 	storeID := uuid.New()
 
-	// Act: Publish a single record (keeps test deterministic and avoids concurrency flakiness)
-	err := c.Publish(ctx, storeID, "space", "seg", []byte("test"), nil)
-	require.NoError(t, err)
+	// Act: Issue concurrent Publish calls
+	var wg sync.WaitGroup
+	var errsMu sync.Mutex
+	var errs []error
+	numPublishers := 5
+	for i := 0; i < numPublishers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.Publish(ctx, storeID, "space", "seg", []byte("test"), nil); err != nil {
+				errsMu.Lock()
+				errs = append(errs, err)
+				errsMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	close(sequences)
 
-	// Assert: Publish invoked Produce exactly once
-	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount), "Publish should call Produce once")
+	// Assert: All Publish calls succeeded
+	require.Empty(t, errs)
+
+	// Collect produced sequences
+	got := make([]uint64, 0, numPublishers)
+	for s := range sequences {
+		got = append(got, s)
+	}
+
+	require.Len(t, got, numPublishers)
+	// Verify sequences are strictly increasing
+	for i := 1; i < len(got); i++ {
+		assert.Greater(t, got[i], got[i-1], "produced sequences should be strictly increasing")
+	}
+	assert.Equal(t, int32(numPublishers), atomic.LoadInt32(&callCount), "all publishes should call Produce")
 }
 
 // TestProduceLockPreventsRaceCondition verifies that concurrent Peek+Produce operations
