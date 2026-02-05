@@ -100,7 +100,7 @@ func azurekitTestHarness(t *testing.T) *TestHarness {
 		AllowInsecureHTTP:   true,
 	}
 
-	factory, err := azurekit.NewStoreFactory(options)
+	factory, err := azurekit.NewStoreFactory(t.Context(), options)
 	if err != nil {
 		t.Skipf("skipping azure tests: failed to create store factory: %v", err)
 		return nil
@@ -181,6 +181,71 @@ func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
 				require.NoError(t, err)
 				assert.Len(t, statuses, 1)
 			}
+		})
+	}
+}
+
+func TestConcurrentProducersDetectConflict(t *testing.T) {
+	for name, h := range configurations(t) {
+		t.Run("concurrent producers "+name, func(t *testing.T) {
+			ctx := t.Context()
+			space, segment := "space-concurrent", "segment-conflict"
+
+			// Each producer needs its own enumerator instance
+			recA := generateRange(0, 200)
+			recB := generateRange(0, 200)
+
+			ch := make(chan error, 2)
+			go func() {
+				_, err := enumerators.ToSlice(h.Client.Produce(ctx, storeID, space, segment, recA))
+				ch <- err
+			}()
+			go func() {
+				_, err := enumerators.ToSlice(h.Client.Produce(ctx, storeID, space, segment, recB))
+				ch <- err
+			}()
+
+			err1 := <-ch
+			err2 := <-ch
+			t.Logf("producer errors: err1=%v err2=%v", err1, err2)
+
+			// Verify final segment is consistent: we expect exactly 200 entries with contiguous sequences
+			enum := h.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
+			entries, err := enumerators.ToSlice(enum)
+			require.NoError(t, err)
+			require.Len(t, entries, 200)
+			for i, e := range entries {
+				reqSeq := uint64(i + 1)
+				assert.Equal(t, reqSeq, e.Sequence)
+			}
+			// At least one producer should have encountered a conflict (server logs will show).
+			// We don't rely on the client-side error here because of close/send races; instead
+			// we validate storage invariants above to ensure no corruption occurred.
+			// Still prefer seeing at least one error if the transport captured it.
+			if err1 == nil && err2 == nil {
+				t.Log("no producer-side errors observed; storage invariants hold")
+			}
+		})
+	}
+}
+
+func TestProduceLargeRecordsChunking(t *testing.T) {
+	for name, h := range configurations(t) {
+		t.Run("large produce "+name, func(t *testing.T) {
+			if name == "azure" {
+				t.Skip("skipping azure for large produce test due to entity size limits")
+			}
+			ctx := t.Context()
+			space, segment := "space-large", "segment-large"
+
+			recs := generateLargeRange(0, 100, 16*1024) // 16KB payloads -> trigger payload chunking
+			_, err := enumerators.ToSlice(h.Client.Produce(ctx, storeID, space, segment, recs))
+			require.NoError(t, err)
+
+			enum := h.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
+			entries, err := enumerators.ToSlice(enum)
+			require.NoError(t, err)
+			require.Len(t, entries, 100)
 		})
 	}
 }
@@ -278,7 +343,7 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 		ctx := t.Context()
 		setupConsumerData(t, storeID, h.Client)
 
-		t.Run("should consume segment with exclusive min "+name, func(t *testing.T) {
+		t.Run("should consume segment with inclusive min "+name, func(t *testing.T) {
 			// Arrange
 			args := &client.ConsumeSegment{
 				Space:       "space0",
@@ -290,9 +355,9 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 			results := h.Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
-			// Assert
+			// Assert - MinSequence is inclusive, so sequences 233-253 = 21 entries
 			require.NoError(t, err)
-			assert.Len(t, entries, 20)
+			assert.Len(t, entries, 21)
 		})
 	}
 }

@@ -91,12 +91,18 @@ func (s *PebbleStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) 
 
 func (s *PebbleStore) calculateTimeBounds(current, min, max int64) struct{ Min, Max int64 } {
 	bounds := struct{ Min, Max int64 }{Min: min}
+	// If min is in the future, clamp to current to avoid empty window
 	if min > current {
 		bounds.Min = current
 	}
-	bounds.Max = max
-	if max == 0 || max > current {
+	// If max == 0 treat as unbounded (include all future entries). If a specific max was provided
+	// but it's in the future, clamp it to current for safety.
+	if max == 0 {
+		bounds.Max = math.MaxInt64
+	} else if max > current {
 		bounds.Max = current
+	} else {
+		bounds.Max = max
 	}
 	return bounds
 }
@@ -272,7 +278,9 @@ func (s *PebbleStore) calculateSegmentBounds(ts int64, args *api.ConsumeSegment)
 	if bounds.MinTS > ts {
 		bounds.MinTS = ts
 	}
-	if args.MaxTimestamp == 0 || args.MaxTimestamp > ts {
+	if args.MaxTimestamp == 0 {
+		bounds.MaxTS = math.MaxInt64
+	} else if args.MaxTimestamp > ts {
 		bounds.MaxTS = ts
 	} else {
 		bounds.MaxTS = args.MaxTimestamp
@@ -288,7 +296,9 @@ func (s *PebbleStore) calculateSegmentBounds(ts int64, args *api.ConsumeSegment)
 func (s *PebbleStore) getSegmentBounds(space, segment string, minSeq, maxSeq uint64) (lexkey.LexKey, lexkey.LexKey) {
 	lower := lexkey.EncodeFirst(api.DATA, api.SEGMENTS, space, segment)
 	if minSeq > 0 {
-		lower = lexkey.EncodeFirst(api.DATA, api.SEGMENTS, space, segment, minSeq)
+		// Use Encode (not EncodeFirst) for inclusive lower bound - the entry key is Encode(..., minSeq)
+		// and we want to include it in the range scan
+		lower = lexkey.Encode(api.DATA, api.SEGMENTS, space, segment, minSeq)
 	}
 	upper := lexkey.EncodeLast(api.DATA, api.SEGMENTS, space, segment)
 	if maxSeq > 0 {
@@ -304,7 +314,7 @@ func (s *PebbleStore) filterSegmentEntries(ctx context.Context, lower, upper lex
 	return enumerators.TakeWhile(
 		s.enumerateEntries(ctx, lower, upper),
 		func(entry *api.Entry) bool {
-			return entry.Sequence > bounds.MinSeq &&
+			return entry.Sequence >= bounds.MinSeq &&
 				entry.Sequence <= bounds.MaxSeq &&
 				entry.Timestamp > bounds.MinTS &&
 				entry.Timestamp <= bounds.MaxTS

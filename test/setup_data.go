@@ -1,6 +1,7 @@
 package test
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -35,6 +36,15 @@ func generateRange(seed, count int) enumerators.Enumerator[*client.Record] {
 		return &client.Record{
 			Sequence: uint64(i + 1),
 			Payload:  []byte(fmt.Sprintf("test data %d", i+1)),
+		}
+	})
+}
+
+func generateLargeRange(seed, count, size int) enumerators.Enumerator[*client.Record] {
+	return enumerators.Range(seed, count, func(i int) *client.Record {
+		return &client.Record{
+			Sequence: uint64(i + 1),
+			Payload:  bytes.Repeat([]byte("x"), size),
 		}
 	})
 }
