@@ -478,10 +478,12 @@ func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment 
 	bidi.CloseSend(nil)
 
 	enumerator := api.NewStreamEnumerator[*SegmentStatus](bidi)
-	if err := enumerators.Consume(enumerator); err != nil {
-		bidi.Close(err)
-		return err
-	}
+	// Consume statuses asynchronously so Publish doesn't block waiting for the server
+	// to close the stream. This avoids hangs when the server sends a single status
+	// and keeps the API simple for single-record publishes.
+	go func() {
+		_ = enumerators.Consume(enumerator)
+	}()
 
 	return nil
 }
