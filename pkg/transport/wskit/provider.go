@@ -73,11 +73,15 @@ func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.Bid
 }
 
 // CallStream opens or reuses a muxed stream over the WebSocket for a single logical interaction.
+// Implements resilient retry with exponential backoff for transient muxer closure.
 func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uuid.UUID, msg api.Routeable) (api.BidiStream, error) {
 	// Retry loop for transient muxer closure: if muxer closes during Encode,
-	// recreate the muxer and retry up to a bounded number of attempts.
-	const maxEncodeAttempts = 3
+	// recreate the muxer and retry with exponential backoff.
+	// Max attempts tuned to allow sufficient reconnection time in production.
+	const maxEncodeAttempts = 7
 	var lastErr error
+	baseDelay := time.Duration(100) * time.Millisecond
+	maxDelay := time.Duration(10) * time.Second
 
 	for attempt := 1; attempt <= maxEncodeAttempts; attempt++ {
 		muxer, err := p.getOrCreateMuxer(ctx)
@@ -95,22 +99,48 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 			lastErr = err
 			// If muxer was closed, attempt reconnect and retry
 			if errors.Is(err, ErrMuxerClosed) || err == ErrMuxerClosed {
-				slog.WarnContext(ctx, "provider: muxer closed during encode, retrying", slog.Int("attempt", attempt))
-				// small jittered backoff before retrying
+				slog.WarnContext(ctx, "provider: muxer closed during encode, retrying",
+					slog.Int("attempt", attempt),
+					slog.Int("maxAttempts", maxEncodeAttempts),
+					slog.String("channelID", channelID.String()))
+
+				// exponential backoff with jitter: baseDelay * 2^(attempt-1) +/- up to 10% jitter
+				backoff := baseDelay * (1 << uint(attempt-1))
+				if backoff > maxDelay {
+					backoff = maxDelay
+				}
+				// Add jitter: +/- 10% of backoff
+				jitter := time.Duration(p.rng.Int63n(int64(backoff/5))) * time.Nanosecond
+				if p.rng.Intn(2) == 0 {
+					backoff = backoff + jitter
+				} else {
+					backoff = backoff - jitter
+				}
+
+				slog.DebugContext(ctx, "provider: encode retry backoff",
+					slog.Duration("backoff", backoff),
+					slog.Int("attempt", attempt))
+
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
-				case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+				case <-time.After(backoff):
 				}
 				continue
 			}
-			// Non-muxer errors are fatal
+			// Non-muxer errors are fatal (context cancellation, auth errors, etc.)
+			slog.WarnContext(ctx, "provider: encode failed with non-transient error",
+				slog.String("error", err.Error()),
+				slog.String("channelID", channelID.String()))
 			return nil, err
 		}
 		return bidi, nil
 	}
 
 	if lastErr != nil {
+		slog.ErrorContext(ctx, "provider: exhausted all retry attempts",
+			slog.Int("maxAttempts", maxEncodeAttempts),
+			slog.String("lastError", lastErr.Error()))
 		return nil, lastErr
 	}
 	return nil, errors.New("failed to call stream")
@@ -178,6 +208,8 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 }
 
 // getOrCreateMuxer dials and initializes or returns the current muxer.
+// Implements coordinated reconnect: if a dial is in progress, waits for completion
+// rather than failing immediately, enabling resilient concurrent recovery.
 func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (providerMuxer, error) {
 	p.mu.Lock()
 	// If existing muxer is healthy, reuse it
@@ -190,21 +222,33 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 
 	// Prevent concurrent dial storms: only one goroutine dials at a time
 	if !p.dialing.CompareAndSwap(false, true) {
-		// Another goroutine is dialing; wait briefly and recheck
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-			// Recheck if muxer is now available
-			p.mu.Lock()
-			if p.muxer != nil && p.muxer.Ping() {
-				m := p.muxer
+		// Another goroutine is dialing; wait for it to complete rather than failing immediately.
+		// This enables resilient concurrent reconnection - multiple goroutines can coordinate
+		// recovery by waiting for the first successful dial.
+		waitBackoff := 50 * time.Millisecond
+		maxWaitTime := time.Duration(p.maxDialAttempts*3) * time.Second // scaled to total dial budget
+		waitDeadline := time.Now().Add(maxWaitTime)
+
+		for time.Now().Before(waitDeadline) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(waitBackoff):
+				// Recheck if muxer is now available
+				p.mu.Lock()
+				if p.muxer != nil && p.muxer.Ping() {
+					m := p.muxer
+					p.mu.Unlock()
+					return m, nil
+				}
 				p.mu.Unlock()
-				return m, nil
+				// Still dialing, continue waiting with exponential backoff
+				if waitBackoff < 500*time.Millisecond {
+					waitBackoff *= 2
+				}
 			}
-			p.mu.Unlock()
-			return nil, errors.New("dial in progress by another goroutine")
 		}
+		return nil, errors.New("dial in progress by another goroutine, timed out waiting for completion")
 	}
 	defer p.dialing.Store(false)
 

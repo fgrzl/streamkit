@@ -79,16 +79,34 @@ type Client interface {
 }
 
 // NewClient creates a new Client instance using the provided BidiStreamProvider.
+// The client includes built-in resilience for transient failures.
 func NewClient(provider api.BidiStreamProvider) Client {
-	return &client{provider: provider}
+	return &client{
+		provider: provider,
+		policy:   DefaultRetryPolicy(),
+	}
+}
+
+// NewClientWithRetryPolicy creates a new Client with a custom retry policy.
+func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolicy) Client {
+	return &client{
+		provider: provider,
+		policy:   policy,
+	}
 }
 
 type client struct {
 	provider api.BidiStreamProvider
+	policy   RetryPolicy
 }
 
 func (c *client) GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[string] {
-	bidi, err := c.provider.CallStream(ctx, storeID, &api.GetSpaces{})
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, &api.GetSpaces{})
+		return err
+	})
 	if err != nil {
 		return enumerators.Error[string](err)
 	}
@@ -96,7 +114,12 @@ func (c *client) GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.E
 }
 
 func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space string) enumerators.Enumerator[string] {
-	bidi, err := c.provider.CallStream(ctx, storeID, &api.GetSegments{Space: space})
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, &api.GetSegments{Space: space})
+		return err
+	})
 	if err != nil {
 		return enumerators.Error[string](err)
 	}
@@ -104,7 +127,12 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 }
 
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
-	bidi, err := c.provider.CallStream(ctx, storeID, args)
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, args)
+		return err
+	})
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
@@ -112,7 +140,12 @@ func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
-	bidi, err := c.provider.CallStream(ctx, storeID, args)
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, args)
+		return err
+	})
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
@@ -120,7 +153,12 @@ func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *ap
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
-	bidi, err := c.provider.CallStream(ctx, storeID, args)
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, args)
+		return err
+	})
 	if err != nil {
 		return enumerators.Error[*Entry](err)
 	}
@@ -128,7 +166,12 @@ func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consu
 }
 
 func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*Entry, error) {
-	bidi, err := c.provider.CallStream(ctx, storeID, &api.Peek{Space: space, Segment: segment})
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, &api.Peek{Space: space, Segment: segment})
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +185,12 @@ func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment str
 }
 
 func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
-	bidi, err := c.provider.CallStream(ctx, storeID, &api.Produce{Space: space, Segment: segment})
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, &api.Produce{Space: space, Segment: segment})
+		return err
+	})
 	if err != nil {
 		return enumerators.Error[*SegmentStatus](err)
 	}
@@ -178,7 +226,12 @@ func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment 
 		return err
 	}
 
-	bidi, err := c.provider.CallStream(ctx, storeID, &api.Produce{Space: space, Segment: segment})
+	var bidi api.BidiStream
+	err = RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, &api.Produce{Space: space, Segment: segment})
+		return err
+	})
 	if err != nil {
 		return err
 	}
