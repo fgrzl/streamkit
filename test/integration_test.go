@@ -85,19 +85,13 @@ func azurekitTestHarness(t *testing.T) *TestHarness {
 	// Support environment variables for Azure Storage configuration
 	accountName := "devstoreaccount1"
 	accountKey := "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-	endpoint := "http://127.0.0.1:10002/devstoreaccount1"
-
-	credential, err := azurekit.NewSharedKeyCredential(accountName, accountKey)
-	if err != nil {
-		t.Skipf("skipping azure tests: failed to create shared key credential: %v", err)
-		return nil
-	}
 
 	options := &azurekit.AzureStoreOptions{
-		Prefix:              uuid.NewString(),
-		Endpoint:            endpoint,
-		SharedKeyCredential: credential,
-		AllowInsecureHTTP:   true,
+		Prefix:            uuid.NewString(),
+		AccountName:       accountName,
+		AccountKey:        accountKey,
+		Endpoint:          "http://127.0.0.1:10002/devstoreaccount1",
+		AllowInsecureHTTP: true,
 	}
 
 	factory, err := azurekit.NewStoreFactory(t.Context(), options)

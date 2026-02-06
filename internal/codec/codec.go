@@ -7,7 +7,7 @@ import (
 
 	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
-	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Constants for buffer initial sizes
@@ -15,21 +15,33 @@ const (
 	defaultBufferSize = 1024
 )
 
-// EncodeEntrySnappy compresses a serialized Entry using Snappy
+// EncodeEntrySnappy compresses a serialized Entry using Zstd
 func EncodeEntrySnappy(e *api.Entry) ([]byte, error) {
 	rawData, err := EncodeEntry(e) // First encode without compression
 	if err != nil {
 		return nil, err
 	}
 
-	// Compress the entry
-	return snappy.Encode(nil, rawData), nil
+	// Compress using zstd
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		return nil, err
+	}
+	defer encoder.Close()
+
+	return encoder.EncodeAll(rawData, nil), nil
 }
 
 // DecodeEntrySnappy decompresses and deserializes an Entry
 func DecodeEntrySnappy(data []byte, e *api.Entry) error {
 	// Decompress the entry first
-	decompressedData, err := snappy.Decode(nil, data)
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		return err
+	}
+	defer decoder.Close()
+
+	decompressedData, err := decoder.DecodeAll(data, nil)
 	if err != nil {
 		return err
 	}
@@ -124,21 +136,33 @@ func DecodeEntry(data []byte, e *api.Entry) error {
 	return nil
 }
 
-// EncodeEntrySnappy compresses a serialized Entry using Snappy
+// EncodeTransactionSnappy compresses a serialized Transaction using Zstd
 func EncodeTransactionSnappy(e *txn.Transaction) ([]byte, error) {
 	rawData, err := EncodeTransaction(e) // First encode without compression
 	if err != nil {
 		return nil, err
 	}
 
-	// Compress the entry
-	return snappy.Encode(nil, rawData), nil
+	// Compress using zstd
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		return nil, err
+	}
+	defer encoder.Close()
+
+	return encoder.EncodeAll(rawData, nil), nil
 }
 
-// DecodeEntrySnappy decompresses and deserializes an Entry
+// DecodeTransactionSnappy decompresses and deserializes a Transaction
 func DecodeTransactionSnappy(data []byte, t *txn.Transaction) error {
-	// Decompress the entry first
-	decompressedData, err := snappy.Decode(nil, data)
+	// Decompress the transaction first
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		return err
+	}
+	defer decoder.Close()
+
+	decompressedData, err := decoder.DecodeAll(data, nil)
 	if err != nil {
 		return err
 	}

@@ -9,15 +9,10 @@ package azurekit
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/fgrzl/streamkit/internal/cache"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/google/uuid"
@@ -30,14 +25,18 @@ const (
 
 // AzureStoreOptions configures the Azure Table Storage client.
 type AzureStoreOptions struct {
-	Prefix                    string
-	Endpoint                  string
-	UseDefaultAzureCredential bool
-	SharedKeyCredential       *aztables.SharedKeyCredential
-	AllowInsecureHTTP         bool // For local Azurite testing
+	Prefix            string
+	AccountName       string // Azure storage account name
+	AccountKey        string // Azure storage account key (leave empty to use Managed Identity)
+	Endpoint          string // Custom endpoint (e.g., http://127.0.0.1:10002/devstoreaccount1 for Azurite)
+	AllowInsecureHTTP bool   // For local Azurite testing
 
-	// Optional: use an existing client (useful for tests)
-	Client *aztables.Client
+	// Managed Identity options
+	UseManagedIdentity bool   // Use Azure Managed Identity instead of SharedKey
+	ManagedIdentityID  string // Optional: specific managed identity client ID
+
+	// Optional: use an existing HTTP client (useful for tests)
+	HTTPClient *HTTPTableClient
 
 	// Runtime knobs
 	AddWorkers                 int
@@ -46,9 +45,6 @@ type AzureStoreOptions struct {
 	CacheTTL                   int // seconds, zero means use default
 	CacheCleanupInterval       int // seconds, zero means use default
 
-	// Optional client options to pass through to Azure SDK
-	ClientOptions *aztables.ClientOptions
-
 	// Optional override table name (useful for tests)
 	TableNameOverride string
 }
@@ -56,49 +52,32 @@ type AzureStoreOptions struct {
 // StoreFactory creates Azure-backed stores using shared credentials.
 type StoreFactory struct {
 	options *AzureStoreOptions
-	cred    azcore.TokenCredential
-	once    sync.Once
-	initErr error
 }
 
-// NewStoreFactory validates options and initializes credentials.
+// NewStoreFactory validates options.
 func NewStoreFactory(ctx context.Context, options *AzureStoreOptions) (*StoreFactory, error) {
-	if options.Endpoint == "" {
-		return nil, errors.New("azure store factory: endpoint is required")
+	if options.AccountName == "" && (options.HTTPClient == nil) {
+		return nil, errors.New("azure store factory: account name is required or HTTPClient must be provided")
 	}
-	if !options.UseDefaultAzureCredential && options.SharedKeyCredential == nil {
-		return nil, errors.New("azure store factory: credential strategy is required")
-	}
-
-	// Helpful warning: HTTP endpoint with DefaultAzureCredential usually indicates Azurite;
-	// AAD tokens won't work against Azurite. Prefer SharedKey in that case.
-	if strings.HasPrefix(strings.ToLower(options.Endpoint), "http://") && options.UseDefaultAzureCredential {
-		slog.WarnContext(ctx, "azure store factory: HTTP endpoint with DefaultAzureCredential detected; this likely requires SharedKey (Azurite)",
-			slog.String("endpoint", options.Endpoint))
+	if !options.UseManagedIdentity && options.AccountKey == "" && options.HTTPClient == nil {
+		return nil, errors.New("azure store factory: account key is required (or use UseManagedIdentity=true) or HTTPClient must be provided")
 	}
 
-	f := &StoreFactory{options: options}
-	f.once.Do(func() {
-		f.cred, f.initErr = f.initCredential(ctx)
-	})
-	if f.initErr != nil {
-		slog.ErrorContext(ctx, "azure store factory: credential initialization failed", slog.String("err", f.initErr.Error()))
-		return nil, fmt.Errorf("azure store factory: credential initialization failed: %w", f.initErr)
+	authMethod := "SharedKey"
+	if options.UseManagedIdentity {
+		authMethod = "ManagedIdentity"
 	}
-	slog.InfoContext(context.Background(), "azure store factory: initialized",
-		slog.String("endpoint", options.Endpoint),
-		slog.Bool("use_default_credential", options.UseDefaultAzureCredential),
-		slog.Bool("shared_key_provided", options.SharedKeyCredential != nil),
+
+	slog.InfoContext(ctx, "azure store factory: initialized",
+		slog.String("account", options.AccountName),
+		slog.String("auth", authMethod),
+		slog.Bool("allow_insecure", options.AllowInsecureHTTP),
 	)
-	return f, nil
+	return &StoreFactory{options: options}, nil
 }
 
 // NewStore returns a new Azure-backed store scoped to a sanitized table name.
 func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage.Store, error) {
-	if f.initErr != nil {
-		return nil, fmt.Errorf("azure store factory: credentials not initialized: %w", f.initErr)
-	}
-
 	// Allow explicit override for table name (useful for tests)
 	var tableName string
 	if f.options.TableNameOverride != "" {
@@ -106,42 +85,27 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 	} else {
 		tableName = sanitizeTableName(f.options.Prefix + storeID.String())
 	}
-	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(f.options.Endpoint, "/"), tableName)
 
 	slog.DebugContext(ctx, "azure store: creating client",
-		slog.String("url", url),
 		slog.String("table", tableName),
-		slog.Bool("aad", f.options.SharedKeyCredential == nil),
+		slog.String("account", f.options.AccountName),
 	)
 
-	// Optimize HTTP transport for high-throughput scenarios
-	// Azure SDK uses default http.Client, but we can configure for better performance
-	clientOpts := aztables.ClientOptions{
-		ClientOptions: azcore.ClientOptions{
-			Transport: nil, // SDK will use default http.DefaultTransport
-			// Note: SDK configures reasonable defaults for retry policy
-			// We handle application-level retries in processChunkWithRetry
-		},
-	}
-	// Allow caller to pass through client options
-	if f.options.ClientOptions != nil {
-		clientOpts = *f.options.ClientOptions
-	}
-	var client *aztables.Client
-	// If a client is provided by the caller (test hooks), use it directly
-	if f.options.Client != nil {
-		client = f.options.Client
+	var httpClient *HTTPTableClient
+	if f.options.HTTPClient != nil {
+		httpClient = f.options.HTTPClient
 	} else {
 		var err error
-		if f.options.SharedKeyCredential != nil {
-			// SharedKey path (used for Azurite or explicit keys)
-			client, err = aztables.NewClientWithSharedKey(url, f.options.SharedKeyCredential, &clientOpts)
+		if f.options.UseManagedIdentity {
+			// Use Managed Identity authentication
+			managedCred := NewManagedIdentityCredential(f.options.ManagedIdentityID)
+			httpClient, err = NewHTTPTableClientWithManagedIdentity(f.options.AccountName, managedCred, tableName, f.options.AllowInsecureHTTP, f.options.Endpoint)
 		} else {
-			// TokenCredential path (used for DefaultAzureCredential)
-			client, err = aztables.NewClient(url, f.cred, &clientOpts)
+			// Use SharedKey authentication
+			httpClient, err = NewHTTPTableClient(f.options.AccountName, f.options.AccountKey, tableName, f.options.AllowInsecureHTTP, f.options.Endpoint)
 		}
 		if err != nil {
-			slog.ErrorContext(ctx, "azure store: failed to create client", slog.String("url", url), slog.String("err", err.Error()))
+			slog.ErrorContext(ctx, "azure store: failed to create HTTP client", slog.String("err", err.Error()))
 			return nil, err
 		}
 	}
@@ -155,27 +119,9 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 	if f.options.CacheCleanupInterval > 0 {
 		cacheCleanup = time.Duration(f.options.CacheCleanupInterval) * time.Second
 	}
-	cache := cache.NewExpiringCache(cacheTTL, cacheCleanup)
+	cacheObj := cache.NewExpiringCache(cacheTTL, cacheCleanup)
 
-	return NewAzureStore(ctx, client, cache, f.options)
-}
-
-// initCredential initializes and returns a shared TokenCredential if needed.
-func (f *StoreFactory) initCredential(ctx context.Context) (azcore.TokenCredential, error) {
-	if f.options.SharedKeyCredential != nil {
-		slog.InfoContext(ctx, "azure store factory: using SharedKey credential")
-		return nil, nil // Not used in this path
-	}
-	if f.options.UseDefaultAzureCredential {
-		cred, err := azidentity.NewDefaultAzureCredential(nil)
-		if err != nil {
-			slog.ErrorContext(ctx, "azure store factory: DefaultAzureCredential creation failed", slog.String("err", err.Error()))
-			return nil, err
-		}
-		slog.InfoContext(ctx, "azure store factory: using DefaultAzureCredential")
-		return cred, nil
-	}
-	return nil, errors.New("azure store factory: no valid credential strategy configured")
+	return NewAzureStore(ctx, httpClient, cacheObj, f.options)
 }
 
 // sanitizeTableName ensures the table name conforms to Azure naming rules.

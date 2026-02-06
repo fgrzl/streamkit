@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/internal/cache"
@@ -33,9 +31,6 @@ const (
 	CacheTTL             time.Duration = time.Second * 97
 	CacheCleanupInterval time.Duration = time.Second * 59
 	ShutdownTimeout      time.Duration = time.Second * 59
-	InitialRetryDelay    time.Duration = time.Millisecond * 100
-	MaxRetryDelay        time.Duration = time.Second * 10
-	MaxRetryAttempts     int           = 5
 	LAST_ENTRY           string        = "LAST_ENTRY"
 	// Max payload size per Azure Table transaction (keep a cushion)
 	MaxTransactionPayloadBytes int = 4*1024*1024 - 256*1024 // ~3.75MB
@@ -71,18 +66,12 @@ const (
 )
 
 // Types
-type entity struct {
-	PartitionKey string `json:"PartitionKey"`
-	RowKey       string `json:"RowKey"`
-	Value        []byte `json:"Value,omitempty"`
-}
-
 type batchEntry struct {
 	Entry        *api.Entry
 	EncodedValue []byte
 }
 
-func NewAzureStore(ctx context.Context, client *aztables.Client, cache *cache.ExpiringCache, options *AzureStoreOptions) (*AzureStore, error) {
+func NewAzureStore(ctx context.Context, client *HTTPTableClient, cache *cache.ExpiringCache, options *AzureStoreOptions) (*AzureStore, error) {
 	store := &AzureStore{
 		client:         client,
 		cache:          cache,
@@ -137,7 +126,7 @@ func NewAzureStore(ctx context.Context, client *aztables.Client, cache *cache.Ex
 //
 // These invariants are intentionally explicit to avoid accidental correctness regressions.
 type AzureStore struct {
-	client         *aztables.Client
+	client         *HTTPTableClient
 	cache          *cache.ExpiringCache
 	wg             sync.WaitGroup
 	closeOnce      sync.Once
@@ -154,12 +143,7 @@ func (s *AzureStore) GetSpaces(ctx context.Context) enumerators.Enumerator[strin
 	// Optimize: limit page size for better performance with large result sets
 	top := int32(1000)
 
-	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
-		Filter: &query,
-		Select: &selectColumns,
-		Top:    &top,
-		Format: ptr(aztables.MetadataFormatNone),
-	}))
+	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(query, selectColumns, top))
 
 	return enumerators.Map(entities, func(e *entity) (string, error) {
 		return e.RowKey, nil
@@ -186,11 +170,7 @@ func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) e
 	// Optimize: limit page size to reduce memory and improve response time
 	top := int32(1000)
 
-	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
-		Filter: &query,
-		Top:    &top,
-		Format: ptr(aztables.MetadataFormatNone),
-	}))
+	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(query, "", top))
 
 	entries := enumerators.Map(entities, func(e *entity) (*api.Entry, error) {
 		return decodeEntry(e.Value)
@@ -211,12 +191,7 @@ func (s *AzureStore) GetSegments(ctx context.Context, space string) enumerators.
 	// Optimize: limit page size for better performance with large result sets
 	top := int32(1000)
 
-	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
-		Filter: &query,
-		Select: &selectColumns,
-		Top:    &top,
-		Format: ptr(aztables.MetadataFormatNone),
-	}))
+	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(query, selectColumns, top))
 
 	return enumerators.Map(entities, func(e *entity) (string, error) {
 		return e.RowKey, nil
@@ -238,11 +213,7 @@ func (s *AzureStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegmen
 	// Optimize: limit page size to reduce memory and improve response time
 	top := int32(1000)
 
-	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
-		Filter: &query,
-		Top:    &top,
-		Format: ptr(aztables.MetadataFormatNone),
-	}))
+	entities := NewAzureTableEnumerator(ctx, s.client.NewListEntitiesPager(query, "", top))
 
 	entries := enumerators.Map(entities, func(e *entity) (*api.Entry, error) {
 		return decodeEntry(e.Value)
@@ -271,7 +242,7 @@ func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entr
 	pk := lexkey.Encode(LAST_ENTRY, space, segment).ToHexString()
 	rk := lexkey.Encode(lexkey.EndMarker).ToHexString()
 
-	resp, err := s.client.GetEntity(ctx, pk, rk, nil)
+	resp, err := s.client.GetEntity(ctx, pk, rk)
 	if err != nil {
 		if isNotFoundError(err) {
 			return nil, nil
@@ -279,7 +250,7 @@ func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entr
 		return nil, fmt.Errorf("%s: %w", ErrPeekFailed, err)
 	}
 
-	entry, err := decodeSnappyEntryEntity(resp.Value)
+	entry, err := decodeSnappyEntryEntity(resp)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ErrPeekFailed, err)
 	}
@@ -456,11 +427,7 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 	// Optimize: limit page size for WAL recovery
 	top := int32(1000)
 
-	pager := s.client.NewListEntitiesPager(&aztables.ListEntitiesOptions{
-		Filter: &query,
-		Top:    &top,
-		Format: ptr(aztables.MetadataFormatNone),
-	})
+	pager := s.client.NewListEntitiesPager(query, "", top)
 	transactions := enumerators.Map(
 		NewAzureTableEnumerator(ctx, pager),
 		func(e *entity) (*txn.Transaction, error) {
@@ -514,7 +481,7 @@ func (s *AzureStore) executeTransaction(ctx context.Context, transaction *txn.Tr
 	if err != nil {
 		return fmt.Errorf("%s: %w", ErrTransactionWrite, err)
 	}
-	if _, err := s.client.AddEntity(ctx, data, nil); err != nil {
+	if err := s.client.AddEntity(ctx, data); err != nil {
 		return fmt.Errorf("%s: %w", ErrTransactionWrite, err)
 	}
 
@@ -529,7 +496,7 @@ func (s *AzureStore) executeTransaction(ctx context.Context, transaction *txn.Tr
 }
 
 func (s *AzureStore) cleanupWAL(ctx context.Context, pk, rk string) error {
-	if _, err := s.client.DeleteEntity(ctx, pk, rk, nil); err != nil {
+	if err := s.client.DeleteEntity(ctx, pk, rk); err != nil {
 		return fmt.Errorf("%s: %w", ErrWALCleanup, err)
 	}
 	return nil
@@ -582,9 +549,7 @@ func (s *AzureStore) writeLastEntry(ctx context.Context, entry batchEntry) error
 	if err != nil {
 		return err
 	}
-	if _, err := s.client.UpsertEntity(ctx, data, &aztables.UpsertEntityOptions{
-		UpdateMode: aztables.UpdateModeReplace,
-	}); err != nil {
+	if err := s.client.UpsertEntity(ctx, data, "Replace"); err != nil {
 		return err
 	}
 	return nil
@@ -697,34 +662,23 @@ func (s *AzureStore) writeBatch(ctx context.Context, entities []entity) error {
 		chunks = append(chunks, cur)
 	}
 
+	// Use native Azure batch API for optimal performance
+	// Each chunk can have different partition keys but up to 100 entities total
+	// If all entities share the same partition key, Azure will atomically commit
 	for _, chunk := range chunks {
-		errCh := make(chan error, len(chunk))
-		sem := make(chan struct{}, s.addWorkers())
-		var wg sync.WaitGroup
-		wg.Add(len(chunk))
-		for i := range chunk {
-			ent := chunk[i]
-			go func(en entity) {
-				defer wg.Done()
-				sem <- struct{}{}
-				b, mErr := marshalEntity(en)
-				if mErr != nil {
-					errCh <- mErr
-					<-sem
-					return
-				}
-				if _, err := s.client.AddEntity(ctx, b, nil); err != nil {
-					errCh <- err
-				}
-				<-sem
-			}(ent)
-		}
-		wg.Wait()
-		close(errCh)
-		for err := range errCh {
+		// Marshal all entities in this chunk
+		entityData := make([][]byte, len(chunk))
+		for i, en := range chunk {
+			b, err := marshalEntity(en)
 			if err != nil {
 				return fmt.Errorf("%s: %w", ErrBatchWrite, err)
 			}
+			entityData[i] = b
+		}
+
+		// Use native Azure batch operation (1 HTTP request instead of N)
+		if err := s.client.AddEntityBatch(ctx, entityData); err != nil {
+			return fmt.Errorf("%s: %w", ErrBatchWrite, err)
 		}
 	}
 	return nil
@@ -738,8 +692,6 @@ func (s *AzureStore) updateInventory(ctx context.Context, space, segment string)
 		return nil
 	}
 
-	updateOptions := &aztables.UpsertEntityOptions{UpdateMode: aztables.UpdateModeReplace}
-
 	// Write segment to space-specific partition
 	segmentPK := lexkey.Encode(api.INVENTORY, api.SEGMENTS, space).ToHexString()
 	data, err := marshalEntity(entity{
@@ -749,7 +701,7 @@ func (s *AzureStore) updateInventory(ctx context.Context, space, segment string)
 	if err != nil {
 		return fmt.Errorf("%s: %w", ErrSegmentInventory, err)
 	}
-	if _, err := s.client.UpsertEntity(ctx, data, updateOptions); err != nil {
+	if err := s.client.UpsertEntity(ctx, data, "Replace"); err != nil {
 		return fmt.Errorf("%s: %w", ErrSegmentInventory, err)
 	}
 
@@ -762,7 +714,7 @@ func (s *AzureStore) updateInventory(ctx context.Context, space, segment string)
 	if err != nil {
 		return fmt.Errorf("%s: %w", ErrSpaceInventory, err)
 	}
-	if _, err := s.client.UpsertEntity(ctx, data, updateOptions); err != nil {
+	if err := s.client.UpsertEntity(ctx, data, "Replace"); err != nil {
 		return fmt.Errorf("%s: %w", ErrSpaceInventory, err)
 	}
 
@@ -785,13 +737,12 @@ func (s *AzureStore) waitForTasks(timeout time.Duration) bool {
 }
 
 func (s *AzureStore) createTableIfNotExists(ctx context.Context) error {
-	_, err := s.client.CreateTable(ctx, &aztables.CreateTableOptions{})
+	err := s.client.CreateTable(ctx)
 	if err == nil {
 		return nil
 	}
 
-	var responseErr *azcore.ResponseError
-	if errors.As(err, &responseErr) && responseErr.ErrorCode == string(aztables.TableAlreadyExists) {
+	if isNotFoundError(err) || strings.Contains(err.Error(), "TableAlreadyExists") {
 		return nil
 	}
 
@@ -877,23 +828,15 @@ func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var respErr *azcore.ResponseError
-	if errors.As(err, &respErr) {
-		// Retry on common transient status codes and throttling only
-		switch respErr.StatusCode {
-		case 429, 500, 502, 503, 504:
-			return true
-		}
-		// Be conservative: do not treat "Conflict" as retryable for insert-only semantics
-		if respErr.ErrorCode == "TooManyRequests" {
-			return true
-		}
-		return false
-	}
-	// Fallback to substring checks for non-ResponseError cases
+	// Check for transient errors based on error messages
 	errStr := err.Error()
 	return strings.Contains(errStr, "ServiceUnavailable") ||
-		strings.Contains(errStr, "429")
+		strings.Contains(errStr, "429") ||
+		strings.Contains(errStr, "500") ||
+		strings.Contains(errStr, "502") ||
+		strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "504") ||
+		strings.Contains(errStr, "TooManyRequests")
 }
 
 func decodeSnappyEntryEntity(value []byte) (*api.Entry, error) {
