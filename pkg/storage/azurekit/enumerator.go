@@ -2,16 +2,14 @@ package azurekit
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
-	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/fgrzl/enumerators"
 )
 
 // NewAzureTableEnumerator creates a new enumerator for Azure Table Storage entities
-func NewAzureTableEnumerator(ctx context.Context, pager *runtime.Pager[aztables.ListEntitiesResponse]) enumerators.Enumerator[*entity] {
+func NewAzureTableEnumerator(ctx context.Context, pager *ListEntitiesPager) enumerators.Enumerator[*entity] {
 	return &AzureTableEnumerator{
 		pager:    pager,
 		ctx:      ctx,
@@ -23,11 +21,11 @@ func NewAzureTableEnumerator(ctx context.Context, pager *runtime.Pager[aztables.
 }
 
 type AzureTableEnumerator struct {
-	pager    *runtime.Pager[aztables.ListEntitiesResponse]
+	pager    *ListEntitiesPager
 	ctx      context.Context
 	current  *entity
 	index    int
-	entities [][]byte
+	entities []entity
 	err      error
 }
 
@@ -42,10 +40,8 @@ func (a *AzureTableEnumerator) Current() (*entity, error) {
 	return a.current, nil
 }
 
-// Dispose cleans up resources (no-op for this implementation as the pager manages its own resources)
+// Dispose cleans up resources
 func (a *AzureTableEnumerator) Dispose() {
-	// The runtime.Pager handles its own cleanup, so we don't need to do anything here
-	// Setting fields to nil to help garbage collection
 	a.pager = nil
 	a.current = nil
 	a.entities = nil
@@ -63,52 +59,40 @@ func (a *AzureTableEnumerator) MoveNext() bool {
 		return false
 	}
 
-	// Move to next entity in current page
 	a.index++
-	if a.entities != nil && a.index < len(a.entities) {
-		if err := a.setCurrent(); err != nil {
+
+	// Load next page if needed
+	if a.entities == nil || a.index >= len(a.entities) {
+		page, err := a.pager.FetchPage(a.ctx)
+		if err != nil {
 			a.err = err
 			return false
 		}
-		return true
+		if len(page) == 0 {
+			return false
+		}
+		a.entities = page
+		a.index = 0
 	}
 
-	// Check if there are more pages
-	if !a.pager.More() {
+	if a.index >= len(a.entities) {
 		return false
 	}
 
-	// Fetch next page
-	resp, err := a.pager.NextPage(a.ctx)
-	if err != nil {
-		a.err = fmt.Errorf("failed to fetch next page: %w", err)
-		return false
+	// Get current entity and decode Value if needed
+	e := &a.entities[a.index]
+
+	// Decode base64-encoded Value field
+	if len(e.Value) > 0 {
+		// Azure Table Storage returns binary data as base64-encoded strings
+		// Try to decode it
+		str := string(e.Value)
+		decoded, err := base64.StdEncoding.DecodeString(str)
+		if err == nil {
+			e.Value = decoded
+		}
 	}
 
-	a.entities = resp.Entities
-	a.index = 0
-
-	if len(a.entities) == 0 {
-		return a.MoveNext() // Recurse if page is empty
-	}
-
-	if err := a.setCurrent(); err != nil {
-		a.err = err
-		return false
-	}
+	a.current = e
 	return true
-}
-
-// setCurrent unmarshals the current entity from the Azure response
-func (a *AzureTableEnumerator) setCurrent() error {
-	if a.index < 0 || a.index >= len(a.entities) {
-		return fmt.Errorf("index out of bounds")
-	}
-
-	var entity entity
-	if err := json.Unmarshal(a.entities[a.index], &entity); err != nil {
-		return fmt.Errorf("failed to unmarshal entity: %w", err)
-	}
-	a.current = &entity
-	return nil
 }
