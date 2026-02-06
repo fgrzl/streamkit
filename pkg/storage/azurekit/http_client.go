@@ -96,6 +96,50 @@ func parseAzureError(resp *http.Response, body []byte) *AzureError {
 	return azErr
 }
 
+// parseBatchResponse parses the multipart/mixed body of an Azure Table Storage
+// batch response to detect per-entity failures. Azure returns 202 Accepted for
+// the batch envelope even when individual entities within a changeset fail
+// (e.g., 409 Conflict, 413 Entity Too Large, quota errors).
+func parseBatchResponse(respBody []byte) error {
+	lines := strings.Split(string(respBody), "\n")
+	var entityErrors []string
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "HTTP/1.1 ") {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		statusCode, err := strconv.Atoi(parts[1])
+		if err != nil || statusCode < 400 {
+			continue
+		}
+		// Found a failure — look for JSON error details in following lines
+		detail := ""
+		for j := i + 1; j < len(lines); j++ {
+			trimmed := strings.TrimSpace(lines[j])
+			if strings.HasPrefix(trimmed, "--") {
+				break
+			}
+			if strings.HasPrefix(trimmed, "{") {
+				detail = trimmed
+				break
+			}
+		}
+		if detail != "" {
+			entityErrors = append(entityErrors, fmt.Sprintf("status %d: %s", statusCode, detail))
+		} else {
+			entityErrors = append(entityErrors, line)
+		}
+	}
+	if len(entityErrors) > 0 {
+		return fmt.Errorf("batch entity failures: %s", strings.Join(entityErrors, "; "))
+	}
+	return nil
+}
+
 // shouldRetry determines if a request should be retried based on error type
 func shouldRetry(err error) bool {
 	var azErr *AzureError
@@ -386,7 +430,7 @@ func (c *HTTPTableClient) CreateTable(ctx context.Context) error {
 	c.signRequest(req, "POST", data, "/Tables")
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.retryableRequest(ctx, req, data)
 	if err != nil {
 		return fmt.Errorf("execute request: %w", err)
 	}
@@ -461,7 +505,7 @@ func (c *HTTPTableClient) AddEntity(ctx context.Context, data []byte) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json;odata=nometadata")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.retryableRequest(ctx, req, buf.Bytes())
 	if err != nil {
 		return fmt.Errorf("execute request: %w", err)
 	}
@@ -567,15 +611,24 @@ func (c *HTTPTableClient) AddEntityBatch(ctx context.Context, entities [][]byte)
 	req.Header.Set("Content-Type", fmt.Sprintf("multipart/mixed; boundary=%s", batchID))
 	req.Header.Set("Accept", "application/json;odata=nometadata")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.retryableRequest(ctx, req, buf.Bytes())
 	if err != nil {
 		return fmt.Errorf("execute batch request: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Always read the body — needed both for error responses and for
+	// Issue #14: checking per-entity failures inside a 202 Accepted envelope.
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(resp.Body)
-		return parseAzureError(resp, body)
+		return parseAzureError(resp, respBody)
+	}
+
+	// Issue #14: Parse the multipart/mixed response to detect per-entity failures.
+	// Azure returns 202 for the batch envelope even when individual entities fail.
+	if err := parseBatchResponse(respBody); err != nil {
+		return err
 	}
 
 	slog.Debug("batch entities added",
@@ -653,7 +706,7 @@ func (c *HTTPTableClient) UpsertEntity(ctx context.Context, data []byte, mode st
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json;odata=nometadata")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.retryableRequest(ctx, req, body)
 	if err != nil {
 		return fmt.Errorf("execute request: %w", err)
 	}
@@ -698,7 +751,7 @@ func (c *HTTPTableClient) DeleteEntity(ctx context.Context, pk, rk string) error
 		c.tableName, url.QueryEscape(pk), url.QueryEscape(rk)))
 	req.Header.Set("If-Match", "*") // Delete regardless of etag
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.retryableRequest(ctx, req, nil)
 	if err != nil {
 		return fmt.Errorf("execute request: %w", err)
 	}
@@ -757,7 +810,7 @@ func (c *HTTPTableClient) GetEntity(ctx context.Context, pk, rk string) ([]byte,
 		c.tableName, url.QueryEscape(pk), url.QueryEscape(rk)))
 	req.Header.Set("Accept", "application/json;odata=nometadata")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.retryableRequest(ctx, req, nil)
 	if err != nil {
 		return nil, fmt.Errorf("execute request: %w", err)
 	}
@@ -870,7 +923,7 @@ func (p *ListEntitiesPager) FetchPage(ctx context.Context) ([]entity, error) {
 	p.client.signRequest(req, "GET", nil, fmt.Sprintf("/%s", p.client.tableName))
 	req.Header.Set("Accept", "application/json;odata=nometadata")
 
-	resp, err := p.client.httpClient.Do(req)
+	resp, err := p.client.retryableRequest(ctx, req, nil)
 	if err != nil {
 		return nil, fmt.Errorf("execute request: %w", err)
 	}

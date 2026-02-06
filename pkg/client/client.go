@@ -768,12 +768,6 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				activeSub.activeHandlers.Add(1)
 				go func() {
 					defer activeSub.activeHandlers.Add(-1)
-					defer func() {
-						if r := recover(); r != nil {
-							activeSub.handlerPanics.Add(1)
-							slog.ErrorContext(ctx, "subscription handler panic", "id", subID, "panic", r)
-						}
-					}()
 
 					// Track last delivered sequence for offset tracking
 					if status.LastSequence > 0 {
@@ -784,22 +778,27 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 					handlerCtx, cancel := context.WithTimeout(ctx, c.handlerTimeout)
 					defer cancel()
 
-					// Run handler directly with timeout context.
-					// Handler is responsible for checking context and exiting gracefully.
+					// Run handler in a goroutine so we can enforce the timeout.
+					// The recover() must be inside this goroutine since panics
+					// don't propagate across goroutine boundaries.
 					done := make(chan struct{})
 					go func() {
 						defer close(done)
+						defer func() {
+							if r := recover(); r != nil {
+								activeSub.handlerPanics.Add(1)
+								slog.ErrorContext(ctx, "subscription handler panic", "id", subID, "panic", r)
+							}
+						}()
 						handler(&status)
 					}()
 
 					select {
 					case <-done:
-						// Handler completed successfully
+						// Handler completed (or panicked and recovered)
 					case <-handlerCtx.Done():
 						activeSub.handlerTimeouts.Add(1)
 						slog.WarnContext(ctx, "subscription handler exceeded timeout", "id", subID, "timeout", c.handlerTimeout)
-						// Note: Handler goroutine continues running, but the activeHandlers count
-						// has been decremented. This is safe because we cap activeHandlers.
 					}
 				}()
 			}

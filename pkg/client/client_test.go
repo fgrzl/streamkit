@@ -1040,9 +1040,14 @@ func TestProduceSafetyAtomic(t *testing.T) {
 					}
 					return nil
 				}
+				var decoded int32
 				stream.decodeFn = func(m interface{}) error {
-					if status, ok := m.(*SegmentStatus); ok {
-						*status = SegmentStatus{Space: "test", Segment: "seg"}
+					call := atomic.AddInt32(&decoded, 1)
+					if call == 1 {
+						if status, ok := m.(*SegmentStatus); ok {
+							*status = SegmentStatus{Space: "test", Segment: "seg"}
+						}
+						return nil
 					}
 					return errors.New("stream ended")
 				}
