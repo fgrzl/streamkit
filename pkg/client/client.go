@@ -145,6 +145,16 @@ type activeSubscription struct {
 	handlerPanics   atomic.Int32         // counts handler panic occurrences
 }
 
+// ClientMetrics provides instrumentation hooks for external observability systems.
+// Implementations may be nil when metrics are not required.
+type ClientMetrics interface {
+	RecordProduceLatency(space, segment string, duration time.Duration)
+	RecordConsumeLatency(space, segment string, duration time.Duration)
+	RecordSubscriptionReplay(id string, success bool, duration time.Duration)
+	RecordHandlerTimeout(id string)
+	RecordHandlerPanic(id string)
+}
+
 type client struct {
 	provider       api.BidiStreamProvider
 	policy         RetryPolicy
@@ -157,6 +167,9 @@ type client struct {
 	// Issue 9: Per-segment locks for atomic Peek+Produce
 	produceLocksLock sync.RWMutex
 	produceLocks     map[string]*sync.Mutex // keyed by {storeID}:{space}:{segment}
+
+	// Optional metrics hooks for Prometheus/OpenTelemetry
+	metrics ClientMetrics
 }
 
 func (c *client) GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[string] {
@@ -186,22 +199,41 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 }
 
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
+	requestID := uuid.New().String()
+	ctx = context.WithValue(ctx, "request_id", requestID)
+	slog.DebugContext(ctx, "consume space request",
+		"request_id", requestID,
+		"store_id", storeID,
+		"space", args.Space)
 	// Returns a resilience-wrapped enumerator that retries on disconnect (Issue 8)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
+	requestID := uuid.New().String()
+	ctx = context.WithValue(ctx, "request_id", requestID)
+	slog.DebugContext(ctx, "consume segment request",
+		"request_id", requestID,
+		"store_id", storeID,
+		"space", args.Space, "segment", args.Segment)
 	// Returns a resilience-wrapped enumerator that retries on disconnect (Issue 8)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
+	requestID := uuid.New().String()
+	ctx = context.WithValue(ctx, "request_id", requestID)
+	slog.DebugContext(ctx, "consume request",
+		"request_id", requestID,
+		"store_id", storeID)
 	// Returns a resilience-wrapped enumerator that retries on disconnect (Issue 8)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
-// resilienceEnumerator wraps a consume enumerator with transparent reconnection (Issue 8)
-// If the stream disconnects, it automatically retries from the last consumed position
+// resilienceEnumerator wraps a consume enumerator with transparent reconnection (Issue 8).
+// On reconnect, the enumerator will resume from the last consumed position to provide
+// at-least-once semantics. It updates Consume arguments to precisely resume using
+// lexicographic offsets when available to avoid duplicate deliveries on reconnect.
 type resilienceEnumerator struct {
 	client    *client
 	storeID   uuid.UUID
@@ -216,6 +248,7 @@ type resilienceEnumerator struct {
 }
 
 func (e *resilienceEnumerator) MoveNext() bool {
+	start := time.Now()
 	for {
 		// Create inner enumerator if not exists
 		if e.innerEnum == nil {
@@ -256,6 +289,10 @@ func (e *resilienceEnumerator) MoveNext() bool {
 				continue
 			}
 			e.lastEntry = entry
+			// Metrics: record consume latency if available
+			if e.client != nil && e.client.metrics != nil {
+				e.client.metrics.RecordConsumeLatency(entry.Space, entry.Segment, time.Since(start))
+			}
 			return true
 		}
 
@@ -300,10 +337,17 @@ func (e *resilienceEnumerator) Dispose() {
 
 // createStream creates a new stream for the consume operation
 func (e *resilienceEnumerator) createStream() (api.BidiStream, error) {
+	// If we have consumed entries previously, update the args to resume from
+	// the position after the last consumed entry to prevent duplicates.
+	argsToUse := e.args
+	if e.lastEntry != nil {
+		argsToUse = e.updateArgsWithOffset()
+	}
+
 	var bidi api.BidiStream
 	err := RetryWithBackoff(e.ctx, e.client.policy, func(retryCtx context.Context) error {
 		var err error
-		bidi, err = e.client.provider.CallStream(retryCtx, e.storeID, e.args)
+		bidi, err = e.client.provider.CallStream(retryCtx, e.storeID, argsToUse)
 		return err
 	})
 	return bidi, err
@@ -340,6 +384,41 @@ func (e *resilienceEnumerator) updateConsumePosition() {
 				"offsetKey", offsetKey, "sequence", e.lastEntry.Sequence+1)
 		}
 	}
+}
+
+// build a new args object that resumes from the last consumed position. This is
+// used when reconnecting so a fresh stream starts from the correct offset.
+func (e *resilienceEnumerator) updateArgsWithOffset() api.Routeable {
+	if e.lastEntry == nil {
+		return e.args
+	}
+
+	switch args := e.args.(type) {
+	case *api.ConsumeSegment:
+		newArgs := *args
+		newArgs.MinSequence = e.lastEntry.Sequence + 1
+		slog.DebugContext(e.ctx, "resilience: built updated ConsumeSegment args",
+			"space", newArgs.Space, "segment", newArgs.Segment, "minSeq", newArgs.MinSequence)
+		return &newArgs
+	case *api.ConsumeSpace:
+		newArgs := *args
+		newArgs.Offset = e.lastEntry.GetSpaceOffset()
+		slog.DebugContext(e.ctx, "resilience: built updated ConsumeSpace args",
+			"space", newArgs.Space, "offset", newArgs.Offset)
+		return &newArgs
+	case *api.Consume:
+		newArgs := *args
+		if newArgs.Offsets == nil {
+			newArgs.Offsets = make(map[string]lexkey.LexKey)
+		}
+		offsetKey := e.lastEntry.Space + "/" + e.lastEntry.Segment
+		newArgs.Offsets[offsetKey] = lexkey.Encode(e.lastEntry.Timestamp, e.lastEntry.Space, e.lastEntry.Segment, e.lastEntry.Sequence)
+		slog.DebugContext(e.ctx, "resilience: built updated Consume args",
+			"offsetKey", offsetKey, "offset", newArgs.Offsets[offsetKey])
+		return &newArgs
+	}
+
+	return e.args
 }
 
 // Err returns any error that occurred during enumeration
@@ -419,6 +498,10 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 	return api.NewStreamEnumerator[*SegmentStatus](bidi)
 }
 
+// Maximum number of per-segment produce locks to retain in the map.
+// Tunable for high-churn scenarios. Tests may override for validation.
+var MaxProduceLocks = 10000
+
 // getProduceLock returns or creates a mutex for the given segment (Issue 9: Peek+Produce atomicity).
 // This ensures that only one goroutine can perform Peek+Produce for a given segment,
 // preventing race conditions where sequences could conflict.
@@ -442,6 +525,18 @@ func (c *client) getProduceLock(storeID uuid.UUID, space, segment string) *sync.
 		return mu
 	}
 
+	// Evict old locks if map is too large (simple random eviction)
+	if len(c.produceLocks) >= MaxProduceLocks {
+		toRemove := MaxProduceLocks / 10
+		for k := range c.produceLocks {
+			delete(c.produceLocks, k)
+			toRemove--
+			if toRemove <= 0 {
+				break
+			}
+		}
+	}
+
 	// Create and store new mutex
 	mu := &sync.Mutex{}
 	c.produceLocks[key] = mu
@@ -449,6 +544,13 @@ func (c *client) getProduceLock(storeID uuid.UUID, space, segment string) *sync.
 }
 
 func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment string, payload []byte, metadata map[string]string) error {
+	start := time.Now()
+	defer func() {
+		if c.metrics != nil {
+			c.metrics.RecordProduceLatency(space, segment, time.Since(start))
+		}
+	}()
+
 	// Issue 9: Acquire segment lock to ensure atomic Peek+Produce operation.
 	// This prevents race conditions where another producer could write data between
 	// our Peek and Produce, causing sequence conflicts.
@@ -547,8 +649,11 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 	go func() {
 		defer close(done)
 		defer func() {
-			// Ensure cleanup happens even if handler panics
-			c.unregisterSubscription(subID)
+			// Ensure cleanup happens even if handler panics. Do not unregister if subscription
+			// has been marked as failed; leave it for explicit application control.
+			if s, ok := activeSub.status.Load().(string); !ok || s != "failed" {
+				c.unregisterSubscription(subID)
+			}
 			if r := recover(); r != nil {
 				slog.ErrorContext(ctx, "subscription goroutine panic (cleanup completed)", "id", subID, "panic", r)
 			}
@@ -571,15 +676,40 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			stream, err := c.provider.CallStream(ctx, storeID, initMsg)
 			if err != nil {
 				slog.WarnContext(ctx, "subscription stream failed, retrying", "attempt", attempt, "backoff", backoff, "err", err)
+
+				// If we've exhausted retry attempts for this batch, increment failure count
+				if attempt >= 2 {
+					failures := activeSub.failureCount.Add(1)
+					if err != nil {
+						activeSub.lastError.Store(err)
+					}
+					slog.WarnContext(ctx, "client: subscribe attempt limit reached",
+						"id", subID, "consecutive_failures", failures, "err", err)
+
+					if failures >= 2 {
+						activeSub.status.Store("failed")
+						slog.ErrorContext(ctx, "client: subscription marked as failed - max retry failures exceeded",
+							"id", subID, "failures", failures, "err", err)
+						// Keep subscription visible; stop trying
+						return
+					}
+
+					// Reset attempt counter for next batch of retries
+					attempt = 0
+				}
+
 				select {
 				case <-ctx.Done():
 					return
 				case <-time.After(backoff):
-					// Exponential backoff with max
+					// Exponential backoff with max and jitter
 					backoff = backoff * 2
 					if backoff > maxBackoff {
 						backoff = maxBackoff
 					}
+					jitterRange := backoff / 4
+					jitter := time.Duration(pseudoRand(int64(jitterRange * 2)))
+					backoff = backoff - jitterRange + jitter
 					continue
 				}
 			}
@@ -848,6 +978,49 @@ func (c *client) unregisterSubscription(id string) {
 	delete(c.subscriptions, id)
 }
 
+// RemoveSubscription explicitly removes a subscription from the registry.
+// Returns true if the subscription existed and was removed.
+func (c *client) RemoveSubscription(id string) bool {
+	c.subscriptionsMu.Lock()
+	defer c.subscriptionsMu.Unlock()
+	_, existed := c.subscriptions[id]
+	delete(c.subscriptions, id)
+	return existed
+}
+
+// RetryFailedSubscription triggers a manual retry of a subscription previously
+// marked as failed. Returns an error if the subscription does not exist or
+// is not in the "failed" state.
+func (c *client) RetryFailedSubscription(id string) error {
+	c.subscriptionsMu.RLock()
+	sub, exists := c.subscriptions[id]
+	c.subscriptionsMu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("subscription %s not found", id)
+	}
+
+	status, _ := sub.status.Load().(string)
+	if status != "failed" {
+		return fmt.Errorf("subscription %s is not failed (status: %s)", id, status)
+	}
+
+	// Reset failure state
+	sub.failureCount.Store(0)
+	sub.status.Store("replaying")
+	// atomic.Value does not accept nil in Store; use empty error placeholder
+	sub.lastError.Store(errors.New(""))
+
+	// Trigger replay in background
+	go func() {
+		if err := c.replaySubscription(sub.ctx, sub); err != nil {
+			slog.ErrorContext(sub.ctx, "manual subscription retry failed", "id", id, "err", err)
+		}
+	}()
+
+	return nil
+}
+
 // SubscriptionStatus represents the health status of an active subscription (Issue 4)
 type SubscriptionStatus struct {
 	ID              string // subscription ID
@@ -860,9 +1033,14 @@ type SubscriptionStatus struct {
 }
 
 // GetSubscriptionStatus returns the current health status of a subscription.
-// This allows applications to detect failed subscriptions (Issue 4: Silent Failures)
-// and handler performance issues (Issue 7: Handler Timeouts).
-// Returns nil if subscription not found or has been cleaned up.
+//
+// The returned status contains the subscription's current state: "active",
+// "replaying", or "failed". Failed subscriptions are intentionally kept in the
+// registry so that applications can inspect them, retry via `RetryFailedSubscription`,
+// or remove them explicitly with `RemoveSubscription`.
+//
+// Failure counts and last errors are tracked to help with observability and
+// operational recovery. Returns nil if the subscription id is not found.
 func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
 	c.subscriptionsMu.RLock()
 	sub, exists := c.subscriptions[id]

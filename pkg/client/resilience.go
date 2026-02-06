@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -52,32 +53,53 @@ func IsRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Context cancellation is not retryable
+
+	// Context errors are never retryable
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
-	errStr := err.Error()
+	errStr := strings.ToLower(err.Error())
 
-	// Explicitly non-retryable errors (permanent failures)
-	nonRetryablePatterns := []string{
+	// Explicit permanent failures (don't retry)
+	permanentErrors := []string{
 		"not found",
 		"unauthorized",
 		"forbidden",
-		"invalid argument",
-		"invalid parameter",
-		"permission denied",
 		"authentication failed",
+		"invalid argument",
+		"invalid request",
 		"bad request",
+		"permission denied",
 	}
 
-	for _, pattern := range nonRetryablePatterns {
-		if contains(errStr, pattern) {
+	for _, perm := range permanentErrors {
+		if strings.Contains(errStr, perm) {
 			return false
 		}
 	}
 
-	// Assume other errors are transient (network hiccups, muxer closures, etc.)
+	// Explicit transient failures (do retry)
+	transientErrors := []string{
+		"connection refused",
+		"connection reset",
+		"timeout",
+		"temporary failure",
+		"service unavailable",
+		"too many requests",
+		"throttled",
+		"429",
+		"503",
+		"504",
+	}
+
+	for _, trans := range transientErrors {
+		if strings.Contains(errStr, trans) {
+			return true
+		}
+	}
+
+	// Default: assume transient (safe default for network issues)
 	return true
 }
 

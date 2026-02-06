@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1234,4 +1235,195 @@ func TestProduceLockIsolatesBySegment(t *testing.T) {
 	// Assert: Both segments had their Produce called
 	assert.Greater(t, atomic.LoadInt32(&seg1Count), int32(0), "segment 1 should have been produced")
 	assert.Greater(t, atomic.LoadInt32(&seg2Count), int32(0), "segment 2 should have been produced")
+}
+
+// --- New tests for RC hardening ---
+
+func TestResilienceEnumeratorResumesConsumeSegment(t *testing.T) {
+	var calls int
+	var capturedArgs []api.Routeable
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			calls++
+			capturedArgs = append(capturedArgs, routeable)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			seq := 0
+			stream.decodeFn = func(m any) error {
+				// handle both *api.Entry and **api.Entry due to how the enumerator passes values
+				switch v := m.(type) {
+				case *api.Entry:
+					seq++
+					if seq == 1 {
+						*v = api.Entry{Sequence: 1}
+						return nil
+					}
+				case **api.Entry:
+					seq++
+					if seq == 1 {
+						*v = &api.Entry{Sequence: 1}
+						return nil
+					}
+				}
+				return errors.New("simulated disconnect")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+	args := &ConsumeSegment{Space: "space", Segment: "segment"}
+	enum := c.ConsumeSegment(ctx, storeID, args)
+	defer enum.Dispose()
+
+	// First MoveNext should return the first entry
+	assert.True(t, enum.MoveNext())
+	entry, err := enum.Current()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), entry.Sequence)
+
+	// Next MoveNext triggers reconnect; we don't rely on its return value here
+	_ = enum.MoveNext()
+
+	// We expect at least two calls and second call's args to be a ConsumeSegment with MinSequence == 2
+	require.GreaterOrEqual(t, calls, 2)
+	if cs, ok := capturedArgs[len(capturedArgs)-1].(*api.ConsumeSegment); ok {
+		assert.Equal(t, uint64(2), cs.MinSequence)
+	} else {
+		t.Fatalf("expected ConsumeSegment, got %T", capturedArgs[len(capturedArgs)-1])
+	}
+}
+
+func TestResilienceEnumeratorResumesConsumeSpace(t *testing.T) {
+	var calls int
+	var capturedArgs []api.Routeable
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			calls++
+			capturedArgs = append(capturedArgs, routeable)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			first := true
+			stream.decodeFn = func(m any) error {
+				// handle both *api.Entry and **api.Entry
+				switch v := m.(type) {
+				case *api.Entry:
+					if first {
+						first = false
+						*v = api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
+						return nil
+					}
+				case **api.Entry:
+					if first {
+						first = false
+						*v = &api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
+						return nil
+					}
+				}
+				return errors.New("simulated disconnect")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+	args := &ConsumeSpace{Space: "spaceX"}
+	enum := c.ConsumeSpace(ctx, storeID, args)
+	defer enum.Dispose()
+
+	// First MoveNext returns the first entry
+	assert.True(t, enum.MoveNext())
+	entry, err := enum.Current()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), entry.Sequence)
+
+	// Next MoveNext triggers reconnect; we don't rely on its return value here
+	_ = enum.MoveNext()
+
+	require.GreaterOrEqual(t, calls, 2)
+	if cs, ok := capturedArgs[len(capturedArgs)-1].(*api.ConsumeSpace); ok {
+		// Offset should be set and equal to the entry's space offset
+		expected := entry.GetSpaceOffset()
+		assert.Equal(t, expected, cs.Offset)
+	} else {
+		t.Fatalf("expected ConsumeSpace, got %T", capturedArgs[len(capturedArgs)-1])
+	}
+}
+
+func TestProduceLockEviction(t *testing.T) {
+	prev := MaxProduceLocks
+	MaxProduceLocks = 100 // shrink for test
+	defer func() { MaxProduceLocks = prev }()
+
+	provider := &mockProvider{}
+	c := NewClient(provider).(*client)
+
+	storeID := uuid.New()
+	// Create more than MaxProduceLocks unique locks
+	for i := 0; i < 150; i++ {
+		space := fmt.Sprintf("s%d", i)
+		segment := fmt.Sprintf("seg%d", i)
+		_ = c.getProduceLock(storeID, space, segment)
+	}
+
+	// Ensure the map size does not exceed MaxProduceLocks
+	c.produceLocksLock.RLock()
+	size := len(c.produceLocks)
+	c.produceLocksLock.RUnlock()
+	assert.LessOrEqual(t, size, MaxProduceLocks)
+}
+
+func TestFailedSubscriptionStaysVisible(t *testing.T) {
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			return nil, errors.New("can't connect")
+		},
+	}
+
+	c := NewClientWithHandlerTimeout(provider, 50*time.Millisecond).(*client)
+	ctx := context.Background()
+	storeID := uuid.New()
+
+	// Register subscription that will fail to connect
+	_, err := c.SubscribeToSegment(ctx, storeID, "space", "segment", func(s *SegmentStatus) {})
+	require.NoError(t, err)
+
+	// Wait until subscription reaches 'failed' status or timeout
+	var subID string
+	c.subscriptionsMu.RLock()
+	for id := range c.subscriptions {
+		subID = id
+		break
+	}
+	c.subscriptionsMu.RUnlock()
+	require.NotEmpty(t, subID)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		status := c.GetSubscriptionStatus(subID)
+		if status != nil && status.Status == "failed" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	status := c.GetSubscriptionStatus(subID)
+	require.NotNil(t, status)
+	assert.Equal(t, "failed", status.Status)
+
+	// Try manual retry (this will attempt to reconnect and still fail)
+	err = c.RetryFailedSubscription(subID)
+	require.NoError(t, err)
+}
+
+func TestIsRetryable(t *testing.T) {
+	assert.False(t, IsRetryable(context.Canceled))
+	assert.False(t, IsRetryable(fmt.Errorf("not found")))
+	assert.False(t, IsRetryable(fmt.Errorf("invalid argument: foo")))
+	assert.True(t, IsRetryable(fmt.Errorf("connection refused")))
+	assert.True(t, IsRetryable(fmt.Errorf("503 service unavailable")))
 }
