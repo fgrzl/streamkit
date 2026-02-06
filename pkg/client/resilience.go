@@ -56,10 +56,61 @@ func IsRetryable(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	// For now, assume most errors are transient (network hiccups, muxer closures, etc.)
-	// In production, you may want to check for specific error types that are permanent
-	// (e.g., auth failures, not found, etc.)
+
+	errStr := err.Error()
+
+	// Explicitly non-retryable errors (permanent failures)
+	nonRetryablePatterns := []string{
+		"not found",
+		"unauthorized",
+		"forbidden",
+		"invalid argument",
+		"invalid parameter",
+		"permission denied",
+		"authentication failed",
+		"bad request",
+	}
+
+	for _, pattern := range nonRetryablePatterns {
+		if contains(errStr, pattern) {
+			return false
+		}
+	}
+
+	// Assume other errors are transient (network hiccups, muxer closures, etc.)
 	return true
+}
+
+// contains performs case-insensitive substring search
+func contains(s, substr string) bool {
+	// Simple case-insensitive check
+	s, substr = toLower(s), toLower(substr)
+	return len(s) >= len(substr) && (s == substr || indexSubstring(s, substr) >= 0)
+}
+
+func toLower(s string) string {
+	b := make([]byte, len(s))
+	for i := range s {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return string(b)
+}
+
+func indexSubstring(s, substr string) int {
+	n := len(substr)
+	if n == 0 {
+		return 0
+	}
+	for i := 0; i <= len(s)-n; i++ {
+		if s[i:i+n] == substr {
+			return i
+		}
+	}
+	return -1
 }
 
 // RetryWithBackoff executes fn with exponential backoff retry on failure.
@@ -121,13 +172,31 @@ func RetryWithBackoff(ctx context.Context, policy RetryPolicy, fn func(context.C
 		case <-time.After(backoff):
 		}
 
-		// Exponential backoff for next attempt
+		// Exponential backoff with jitter for next attempt
 		nextBackoff := time.Duration(float64(backoff) * policy.BackoffMultiplier)
 		if nextBackoff > policy.MaxBackoff {
 			nextBackoff = policy.MaxBackoff
 		}
-		backoff = nextBackoff
+
+		// Add ±25% jitter to prevent thundering herd on mass reconnects
+		jitterRange := nextBackoff / 4
+		jitter := time.Duration(pseudoRand(int64(jitterRange * 2)))
+		backoff = nextBackoff - jitterRange + jitter
 	}
 
 	return lastErr
+}
+
+// pseudoRand generates a pseudo-random number without importing math/rand
+// Uses simple LCG (Linear Congruential Generator) for jitter
+// Not cryptographically secure, but sufficient for backoff jitter
+var pseudoRandState int64 = time.Now().UnixNano()
+
+func pseudoRand(max int64) int64 {
+	if max <= 0 {
+		return 0
+	}
+	// Simple LCG: https://en.wikipedia.org/wiki/Linear_congruential_generator
+	pseudoRandState = (pseudoRandState*1103515245 + 12345) & 0x7fffffff
+	return pseudoRandState % max
 }

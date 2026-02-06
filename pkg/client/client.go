@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/fgrzl/enumerators"
+	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
 )
@@ -96,7 +97,15 @@ func NewClient(provider api.BidiStreamProvider) Client {
 
 // NewClientWithRetryPolicy creates a new Client with a custom retry policy.
 func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolicy) Client {
-	return NewClientWithHandlerTimeout(provider, 30*time.Second)
+	c := &client{
+		provider:       provider,
+		policy:         policy,
+		handlerTimeout: 30 * time.Second,
+		subscriptions:  make(map[string]*activeSubscription),
+		produceLocks:   make(map[string]*sync.Mutex),
+	}
+	provider.RegisterReconnectListener(c)
+	return c
 }
 
 // NewClientWithHandlerTimeout creates a new Client with custom timeout for handler execution (Issue 7).
@@ -308,17 +317,28 @@ func (e *resilienceEnumerator) updateConsumePosition() {
 		// Resume from next sequence after last consumed (Issue 8)
 		if e.lastEntry != nil && e.lastEntry.Sequence > 0 {
 			args.MinSequence = e.lastEntry.Sequence + 1
+			slog.DebugContext(e.ctx, "resilience: updated ConsumeSegment offset",
+				"space", args.Space, "segment", args.Segment, "minSeq", args.MinSequence)
 		}
 	case *api.ConsumeSpace:
-		// For ConsumeSpace, offset tracking is more complex (timestamp-based)
-		// For now, resume from timestamp after last entry
+		// For ConsumeSpace, we need to resume past the last timestamp
+		// Add 1 nanosecond to avoid re-receiving entries with same timestamp
 		if e.lastEntry != nil && e.lastEntry.Timestamp > 0 {
-			args.MinTimestamp = e.lastEntry.Timestamp
+			args.MinTimestamp = e.lastEntry.Timestamp + 1
+			slog.DebugContext(e.ctx, "resilience: updated ConsumeSpace offset",
+				"space", args.Space, "minTimestamp", args.MinTimestamp)
 		}
 	case *api.Consume:
-		// For Consume, we use offset map (complex resume)
-		// For now, keep existing offsets
-		// In a full implementation, would update Offsets map with last seen position per space/segment
+		// For Consume (multi-space), update offset map with last seen position
+		// If Offsets map exists, update the specific space/segment pair
+		if e.lastEntry != nil && args.Offsets != nil {
+			// Create offset key for this space/segment
+			offsetKey := e.lastEntry.Space + "/" + e.lastEntry.Segment
+			// Store sequence after last consumed entry using lexkey encoding
+			args.Offsets[offsetKey] = lexkey.Encode(e.lastEntry.Sequence + 1)
+			slog.DebugContext(e.ctx, "resilience: updated Consume offset",
+				"offsetKey", offsetKey, "sequence", e.lastEntry.Sequence+1)
+		}
 	}
 }
 

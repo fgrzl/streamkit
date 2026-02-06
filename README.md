@@ -58,3 +58,21 @@ func main() {
     }
 }
 ```
+## 📋 Known Limitations (Alpha)
+
+### Client Resilience
+The client includes production-grade resilience features but has documented limitations:
+
+1. **Lock Management**: Per-segment produce locks accumulate over time. Not an issue for typical workloads (<10K segments) but may impact scenarios with millions of unique segments over time.
+
+2. **Deduplication**: While resilience enumerators resume from last consumed position, applications should implement sequence-based deduplication for exactly-once semantics in critical workflows.
+
+3. **Subscription Failures**: Failed subscriptions (after 2 consecutive replay failures) are removed from the client registry. Monitor subscription health using `GetSubscriptionStatus()` before failures occur.
+
+**Recommendations for Alpha Testing:**
+- ✅ Use `client.GetSubscriptionStatus(id)` to monitor subscription health
+- ✅ Implement application-level deduplication using `Entry.Sequence` numbers
+- ✅ Monitor segment churn if creating more than 10K unique segments
+- ✅ Handle subscription failure scenarios explicitly in application code
+
+For detailed changes and future roadmap, see [CHANGELOG.md](CHANGELOG.md).

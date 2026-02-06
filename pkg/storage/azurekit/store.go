@@ -73,10 +73,11 @@ type batchEntry struct {
 
 func NewAzureStore(ctx context.Context, client *HTTPTableClient, cache *cache.ExpiringCache, options *AzureStoreOptions) (*AzureStore, error) {
 	store := &AzureStore{
-		client:         client,
-		cache:          cache,
-		opts:           options,
-		stopWALMonitor: make(chan struct{}),
+		client:              client,
+		cache:               cache,
+		opts:                options,
+		stopWALMonitor:      make(chan struct{}),
+		walRecoveryComplete: make(chan struct{}),
 	}
 
 	// Validate and apply defaults
@@ -100,6 +101,9 @@ func NewAzureStore(ctx context.Context, client *HTTPTableClient, cache *cache.Ex
 	if err := store.recoverWAL(ctx); err != nil {
 		return nil, fmt.Errorf("recover WAL failed: %w", err)
 	}
+
+	// Signal recovery complete before accepting writes
+	close(store.walRecoveryComplete)
 
 	// Start background WAL monitor for orphaned transactions
 	go store.walMonitorLoop(ctx)
@@ -126,12 +130,13 @@ func NewAzureStore(ctx context.Context, client *HTTPTableClient, cache *cache.Ex
 //
 // These invariants are intentionally explicit to avoid accidental correctness regressions.
 type AzureStore struct {
-	client         *HTTPTableClient
-	cache          *cache.ExpiringCache
-	wg             sync.WaitGroup
-	closeOnce      sync.Once
-	opts           *AzureStoreOptions
-	stopWALMonitor chan struct{}
+	client              *HTTPTableClient
+	cache               *cache.ExpiringCache
+	wg                  sync.WaitGroup
+	closeOnce           sync.Once
+	opts                *AzureStoreOptions
+	stopWALMonitor      chan struct{}
+	walRecoveryComplete chan struct{}
 }
 
 func (s *AzureStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
@@ -261,6 +266,14 @@ func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entr
 func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
 	if args == nil || args.Space == "" || args.Segment == "" {
 		return enumerators.Error[*api.SegmentStatus](errors.New(ErrInvalidProduceArgs))
+	}
+
+	// Wait for WAL recovery to complete before accepting writes
+	select {
+	case <-s.walRecoveryComplete:
+		// Recovery complete, proceed
+	case <-ctx.Done():
+		return enumerators.Error[*api.SegmentStatus](ctx.Err())
 	}
 
 	lastEntry, err := s.Peek(ctx, args.Space, args.Segment)
@@ -453,6 +466,15 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 // walMonitorLoop periodically scans for orphaned WAL transactions and recovers them.
 // This handles the case where a process crashes after writing WAL but before fanout completion.
 func (s *AzureStore) walMonitorLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "WAL monitor panicked, restarting",
+				slog.Any("panic", r))
+			time.Sleep(time.Second)
+			go s.walMonitorLoop(ctx) // Restart
+		}
+	}()
+
 	ticker := time.NewTicker(WALMonitorInterval)
 	defer ticker.Stop()
 
@@ -460,11 +482,14 @@ func (s *AzureStore) walMonitorLoop(ctx context.Context) {
 		select {
 		case <-s.stopWALMonitor:
 			return
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 			// Create a timeout context for the recovery operation
-			recoveryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			recoveryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := s.recoverWAL(recoveryCtx); err != nil {
 				slog.WarnContext(ctx, "WAL monitor: recovery failed", "err", err)
+				// Don't crash, retry next interval
 			}
 			cancel()
 		}
@@ -491,6 +516,13 @@ func (s *AzureStore) executeTransaction(ctx context.Context, transaction *txn.Tr
 	if err := s.cleanupWAL(ctx, transactionEntity.PartitionKey, transactionEntity.RowKey); err != nil {
 		return fmt.Errorf("%s: %w", ErrWALCleanup, err)
 	}
+
+	// Invalidate affected caches after successful write
+	peekKey := fmt.Sprintf("peek:%s:%s", transaction.Space, transaction.Segment)
+	s.cache.Delete(peekKey)
+
+	invKey := fmt.Sprintf("inventory:%s:%s", transaction.Space, transaction.Segment)
+	s.cache.Delete(invKey)
 
 	return s.updateInventory(ctx, transaction.Space, transaction.Segment)
 }
@@ -650,7 +682,8 @@ func (s *AzureStore) writeBatch(ctx context.Context, entities []entity) error {
 			return fmt.Errorf("%s: %w", ErrBatchWrite, err)
 		}
 		sz := len(b)
-		if len(cur) > 0 && (curSize+sz) > s.maxTransactionPayloadBytes() {
+		// Check BOTH entity count (max 100) AND payload size (max 4MB)
+		if len(cur) > 0 && (len(cur) >= MaxBatchSize || (curSize+sz) > s.maxTransactionPayloadBytes()) {
 			chunks = append(chunks, cur)
 			cur = nil
 			curSize = 0
@@ -666,6 +699,13 @@ func (s *AzureStore) writeBatch(ctx context.Context, entities []entity) error {
 	// Each chunk can have different partition keys but up to 100 entities total
 	// If all entities share the same partition key, Azure will atomically commit
 	for _, chunk := range chunks {
+		// Check context before processing each chunk
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		// Marshal all entities in this chunk
 		entityData := make([][]byte, len(chunk))
 		for i, en := range chunk {
