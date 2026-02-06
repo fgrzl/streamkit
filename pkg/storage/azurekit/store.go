@@ -976,13 +976,6 @@ func (s *AzureStore) batchSize() int {
 	return BatchSize
 }
 
-func (s *AzureStore) addWorkers() int {
-	if s.opts != nil && s.opts.AddWorkers > 0 {
-		return s.opts.AddWorkers
-	}
-	return AddWorkers
-}
-
 func (s *AzureStore) maxTransactionPayloadBytes() int {
 	if s.opts != nil && s.opts.MaxTransactionPayloadBytes > 0 {
 		return s.opts.MaxTransactionPayloadBytes
@@ -1026,8 +1019,4 @@ func calculateSegmentBounds(ts int64, args *api.ConsumeSegment) struct {
 		bounds.MaxSeq = math.MaxUint64
 	}
 	return bounds
-}
-
-func ptr[T any](v T) *T {
-	return &v
 }

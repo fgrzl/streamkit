@@ -156,9 +156,10 @@ func (c *MuxerBidiStream) Close(err error) {
 				// Continue draining
 			default:
 				// Channel is empty, we can stop
+				goto drainDone
 			}
-			break
 		}
+	drainDone:
 
 		if c.onClose != nil {
 			c.onClose()

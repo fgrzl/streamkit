@@ -140,17 +140,6 @@ func parseBatchResponse(respBody []byte) error {
 	return nil
 }
 
-// shouldRetry determines if a request should be retried based on error type
-func shouldRetry(err error) bool {
-	var azErr *AzureError
-	if errors.As(err, &azErr) {
-		return azErr.IsTransient()
-	}
-	// Also retry on network errors
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
 // getRetryDelay calculates exponential backoff delay with optional Retry-After header
 func getRetryDelay(attempt int, resp *http.Response) time.Duration {
 	// Check Retry-After header for 429 responses
@@ -276,13 +265,6 @@ var (
 			b := &strings.Builder{}
 			b.Grow(512) // Pre-allocate reasonable URL size
 			return b
-		},
-	}
-
-	// hmacKeyPool for reusing HMAC hashers (pre-compute key, clone per-request)
-	hmacKeyPool = sync.Pool{
-		New: func() interface{} {
-			return nil // Will be set per-client
 		},
 	}
 )
@@ -980,7 +962,7 @@ func (p *ListEntitiesPager) Close() error {
 
 // signRequest signs an HTTP request with either SharedKey or Bearer token authentication
 // Based on: https://docs.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
-func (c *HTTPTableClient) signRequest(req *http.Request, method string, body []byte, resourcePath string) {
+func (c *HTTPTableClient) signRequest(req *http.Request, method string, _ []byte, resourcePath string) {
 	// Set standard headers
 	req.Header.Set("x-ms-version", AzureAPIVersion)
 	date := time.Now().UTC().Format(time.RFC1123)

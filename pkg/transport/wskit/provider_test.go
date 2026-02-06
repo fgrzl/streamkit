@@ -88,9 +88,7 @@ func TestBackgroundReconnectRecreatesMuxer(t *testing.T) {
 			ok = true
 			break
 		}
-		select {
-		case <-time.After(100 * time.Millisecond):
-		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Assert

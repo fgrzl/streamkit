@@ -10,8 +10,6 @@
 
 Architectural principle: **Separation of concerns** — logical hierarchy (Space/Segment) is independent from physical storage backends.
 
----
-
 ## Architecture
 
 ```
@@ -26,10 +24,10 @@ pkg/
 ├── transport/    Protocol implementations
 │   ├── inprockit/   In-process (direct channel-based, no serialization overhead)
 │   └── wskit/       WebSocket (multiplexed streams, heartbeat, JWT auth, sessions)
-└── internal/
-    ├── codec/       Binary serialization + Zstd compression
-    ├── cache/       TTL-based expiring cache (sync.Map + cleanup goroutine)
-    └── txn/         Transaction model for consistent multi-entry writes
+internal/
+├── codec/       Binary serialization + Zstd compression
+├── cache/       TTL-based expiring cache (sync.Map + cleanup goroutine)
+└── txn/         Transaction model for consistent multi-entry writes
 ```
 
 > `grpckit/` and `http2kit/` exist as placeholders (`.gitkeep` only) — not yet implemented.
@@ -66,11 +64,13 @@ type Client interface {
 ```
 
 **Creation**:
+
 - `NewClient(provider)` — default 30s handler timeout
 - `NewClientWithHandlerTimeout(provider, timeout)` — custom handler timeout
 - `NewClientWithRetryPolicy(provider, policy)` — custom retry policy
 
 **Resilience** (`resilience.go`):
+
 - `RetryPolicy` with `MaxAttempts`, `InitialBackoff`, `MaxBackoff`, `BackoffMultiplier`
 - `DefaultRetryPolicy()`: 5 attempts, 100ms initial, 5s max, 2x multiplier
 - `AggressiveRetryPolicy()`: 8 attempts, 200ms initial, 15s max, 1.5x multiplier
@@ -80,6 +80,7 @@ type Client interface {
 ### Event Sourcing Layer (`pkg/eskit/`)
 
 Adapter bridging streamkit with `fgrzl/es`:
+
 - `NewStreamStore(client) es.Store` — wraps a streamkit client as an event store
 - `LoadEvents()`: consumes segment entries, unmarshals `polymorphic.Envelope` → `es.DomainEvent`
 - `SaveEvents()`: validates contiguous sequences, produces records via `client.Produce()`
@@ -93,6 +94,7 @@ Adapter bridging streamkit with `fgrzl/es`:
 ### Storage Layer (`pkg/storage/`)
 
 `Store` interface:
+
 ```go
 type Store interface {
     GetSpaces(ctx) Enumerator[string]
@@ -114,6 +116,7 @@ type Store interface {
 ### Transport Layer (`pkg/transport/`)
 
 **`BidiStream`** interface — all transports must implement:
+
 ```go
 type BidiStream interface {
     Encode(any) error
@@ -139,12 +142,12 @@ Server integration: `ConfigureWebSocketServer(router, nodeManager)` mounts `/str
 
 **Transaction** (`internal/txn/`): `Transaction` struct — groups entries with TRX metadata, space/segment, sequence range, and timestamp.
 
----
-
 ## Key Patterns
 
 ### Enumerator Pattern
+
 All list/stream operations return `enumerators.Enumerator[T]` from `fgrzl/enumerators`:
+
 ```go
 entries := client.ConsumeSegment(ctx, storeID, args)
 for entries.MoveNext() {
@@ -152,23 +155,26 @@ for entries.MoveNext() {
     // process entry
 }
 ```
+
 `BidiStreamEnumerator[T]` bridges `BidiStream` decode loops into the enumerator interface.
 
 ### Polymorphic Message Dispatch
+
 All API messages implement `GetDiscriminator() string` (e.g., `"streamkit://api/v1/produce"`). Messages are wrapped in `polymorphic.Envelope` for serialization. Server `Node.Handle()` type-switches on the deserialized content to dispatch operations. All message types must be registered via `polymorphic.RegisterType[T]()`.
 
 ### Factory Pattern
+
 - `StoreFactory.NewStore(ctx, storeID)` — storage backends
 - `NewClient(provider)` — client creation from `BidiStreamProvider`
 - `NewInProcBidiStreamProvider(ctx, nodeManager)` — in-process transport
 - `NewBidiStreamProvider(addr, fetchJWT)` — WebSocket transport
 
 ### Error Classification
+
 `StreamsError` carries a `Code` field:
+
 - `ErrCodeTransient` (1): temporary, retryable (e.g., `ERR_COMMIT_BATCH`, `ERR_SEQ_NUMBER_BEHIND`)
 - `ErrCodePermanent` (2): terminal, do not retry (e.g., `ERR_SEQUENCE_MISMATCH`, `ERR_TRX_ID_MISMATCH`)
-
----
 
 ## Testing
 
@@ -191,6 +197,7 @@ func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
 ```
 
 **Rules**:
+
 - `testify/require` in Arrange (fail fast on setup). `testify/assert` in Assert.
 - Table-driven tests for input variations.
 - All tests must pass with `-race` flag.
@@ -199,13 +206,12 @@ func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
 - `test/setup_data.go`: `TestHarness`, `setupConsumerData()`, `generateRange()`.
 
 **Integration tests** (`test/integration_test.go`) run against three configurations:
+
 - `inproc`: PebbleDB + in-process transport
 - `pebble`: PebbleDB + WebSocket transport
 - `azure`: Azure Table Storage + WebSocket transport (requires Fazure emulator)
 
 **Benchmarks**: `*_bench_test.go` files in `internal/cache/`, `internal/codec/`, `pkg/transport/inprockit/`, `pkg/transport/wskit/`.
-
----
 
 ## Dev Workflows
 
@@ -234,8 +240,6 @@ STREAMKIT_TEST_SMALL=1 go test -race ./test/...
 
 The `compose.yml` runs **Fazure** (Azure Storage emulator) on ports 10000-10002 (Blob/Queue/Table).
 
----
-
 ## Dependencies
 
 **Direct** (from `go.mod`):
@@ -255,11 +259,10 @@ The `compose.yml` runs **Fazure** (Azure Storage emulator) on ports 10000-10002 
 | `stretchr/testify` | Test assertions (`require`/`assert`) |
 | `golang.org/x/net` | WebSocket implementation |
 
----
-
 ## Common Task Patterns
 
 **Adding a new API operation**:
+
 1. Define message type in `pkg/api/messages.go` with `GetDiscriminator()` method
 2. Register it in `pkg/api/registry.go` via `polymorphic.RegisterType[T]()`
 3. Implement in `pkg/storage/` backends (both `pebblekit` and `azurekit`)

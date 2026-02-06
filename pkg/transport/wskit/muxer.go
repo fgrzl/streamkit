@@ -383,13 +383,13 @@ func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 	}
 }
 
-func (m *WebSocketMuxer) handlePing(ctx context.Context) {
+func (m *WebSocketMuxer) handlePing(_ context.Context) {
 	atomic.AddInt64(&m.pingsReceived, 1)
 	_ = m.sendControl(ControlTypePong, uuid.Nil, uuid.Nil, nil)
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 }
 
-func (m *WebSocketMuxer) handlePong(ctx context.Context) {
+func (m *WebSocketMuxer) handlePong(_ context.Context) {
 	ts := timestamp.GetTimestamp()
 	atomic.AddInt64(&m.pongsReceived, 1)
 	atomic.StoreInt64(&m.lastPongUnix, ts)
@@ -423,7 +423,7 @@ func (m *WebSocketMuxer) handleDataMessage(ctx context.Context, msg *MuxerMsg) {
 }
 
 // canAccessOrSendError checks store access and sends an error control frame on denial.
-func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, channelID uuid.UUID) bool {
+func (m *WebSocketMuxer) canAccessOrSendError(_ context.Context, storeID, channelID uuid.UUID) bool {
 	if m.session.CanAccessStore(storeID) {
 		return true
 	}
