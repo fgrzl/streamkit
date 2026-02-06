@@ -665,34 +665,23 @@ func (s *AzureStore) writeBatch(ctx context.Context, entities []entity) error {
 		chunks = append(chunks, cur)
 	}
 
+	// Use native Azure batch API for optimal performance
+	// Each chunk can have different partition keys but up to 100 entities total
+	// If all entities share the same partition key, Azure will atomically commit
 	for _, chunk := range chunks {
-		errCh := make(chan error, len(chunk))
-		sem := make(chan struct{}, s.addWorkers())
-		var wg sync.WaitGroup
-		wg.Add(len(chunk))
-		for i := range chunk {
-			ent := chunk[i]
-			go func(en entity) {
-				defer wg.Done()
-				sem <- struct{}{}
-				b, mErr := marshalEntity(en)
-				if mErr != nil {
-					errCh <- mErr
-					<-sem
-					return
-				}
-				if err := s.client.AddEntity(ctx, b); err != nil {
-					errCh <- err
-				}
-				<-sem
-			}(ent)
-		}
-		wg.Wait()
-		close(errCh)
-		for err := range errCh {
+		// Marshal all entities in this chunk
+		entityData := make([][]byte, len(chunk))
+		for i, en := range chunk {
+			b, err := marshalEntity(en)
 			if err != nil {
 				return fmt.Errorf("%s: %w", ErrBatchWrite, err)
 			}
+			entityData[i] = b
+		}
+
+		// Use native Azure batch operation (1 HTTP request instead of N)
+		if err := s.client.AddEntityBatch(ctx, entityData); err != nil {
+			return fmt.Errorf("%s: %w", ErrBatchWrite, err)
 		}
 	}
 	return nil

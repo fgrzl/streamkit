@@ -2,13 +2,15 @@ package azurekit
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 
 	"github.com/fgrzl/enumerators"
 )
 
 // NewAzureTableEnumerator creates a new enumerator for Azure Table Storage entities
+// Note: This enumerator is one-shot only. Once an error occurs during enumeration,
+// the enumerator becomes permanently failed and will return false from MoveNext().
+// Create a new enumerator if you need to retry after an error.
 func NewAzureTableEnumerator(ctx context.Context, pager *ListEntitiesPager) enumerators.Enumerator[*entity] {
 	return &AzureTableEnumerator{
 		pager:    pager,
@@ -79,20 +81,10 @@ func (a *AzureTableEnumerator) MoveNext() bool {
 		return false
 	}
 
-	// Get current entity and decode Value if needed
-	e := &a.entities[a.index]
-
-	// Decode base64-encoded Value field
-	if len(e.Value) > 0 {
-		// Azure Table Storage returns binary data as base64-encoded strings
-		// Try to decode it
-		str := string(e.Value)
-		decoded, err := base64.StdEncoding.DecodeString(str)
-		if err == nil {
-			e.Value = decoded
-		}
-	}
-
-	a.current = e
+	// Get current entity
+	// Note: Value field is already decoded by JSON unmarshaler.
+	// When JSON sees a base64 string value for a []byte field, it automatically
+	// decodes it. No manual base64 decoding is needed here.
+	a.current = &a.entities[a.index]
 	return true
 }
