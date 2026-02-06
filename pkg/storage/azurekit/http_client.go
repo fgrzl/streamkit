@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -173,7 +174,7 @@ func (c *HTTPTableClient) CreateTable(ctx context.Context) error {
 		return err
 	}
 
-	c.signRequest(req, "POST", []byte{}, "/Tables")
+	c.signRequest(req, "POST", data, "/Tables")
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -359,10 +360,35 @@ func (c *HTTPTableClient) UpsertEntity(ctx context.Context, data []byte, mode st
 		reqBody["Value"] = base64.StdEncoding.EncodeToString(e.Value)
 	}
 
-	body, _ := json.Marshal(reqBody)
+	// Use buffer pool for JSON encoding
+	bodyBuf := bufferPool.Get().(*bytes.Buffer)
+	bodyBuf.Reset()
+	defer bufferPool.Put(bodyBuf)
 
-	reqURL := fmt.Sprintf("%s/%s(PartitionKey='%s',RowKey='%s')",
-		c.endpoint, c.tableName, url.QueryEscape(e.PartitionKey), url.QueryEscape(e.RowKey))
+	if err := json.NewEncoder(bodyBuf).Encode(reqBody); err != nil {
+		return err
+	}
+	body := bodyBuf.Bytes()
+
+	// Build URL efficiently
+	b := builderPool.Get().(*strings.Builder)
+	b.Reset()
+	defer builderPool.Put(b)
+
+	b.WriteString(c.endpoint)
+	b.WriteByte('/')
+	b.WriteString(c.tableName)
+	b.WriteString("(PartitionKey='")
+	b.WriteString(url.QueryEscape(e.PartitionKey))
+	b.WriteString("',RowKey='")
+	b.WriteString(url.QueryEscape(e.RowKey))
+	b.WriteString("')")
+
+	if c.useSAS {
+		b.WriteByte('?')
+		b.WriteString(c.sasToken)
+	}
+	reqURL := b.String()
 
 	method := "PATCH" // Merge (update if exists, insert if not)
 	if mode == "Replace" {
@@ -377,6 +403,7 @@ func (c *HTTPTableClient) UpsertEntity(ctx context.Context, data []byte, mode st
 	c.signRequest(req, method, body, fmt.Sprintf("/%s(PartitionKey='%s',RowKey='%s')",
 		c.tableName, url.QueryEscape(e.PartitionKey), url.QueryEscape(e.RowKey)))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json;odata=nometadata")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -394,8 +421,25 @@ func (c *HTTPTableClient) UpsertEntity(ctx context.Context, data []byte, mode st
 
 // DeleteEntity removes an entity
 func (c *HTTPTableClient) DeleteEntity(ctx context.Context, pk, rk string) error {
-	reqURL := fmt.Sprintf("%s/%s(PartitionKey='%s',RowKey='%s')",
-		c.endpoint, c.tableName, url.QueryEscape(pk), url.QueryEscape(rk))
+	// Build URL efficiently
+	b := builderPool.Get().(*strings.Builder)
+	b.Reset()
+	defer builderPool.Put(b)
+
+	b.WriteString(c.endpoint)
+	b.WriteByte('/')
+	b.WriteString(c.tableName)
+	b.WriteString("(PartitionKey='")
+	b.WriteString(url.QueryEscape(pk))
+	b.WriteString("',RowKey='")
+	b.WriteString(url.QueryEscape(rk))
+	b.WriteString("')")
+
+	if c.useSAS {
+		b.WriteByte('?')
+		b.WriteString(c.sasToken)
+	}
+	reqURL := b.String()
 
 	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
 	if err != nil {
@@ -404,6 +448,7 @@ func (c *HTTPTableClient) DeleteEntity(ctx context.Context, pk, rk string) error
 
 	c.signRequest(req, "DELETE", nil, fmt.Sprintf("/%s(PartitionKey='%s',RowKey='%s')",
 		c.tableName, url.QueryEscape(pk), url.QueryEscape(rk)))
+	req.Header.Set("If-Match", "*") // Delete regardless of etag
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -426,8 +471,27 @@ func (c *HTTPTableClient) DeleteEntity(ctx context.Context, pk, rk string) error
 
 // GetEntity retrieves a single entity
 func (c *HTTPTableClient) GetEntity(ctx context.Context, pk, rk string) ([]byte, error) {
-	reqURL := fmt.Sprintf("%s/%s(PartitionKey='%s',RowKey='%s')?$format=json",
-		c.endpoint, c.tableName, url.QueryEscape(pk), url.QueryEscape(rk))
+	// Build URL efficiently
+	b := builderPool.Get().(*strings.Builder)
+	b.Reset()
+	defer builderPool.Put(b)
+
+	b.WriteString(c.endpoint)
+	b.WriteByte('/')
+	b.WriteString(c.tableName)
+	b.WriteString("(PartitionKey='")
+	b.WriteString(url.QueryEscape(pk))
+	b.WriteString("',RowKey='")
+	b.WriteString(url.QueryEscape(rk))
+	b.WriteString("')")
+
+	if c.useSAS {
+		b.WriteByte('?')
+		b.WriteString(c.sasToken)
+	} else {
+		b.WriteString("?$format=json")
+	}
+	reqURL := b.String()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
@@ -436,6 +500,7 @@ func (c *HTTPTableClient) GetEntity(ctx context.Context, pk, rk string) ([]byte,
 
 	c.signRequest(req, "GET", nil, fmt.Sprintf("/%s(PartitionKey='%s',RowKey='%s')",
 		c.tableName, url.QueryEscape(pk), url.QueryEscape(rk)))
+	req.Header.Set("Accept", "application/json;odata=nometadata")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -495,29 +560,54 @@ type PageResponse struct {
 	NextToken string   `json:"odata.nextLink,omitempty"`
 }
 
-// FetchPage fetches the next page of results
+// FetchPage fetches the next page of results with efficient continuation token handling
 func (p *ListEntitiesPager) FetchPage(ctx context.Context) ([]entity, error) {
+	if p.done {
+		return nil, nil
+	}
+
 	p.ctx = ctx
 
-	// Build query string
-	query := fmt.Sprintf("%s/%s?$format=json&$top=%d", p.client.endpoint, p.client.tableName, p.top)
+	// Build query URL efficiently with strings.Builder
+	b := builderPool.Get().(*strings.Builder)
+	b.Reset()
+	defer builderPool.Put(b)
+
+	b.WriteString(p.client.endpoint)
+	b.WriteByte('/')
+	b.WriteString(p.client.tableName)
+	b.WriteByte('?')
+	b.WriteString("$top=")
+	b.WriteString(strconv.Itoa(int(p.top)))
 
 	if p.filter != "" {
-		query += "&$filter=" + url.QueryEscape(p.filter)
+		b.WriteString("&$filter=")
+		b.WriteString(url.QueryEscape(p.filter))
 	}
 	if p.selectCols != "" {
-		query += "&$select=" + url.QueryEscape(p.selectCols)
+		b.WriteString("&$select=")
+		b.WriteString(url.QueryEscape(p.selectCols))
 	}
 	if p.continuationToken != "" {
-		query += "&" + p.continuationToken
+		b.WriteByte('&')
+		b.WriteString(p.continuationToken)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", query, nil)
+	// Add SAS token if configured
+	if p.client.useSAS {
+		b.WriteByte('&')
+		b.WriteString(p.client.sasToken)
+	}
+
+	reqURL := b.String()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	p.client.signRequest(req, "GET", nil, fmt.Sprintf("/%s", p.client.tableName))
+	req.Header.Set("Accept", "application/json;odata=nometadata")
 
 	resp, err := p.client.httpClient.Do(req)
 	if err != nil {
@@ -530,20 +620,34 @@ func (p *ListEntitiesPager) FetchPage(ctx context.Context) ([]entity, error) {
 		return nil, fmt.Errorf("list entities failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
 
+	// Extract continuation tokens from response headers
+	nextPK := resp.Header.Get("x-ms-continuation-NextPartitionKey")
+	nextRK := resp.Header.Get("x-ms-continuation-NextRowKey")
+
+	if nextPK != "" || nextRK != "" {
+		// Build continuation token query string
+		cb := builderPool.Get().(*strings.Builder)
+		cb.Reset()
+		if nextPK != "" {
+			cb.WriteString("NextPartitionKey=")
+			cb.WriteString(url.QueryEscape(nextPK))
+		}
+		if nextRK != "" {
+			if cb.Len() > 0 {
+				cb.WriteByte('&')
+			}
+			cb.WriteString("NextRowKey=")
+			cb.WriteString(url.QueryEscape(nextRK))
+		}
+		p.continuationToken = cb.String()
+		builderPool.Put(cb)
+	} else {
+		p.done = true
+	}
+
 	var pageResp PageResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pageResp); err != nil {
 		return nil, err
-	}
-
-	// Extract continuation token if present
-	if pageResp.NextToken != "" {
-		// Parse continuation token from odata.nextLink
-		parts := strings.Split(pageResp.NextToken, "?")
-		if len(parts) > 1 {
-			p.continuationToken = parts[1]
-		}
-	} else {
-		p.done = true
 	}
 
 	p.pageIndex++
