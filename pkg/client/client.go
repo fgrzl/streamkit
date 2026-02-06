@@ -134,7 +134,8 @@ func NewClientWithHandlerTimeout(provider api.BidiStreamProvider, handlerTimeout
 	return c
 }
 
-// activeSubscription represents a subscription that can be replayed on reconnection
+// activeSubscription represents a subscription managed by a single goroutine.
+// The goroutine retries indefinitely with exponential backoff until cancelled.
 type activeSubscription struct {
 	id              string               // unique subscription ID
 	storeID         uuid.UUID            // store being subscribed to
@@ -142,15 +143,15 @@ type activeSubscription struct {
 	handler         func(*SegmentStatus) // handler to call for each status update
 	cancel          context.CancelFunc   // cancels the subscription goroutine
 	done            <-chan struct{}      // signals when subscription has stopped
-	isReplaying     atomic.Bool          // prevents duplicate subscription during rapid reconnects
 	lastDelivered   atomic.Int64         // tracks last delivered sequence for offset resumption
-	ctx             context.Context      // subscription's own context (Issue 5)
-	failureCount    atomic.Int32         // tracks consecutive replay failures (Issue 4)
-	status          atomic.Value         // current status: "active"|"replaying"|"failed" (Issue 4)
-	lastError       atomic.Value         // stores last error encountered (Issue 4)
-	handlerTimeouts atomic.Int32         // counts handler timeout occurrences (Issue 7)
+	ctx             context.Context      // subscription's own context
+	failureCount    atomic.Int32         // tracks consecutive failures for observability
+	status          atomic.Value         // current status: "active"|"reconnecting"
+	lastError       atomic.Value         // stores last error encountered
+	handlerTimeouts atomic.Int32         // counts handler timeout occurrences
 	handlerPanics   atomic.Int32         // counts handler panic occurrences
-	activeHandlers  atomic.Int32         // Issue #13: tracks currently running handlers to prevent goroutine leak
+	activeHandlers  atomic.Int32         // tracks currently running handlers to prevent goroutine leak
+	reconnectSignal chan struct{}        // signaled by OnReconnected to wake subscription from backoff
 }
 
 // ClientMetrics provides instrumentation hooks for external observability systems.
@@ -653,13 +654,14 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 
 	// Create the activeSubscription for replaying on reconnect
 	activeSub := &activeSubscription{
-		id:      subID,
-		storeID: storeID,
-		initMsg: initMsg,
-		handler: handler,
-		cancel:  cancel,
-		done:    done,
-		ctx:     ctx, // Store subscription's context (Issue 5)
+		id:              subID,
+		storeID:         storeID,
+		initMsg:         initMsg,
+		handler:         handler,
+		cancel:          cancel,
+		done:            done,
+		ctx:             ctx,
+		reconnectSignal: make(chan struct{}, 1),
 	}
 
 	// Initialize health status
@@ -670,12 +672,8 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 
 	go func() {
 		defer close(done)
+		defer c.unregisterSubscription(subID)
 		defer func() {
-			// Ensure cleanup happens even if handler panics. Do not unregister if subscription
-			// has been marked as failed; leave it for explicit application control.
-			if s, ok := activeSub.status.Load().(string); !ok || s != "failed" {
-				c.unregisterSubscription(subID)
-			}
 			if r := recover(); r != nil {
 				slog.ErrorContext(ctx, "subscription goroutine panic (cleanup completed)", "id", subID, "panic", r)
 			}
@@ -683,7 +681,6 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 
 		backoff := time.Second
 		maxBackoff := 30 * time.Second
-		attempt := 0
 
 		for {
 			// Check for cancellation before attempting (re)subscription
@@ -694,52 +691,43 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			}
 
 			// Create new stream (initial or reconnect)
-			attempt++
 			stream, err := c.provider.CallStream(ctx, storeID, initMsg)
 			if err != nil {
-				slog.WarnContext(ctx, "subscription stream failed, retrying", "attempt", attempt, "backoff", backoff, "err", err)
+				activeSub.failureCount.Add(1)
+				activeSub.lastError.Store(err)
+				activeSub.status.Store("reconnecting")
+				slog.WarnContext(ctx, "subscription stream failed, retrying",
+					"id", subID, "backoff", backoff, "failures", activeSub.failureCount.Load(), "err", err)
 
-				// If we've exhausted retry attempts for this batch, increment failure count
-				if attempt >= 2 {
-					failures := activeSub.failureCount.Add(1)
-					if err != nil {
-						activeSub.lastError.Store(err)
-					}
-					slog.WarnContext(ctx, "client: subscribe attempt limit reached",
-						"id", subID, "consecutive_failures", failures, "err", err)
-
-					if failures >= 2 {
-						activeSub.status.Store("failed")
-						slog.ErrorContext(ctx, "client: subscription marked as failed - max retry failures exceeded",
-							"id", subID, "failures", failures, "err", err)
-						// Keep subscription visible; stop trying
-						return
-					}
-
-					// Reset attempt counter for next batch of retries
-					attempt = 0
-				}
-
+				// Wait with backoff, but wake immediately on provider reconnect signal
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(backoff):
-					// Exponential backoff with max and jitter
+				case <-activeSub.reconnectSignal:
+					// Provider reconnected — retry immediately with reset backoff
+					backoff = time.Second
+				case <-time.After(applyBackoffJitter(backoff)):
 					backoff = backoff * 2
 					if backoff > maxBackoff {
 						backoff = maxBackoff
 					}
-					backoff = applyBackoffJitter(backoff)
-					continue
 				}
+				continue
 			}
 
-			// Reset backoff on successful connection
+			// Connected successfully — reset failure state
+			activeSub.failureCount.Store(0)
+			activeSub.status.Store("active")
 			backoff = time.Second
-			slog.InfoContext(ctx, "subscription stream connected", "attempt", attempt)
+			slog.InfoContext(ctx, "subscription stream connected", "id", subID)
 
-			// Read from stream until it fails
-			streamFailed := false
+			// Drain any stale reconnect signals from before we connected
+			select {
+			case <-activeSub.reconnectSignal:
+			default:
+			}
+
+			// Read from stream until it fails or context is cancelled
 			for {
 				select {
 				case <-ctx.Done():
@@ -750,14 +738,21 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 
 				var status SegmentStatus
 				if err := stream.Decode(&status); err != nil {
-					slog.WarnContext(ctx, "subscription decode failed, reconnecting", "err", err)
+					activeSub.failureCount.Add(1)
+					activeSub.lastError.Store(err)
+					activeSub.status.Store("reconnecting")
+					slog.WarnContext(ctx, "subscription decode failed, reconnecting",
+						"id", subID, "err", err)
 					stream.Close(err)
-					streamFailed = true
-					break // inner loop - will reconnect with backoff
+					break // inner loop → reconnect with backoff
 				}
-				// Issue #13: Simplified handler execution with activeHandlers counter
-				// to prevent unbounded goroutine accumulation on handler timeout.
-				// Skip message if too many handlers are already running.
+
+				// Reset failure count on successful decode
+				if activeSub.failureCount.Load() > 0 {
+					activeSub.failureCount.Store(0)
+				}
+
+				// Limit concurrent handler goroutines to prevent unbounded accumulation
 				const maxActiveHandlers = 10
 				if activeSub.activeHandlers.Load() >= maxActiveHandlers {
 					slog.WarnContext(ctx, "subscription: too many active handlers, skipping message",
@@ -803,19 +798,19 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				}()
 			}
 
-			// Stream failed, apply backoff before reconnecting
-			if streamFailed {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(backoff):
-					backoff = backoff * 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
+			// Stream failed — backoff before reconnecting, but wake on provider reconnect
+			select {
+			case <-ctx.Done():
+				return
+			case <-activeSub.reconnectSignal:
+				// Provider reconnected — retry immediately with reset backoff
+				backoff = time.Second
+			case <-time.After(applyBackoffJitter(backoff)):
+				backoff = backoff * 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
 				}
 			}
-			// Stream failed, loop will retry connection
 		}
 	}()
 
@@ -833,7 +828,8 @@ func (s *subscription) Unsubscribe() {
 }
 
 // OnReconnected is called by the provider when it reconnects after a failure.
-// It replays all active subscriptions to the new muxer connection.
+// It signals all active subscription goroutines to wake from backoff and
+// immediately retry their stream connections.
 // Implements api.ReconnectListener.
 func (c *client) OnReconnected(ctx context.Context, storeID uuid.UUID) error {
 	c.subscriptionsMu.RLock()
@@ -843,148 +839,18 @@ func (c *client) OnReconnected(ctx context.Context, storeID uuid.UUID) error {
 		return nil
 	}
 
-	slog.InfoContext(ctx, "client: replaying subscriptions after reconnect", "count", len(c.subscriptions))
+	slog.InfoContext(ctx, "client: signaling subscriptions to reconnect", "count", len(c.subscriptions))
 
-	// Replay each subscription in a separate goroutine to allow parallel recovery
 	for _, sub := range c.subscriptions {
-		// Skip subscriptions that are already marked as permanently failed
-		if status, ok := sub.status.Load().(string); ok && status == "failed" {
-			slog.DebugContext(ctx, "client: skipping permanently failed subscription", "id", sub.id)
-			continue
+		// Non-blocking send — if the signal buffer is full, the goroutine
+		// is already aware it needs to reconnect.
+		select {
+		case sub.reconnectSignal <- struct{}{}:
+		default:
 		}
-
-		// Only replay if not already replaying (prevents duplicate subscriptions on rapid reconnects)
-		if !sub.isReplaying.CompareAndSwap(false, true) {
-			continue // Already replaying, skip
-		}
-
-		go func(sub *activeSubscription) {
-			defer func() {
-				// Mark replay as complete when done (allows new replays if needed)
-				sub.isReplaying.Store(false)
-				if r := recover(); r != nil {
-					slog.ErrorContext(sub.ctx, "replay goroutine panic", "id", sub.id, "panic", r)
-				}
-			}()
-			slog.DebugContext(sub.ctx, "client: replaying subscription", "id", sub.id)
-			// Re-establish the subscription using subscription's own context (Issue 5)
-			// This ensures unsubscribe properly cancels replay goroutines
-			err := c.replaySubscription(sub.ctx, sub)
-			if err != nil {
-				slog.WarnContext(sub.ctx, "client: subscription replay failed", "id", sub.id, "err", err)
-			}
-		}(sub)
 	}
 
 	return nil
-}
-
-// replaySubscription connects to a subscription and feeds status updates to the handler.
-// This is used when reconnecting to re-establish a subscription after connection loss.
-// Implements panic recovery to ensure failed handlers don't crash the replay.
-// Issues 4, 5: Tracks failures and marks subscriptions as failed after threshold (Issue 4),
-// uses subscription's context for proper lifecycle (Issue 5).
-func (c *client) replaySubscription(ctx context.Context, sub *activeSubscription) error {
-	const maxReplayAttempts = 2 // Limit retry attempts to prevent infinite loops (Issue 4)
-	const maxFailures = 2       // After 2 consecutive failure batches, mark as failed (Issue 4)
-
-	// Use exponential backoff for replay attempts
-	backoff := time.Second
-	maxBackoff := 30 * time.Second
-	attempt := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		attempt++
-		stream, err := c.provider.CallStream(ctx, sub.storeID, sub.initMsg)
-		if err != nil {
-			slog.WarnContext(ctx, "client: replay stream failed, retrying",
-				"id", sub.id, "attempt", attempt, "backoff", backoff, "err", err)
-
-			// If we've exhausted retry attempts, increment failure count (Issue 4)
-			if attempt >= maxReplayAttempts {
-				failures := sub.failureCount.Add(1)
-				if err != nil {
-					sub.lastError.Store(err)
-				}
-				slog.WarnContext(ctx, "client: replay attempt limit reached",
-					"id", sub.id, "consecutive_failures", failures, "err", err)
-
-				// After maxFailures consecutive failures, mark subscription as failed (Issue 4)
-				if failures >= maxFailures {
-					sub.status.Store("failed")
-					slog.ErrorContext(ctx, "client: subscription marked as failed - max retry failures exceeded",
-						"id", sub.id, "failures", failures, "err", err)
-					c.unregisterSubscription(sub.id) // Remove from registry (Issue 6)
-					return fmt.Errorf("subscription failed after %d consecutive reconnect failures: %w", failures, err)
-				}
-
-				// Reset attempt counter for next batch of retries
-				attempt = 0
-			}
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-				backoff = backoff * 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				continue
-			}
-		}
-
-		// Successfully connected, reset failure count and deliver updates (Issue 4)
-		sub.failureCount.Store(0)
-		sub.status.Store("active") // Reset to active on successful connection (Issue 4)
-
-		backoff = time.Second
-		slog.DebugContext(ctx, "client: replay stream connected", "id", sub.id)
-
-		streamFailed := false
-		for {
-			var status SegmentStatus
-			if err := stream.Decode(&status); err != nil {
-				slog.DebugContext(ctx, "client: replay stream decode failed", "id", sub.id, "err", err)
-				stream.Close(err)
-				streamFailed = true
-				break // inner loop, will retry with backoff
-			}
-			// Call handler with panic recovery to prevent replay crashes
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						slog.ErrorContext(ctx, "subscription handler panic during replay", "id", sub.id, "panic", r)
-					}
-				}()
-				// Track last delivered sequence for potential offset resumption
-				if status.LastSequence > 0 {
-					sub.lastDelivered.Store(int64(status.LastSequence))
-				}
-				sub.handler(&status)
-			}()
-		}
-
-		// Stream failed, apply backoff before retrying
-		if streamFailed {
-			sub.status.Store("replaying") // Mark as replaying (Issue 4)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-				backoff = backoff * 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-			}
-		}
-	}
 }
 
 // registerSubscription adds a subscription to the registry for replay on reconnect
@@ -1011,9 +877,9 @@ func (c *client) RemoveSubscription(id string) bool {
 	return existed
 }
 
-// RetryFailedSubscription triggers a manual retry of a subscription previously
-// marked as failed. Returns an error if the subscription does not exist or
-// is not in the "failed" state.
+// RetryFailedSubscription signals a subscription to immediately retry its
+// stream connection. This is useful when external conditions have changed
+// (e.g., server restarted) and the caller wants to bypass the backoff wait.
 func (c *client) RetryFailedSubscription(id string) error {
 	c.subscriptionsMu.RLock()
 	sub, exists := c.subscriptions[id]
@@ -1023,47 +889,37 @@ func (c *client) RetryFailedSubscription(id string) error {
 		return fmt.Errorf("subscription %s not found", id)
 	}
 
-	status, _ := sub.status.Load().(string)
-	if status != "failed" {
-		return fmt.Errorf("subscription %s is not failed (status: %s)", id, status)
+	// Signal the subscription goroutine to wake from backoff and retry immediately
+	select {
+	case sub.reconnectSignal <- struct{}{}:
+	default:
+		// Already signaled
 	}
-
-	// Reset failure state
-	sub.failureCount.Store(0)
-	sub.status.Store("replaying")
-	// atomic.Value does not accept nil in Store; use empty error placeholder
-	sub.lastError.Store(errors.New(""))
-
-	// Trigger replay in background
-	go func() {
-		if err := c.replaySubscription(sub.ctx, sub); err != nil {
-			slog.ErrorContext(sub.ctx, "manual subscription retry failed", "id", id, "err", err)
-		}
-	}()
 
 	return nil
 }
 
-// SubscriptionStatus represents the health status of an active subscription (Issue 4)
+// SubscriptionStatus represents the health status of an active subscription.
 type SubscriptionStatus struct {
 	ID              string // subscription ID
-	Status          string // "active", "replaying", or "failed"
-	FailureCount    int32  // consecutive replay failures
-	LastError       error  // last error encountered during replay
+	Status          string // "active" or "reconnecting"
+	FailureCount    int32  // consecutive reconnection failures (resets on success)
+	LastError       error  // last error encountered during reconnection
 	LastSequence    int64  // last successfully delivered sequence
-	HandlerTimeouts int32  // count of handler timeout occurrences (Issue 7)
+	HandlerTimeouts int32  // count of handler timeout occurrences
 	HandlerPanics   int32  // count of handler panic occurrences
 }
 
 // GetSubscriptionStatus returns the current health status of a subscription.
 //
-// The returned status contains the subscription's current state: "active",
-// "replaying", or "failed". Failed subscriptions are intentionally kept in the
-// registry so that applications can inspect them, retry via `RetryFailedSubscription`,
-// or remove them explicitly with `RemoveSubscription`.
+// The returned status contains the subscription's current state: "active"
+// (stream connected and delivering) or "reconnecting" (stream failed, retrying
+// with exponential backoff). Subscriptions never permanently fail — they keep
+// retrying until explicitly cancelled via Unsubscribe().
 //
-// Failure counts and last errors are tracked to help with observability and
-// operational recovery. Returns nil if the subscription id is not found.
+// Failure counts and last errors are tracked for observability. The failure
+// count resets to zero on each successful reconnection. Returns nil if the
+// subscription id is not found.
 func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
 	c.subscriptionsMu.RLock()
 	sub, exists := c.subscriptions[id]

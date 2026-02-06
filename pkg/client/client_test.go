@@ -184,74 +184,65 @@ func TestSubscriptionTrackedInRegistry(t *testing.T) {
 }
 
 func TestReconnectReplaysSubscriptions(t *testing.T) {
-	// Arrange
-	streamAttempts := 0
-	streamAttemptsMu := sync.Mutex{}
+	// Arrange: stream that fails after first decode, then succeeds on reconnect
+	var streamAttempts atomic.Int32
+	failStream := atomic.Bool{}
+	failStream.Store(true)
 
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			streamAttemptsMu.Lock()
-			streamAttempts++
-			streamAttemptsMu.Unlock()
+			streamAttempts.Add(1)
+
+			if failStream.Load() {
+				return nil, errors.New("connection lost")
+			}
 
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 			stream.decodeFn = func(m any) error {
-				// Send a status with the attempt number
 				if status, ok := m.(*SegmentStatus); ok {
 					*status = SegmentStatus{Segment: "test-segment"}
 				}
-				// Keep stream open
 				<-ctx.Done()
 				return ctx.Err()
 			}
-
 			return stream, nil
 		},
 	}
 
 	c := NewClient(provider)
-
-	// Act: create a subscription
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	storeID := uuid.New()
-	space := "test-space"
-	segment := "test-segment"
 
-	statusCount := 0
-	statusMu := sync.Mutex{}
-	handler := func(status *SegmentStatus) {
-		statusMu.Lock()
-		statusCount++
-		statusMu.Unlock()
-	}
+	handler := func(status *SegmentStatus) {}
 
-	sub, err := c.SubscribeToSegment(ctx, storeID, space, segment, handler)
+	sub, err := c.SubscribeToSegment(ctx, storeID, "test-space", "test-segment", handler)
 	require.NoError(t, err)
 	require.NotNil(t, sub)
 
-	// Give subscription time to connect
-	time.Sleep(100 * time.Millisecond)
+	// Wait for at least one failed attempt
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && streamAttempts.Load() < 2 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	require.GreaterOrEqual(t, streamAttempts.Load(), int32(2), "should have multiple failed attempts")
 
-	streamAttemptsMu.Lock()
-	initialAttempts := streamAttempts
-	streamAttemptsMu.Unlock()
+	// Now allow connections to succeed and signal reconnect
+	attemptsBeforeSignal := streamAttempts.Load()
+	failStream.Store(false)
 
-	// Act: simulate reconnect
 	clientInst := c.(*client)
 	err = clientInst.OnReconnected(ctx, uuid.Nil)
 	require.NoError(t, err)
 
-	// Give replay goroutines time to execute
-	time.Sleep(200 * time.Millisecond)
+	// Wait for the goroutine to reconnect via the signal
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && streamAttempts.Load() <= attemptsBeforeSignal {
+		time.Sleep(50 * time.Millisecond)
+	}
 
-	// Assert: should have created new streams for replay
-	streamAttemptsMu.Lock()
-	finalAttempts := streamAttempts
-	streamAttemptsMu.Unlock()
-
-	assert.Greater(t, finalAttempts, initialAttempts, "should have created new streams on reconnect")
+	assert.Greater(t, streamAttempts.Load(), attemptsBeforeSignal, "reconnect signal should trigger new stream attempt")
 
 	// Cleanup
 	cancel()
@@ -545,8 +536,8 @@ func TestHealthStatusTracking(t *testing.T) {
 	// Assert: subscription should be tracked and queryable
 	assert.NotNil(t, status, "should be able to query subscription status (Issue 4)")
 	if status != nil {
-		// Status should be "active" or "replaying"
-		assert.Contains(t, []string{"active", "replaying"}, status.Status, "status should be active or replaying")
+		// Status should be "active" or "reconnecting"
+		assert.Contains(t, []string{"active", "reconnecting"}, status.Status, "status should be active or reconnecting")
 	}
 
 	// Cleanup
@@ -1382,22 +1373,35 @@ func TestProduceLockEviction(t *testing.T) {
 	assert.LessOrEqual(t, size, MaxProduceLocks)
 }
 
-func TestFailedSubscriptionStaysVisible(t *testing.T) {
+func TestSubscriptionRetriesIndefinitely(t *testing.T) {
+	var attempts atomic.Int32
+
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			attempts.Add(1)
 			return nil, errors.New("can't connect")
 		},
 	}
 
 	c := NewClientWithHandlerTimeout(provider, 50*time.Millisecond).(*client)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	storeID := uuid.New()
 
 	// Register subscription that will fail to connect
-	_, err := c.SubscribeToSegment(ctx, storeID, "space", "segment", func(s *SegmentStatus) {})
+	sub, err := c.SubscribeToSegment(ctx, storeID, "space", "segment", func(s *SegmentStatus) {})
 	require.NoError(t, err)
 
-	// Wait until subscription reaches 'failed' status or timeout
+	// Wait for several retry attempts
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if attempts.Load() >= 3 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Assert: subscription keeps retrying (status is "reconnecting", not "failed")
 	var subID string
 	c.subscriptionsMu.RLock()
 	for id := range c.subscriptions {
@@ -1405,24 +1409,25 @@ func TestFailedSubscriptionStaysVisible(t *testing.T) {
 		break
 	}
 	c.subscriptionsMu.RUnlock()
-	require.NotEmpty(t, subID)
-
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		status := c.GetSubscriptionStatus(subID)
-		if status != nil && status.Status == "failed" {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	require.NotEmpty(t, subID, "subscription should still be registered")
 
 	status := c.GetSubscriptionStatus(subID)
 	require.NotNil(t, status)
-	assert.Equal(t, "failed", status.Status)
+	assert.Equal(t, "reconnecting", status.Status, "subscription should be reconnecting, never permanently failed")
+	assert.GreaterOrEqual(t, status.FailureCount, int32(3), "should have multiple failure attempts")
+	assert.NotNil(t, status.LastError)
 
-	// Try manual retry (this will attempt to reconnect and still fail)
+	// RetryFailedSubscription signals immediate retry (works regardless of status)
 	err = c.RetryFailedSubscription(subID)
 	require.NoError(t, err)
+
+	// Cleanup — Unsubscribe should stop the retry loop
+	sub.Unsubscribe()
+
+	c.subscriptionsMu.RLock()
+	_, stillExists := c.subscriptions[subID]
+	c.subscriptionsMu.RUnlock()
+	assert.False(t, stillExists, "subscription should be unregistered after Unsubscribe")
 }
 
 func TestIsRetryable(t *testing.T) {
