@@ -32,6 +32,7 @@ func (s *webSocketServer) connect(c mux.RouteContext) {
 	session, err := NewServerMuxerSession(c.User())
 	if err != nil {
 		c.Unauthorized()
+		return
 	}
 
 	handler := &webSocketHandler{

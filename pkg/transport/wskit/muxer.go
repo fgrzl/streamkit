@@ -796,8 +796,11 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 			}
 		}
 		if m.conn != nil {
-			// try a final write without locking - best effort
+			// Issue #22: Acquire writeMu lock before final write to prevent concurrent writes.
+			// Without this lock, if a goroutine is still writing, the frame gets corrupted.
+			m.writeMu.Lock()
 			_ = m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypeClose})
+			m.writeMu.Unlock()
 			_ = m.conn.Close()
 		}
 		if m.cancelFunc != nil {

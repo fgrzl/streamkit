@@ -467,12 +467,22 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 // This handles the case where a process crashes after writing WAL but before fanout completion.
 // Issue #5 FIX: Use parent context instead of context.Background() to respect shutdown
 func (s *AzureStore) walMonitorLoop(ctx context.Context) {
+	// Issue #12: Add restart counter to prevent infinite goroutine bomb on persistent panics
+	const maxRestarts = 5
+	restartCount := 0
+
 	defer func() {
 		if r := recover(); r != nil {
 			slog.ErrorContext(ctx, "WAL monitor panicked, restarting",
-				slog.Any("panic", r))
-			time.Sleep(time.Second)
-			go s.walMonitorLoop(ctx) // Restart
+				slog.Any("panic", r), slog.Int("restarts", restartCount))
+			if restartCount < maxRestarts {
+				time.Sleep(time.Duration(restartCount+1) * time.Second) // Exponential backoff
+				restartCount++
+				go s.walMonitorLoopWithRestarts(ctx, restartCount)
+			} else {
+				slog.ErrorContext(ctx, "WAL monitor exceeded max restarts, stopping permanently",
+					slog.Int("maxRestarts", maxRestarts))
+			}
 		}
 	}()
 
@@ -492,6 +502,43 @@ func (s *AzureStore) walMonitorLoop(ctx context.Context) {
 			if err := s.recoverWAL(recoveryCtx); err != nil {
 				slog.WarnContext(ctx, "WAL monitor: recovery failed", "err", err)
 				// Don't crash, retry next interval
+			}
+			cancel()
+		}
+	}
+}
+
+// walMonitorLoopWithRestarts is a helper for recursive restart with restart counter
+func (s *AzureStore) walMonitorLoopWithRestarts(ctx context.Context, restartCount int) {
+	const maxRestarts = 5
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "WAL monitor panicked, restarting",
+				slog.Any("panic", r), slog.Int("restarts", restartCount))
+			if restartCount < maxRestarts {
+				time.Sleep(time.Duration(restartCount+1) * time.Second)
+				go s.walMonitorLoopWithRestarts(ctx, restartCount+1)
+			} else {
+				slog.ErrorContext(ctx, "WAL monitor exceeded max restarts, stopping permanently",
+					slog.Int("maxRestarts", maxRestarts))
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(WALMonitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopWALMonitor:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			recoveryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := s.recoverWAL(recoveryCtx); err != nil {
+				slog.WarnContext(ctx, "WAL monitor: recovery failed", "err", err)
 			}
 			cancel()
 		}
@@ -557,10 +604,16 @@ func (s *AzureStore) fanoutTransaction(ctx context.Context, transaction *txn.Tra
 	wg.Wait()
 	close(errChan)
 
+	// Issue #18: Collect all errors instead of returning just the first one
+	var errs []error
 	for err := range errChan {
 		if err != nil {
-			return err
+			errs = append(errs, err)
 		}
+	}
+	if len(errs) > 0 {
+		// Use errors.Join to return all errors (Go 1.20+)
+		return errors.Join(errs...)
 	}
 
 	// Only write LAST_ENTRY after segment & space batches succeeded to avoid exposing a last

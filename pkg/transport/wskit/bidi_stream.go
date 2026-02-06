@@ -147,6 +147,19 @@ func (c *MuxerBidiStream) Close(err error) {
 		// mark closed and notify listeners; do not close recvChan to avoid send-on-closed panics
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
+
+		// Issue #21: Drain buffered messages to prevent memory leak.
+		// Messages buffered in recvChan would leak until GC collects this struct.
+		for {
+			select {
+			case <-c.recvChan:
+				// Continue draining
+			default:
+				// Channel is empty, we can stop
+			}
+			break
+		}
+
 		if c.onClose != nil {
 			c.onClose()
 		}

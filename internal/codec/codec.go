@@ -269,8 +269,8 @@ func DecodeTransaction(data []byte, t *txn.Transaction) error {
 		}
 
 		entry := &api.Entry{}
-		if DecodeEntry(entryData, entry) != nil {
-			return err
+		if decErr := DecodeEntry(entryData, entry); decErr != nil {
+			return decErr
 		}
 
 		t.Entries[i] = entry
@@ -332,8 +332,14 @@ func readMap(buf *bytes.Reader) (map[string]string, error) {
 	}
 	m := make(map[string]string, length)
 	for i := uint32(0); i < length; i++ {
-		k, _ := readString(buf)
-		v, _ := readString(buf)
+		k, err := readString(buf)
+		if err != nil {
+			return nil, err
+		}
+		v, err := readString(buf)
+		if err != nil {
+			return nil, err
+		}
 		m[k] = v
 	}
 	return m, nil

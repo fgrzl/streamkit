@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -224,13 +225,24 @@ func applyBackoffJitter(d time.Duration) time.Duration {
 // pseudoRand generates a pseudo-random number without importing math/rand
 // Uses simple LCG (Linear Congruential Generator) for jitter
 // Not cryptographically secure, but sufficient for backoff jitter
-var pseudoRandState int64 = time.Now().UnixNano()
+// Issue #8: Use atomic.Int64 to prevent data race on pseudoRandState
+var pseudoRandState atomic.Int64
+
+func init() {
+	pseudoRandState.Store(time.Now().UnixNano())
+}
 
 func pseudoRand(max int64) int64 {
 	if max <= 0 {
 		return 0
 	}
 	// Simple LCG: https://en.wikipedia.org/wiki/Linear_congruential_generator
-	pseudoRandState = (pseudoRandState*1103515245 + 12345) & 0x7fffffff
-	return pseudoRandState % max
+	// Use CAS loop to update state atomically
+	for {
+		old := pseudoRandState.Load()
+		next := (old*1103515245 + 12345) & 0x7fffffff
+		if pseudoRandState.CompareAndSwap(old, next) {
+			return next % max
+		}
+	}
 }

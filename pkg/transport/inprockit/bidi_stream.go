@@ -49,9 +49,8 @@ func NewInProcBidiStreamLoopback() *InProcBidiStream {
 }
 
 func (s *InProcBidiStream) Encode(m any) error {
-	if s.closeErr != nil {
-		return s.closeErr
-	}
+	// Issue #7: Removed closeErr check which had a data race (not synchronized).
+	// The closed channel select below is the correct synchronization mechanism.
 	// For in-process streams we can avoid serialization overhead by sending
 	// the object directly across the channel. The receiver will attempt a
 	// direct type assignment before falling back to JSON decoding when needed.

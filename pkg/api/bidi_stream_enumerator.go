@@ -36,6 +36,10 @@ func (e *BidiStreamEnumerator[T]) MoveNext() bool {
 }
 
 func (e *BidiStreamEnumerator[T]) Current() (T, error) {
+	if e.current == nil {
+		var zero T
+		return zero, e.err
+	}
 	return *e.current, e.err
 }
 

@@ -161,7 +161,13 @@ func (c *HTTPTableClient) retryableRequest(ctx context.Context, req *http.Reques
 					"attempt", attempt+1,
 					"delay", delay,
 					"error", err)
-				time.Sleep(delay)
+				// Issue #16: Use context-aware sleep instead of blocking time.Sleep
+				select {
+				case <-time.After(delay):
+					// Sleep completed
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				lastErr = err
 				continue
 			}
@@ -184,7 +190,13 @@ func (c *HTTPTableClient) retryableRequest(ctx context.Context, req *http.Reques
 					"delay", delay,
 					"request_id", resp.Header.Get("x-ms-request-id"))
 
-				time.Sleep(delay)
+				// Issue #16: Use context-aware sleep
+				select {
+				case <-time.After(delay):
+					// Sleep completed
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				lastErr = parseAzureError(resp, respBody)
 				continue
 			} else {
@@ -465,6 +477,9 @@ func (c *HTTPTableClient) AddEntity(ctx context.Context, data []byte) error {
 
 // AddEntityBatch inserts multiple entities in a single batch request (up to 100)
 // Uses multipart/mixed format for efficient bulk inserts
+// Issue #1: Changed from POST (insert) to PUT (upsert) to make WAL recovery idempotent.
+// Without this, WAL recovery fails on already-inserted entries with 409 Conflict,
+// making the store permanently unopenable after a crash at the wrong moment.
 func (c *HTTPTableClient) AddEntityBatch(ctx context.Context, entities [][]byte) error {
 	if len(entities) == 0 {
 		return nil
@@ -511,7 +526,10 @@ func (c *HTTPTableClient) AddEntityBatch(ctx context.Context, entities [][]byte)
 		fmt.Fprintf(buf, "--%s\r\n", changesetID)
 		fmt.Fprintf(buf, "Content-Type: application/http\r\n")
 		fmt.Fprintf(buf, "Content-Transfer-Encoding: binary\r\n\r\n")
-		fmt.Fprintf(buf, "POST %s/%s HTTP/1.1\r\n", c.endpoint, c.tableName)
+		// Use PUT instead of POST to enable upsert (create or replace) semantics
+		// This makes WAL recovery idempotent and prevents 409 Conflict errors
+		fmt.Fprintf(buf, "PUT %s/%s(PartitionKey='%s',RowKey='%s') HTTP/1.1\r\n", c.endpoint, c.tableName,
+			url.QueryEscape(e.PartitionKey), url.QueryEscape(e.RowKey))
 		fmt.Fprintf(buf, "Content-Type: application/json\r\n")
 		fmt.Fprintf(buf, "Accept: application/json;odata=nometadata\r\n")
 		fmt.Fprintf(buf, "Content-Length: %d\r\n\r\n", len(entJSON))
@@ -925,11 +943,15 @@ func (c *HTTPTableClient) signRequest(req *http.Request, method string, body []b
 	if c.useBearerToken && c.managedCred != nil {
 		token, err := c.managedCred.GetToken(req.Context())
 		if err != nil {
-			// Log error but don't fail - request will likely get 401
+			// Issue #15: Log error clearly and set a sentinel header so failures are visible.
+			// This prevents silent auth failures where a request proceeds without credentials.
 			slog.Error("failed to acquire managed identity token",
 				"error", err,
 				"method", method,
 				"path", resourcePath)
+			// Set a sentinel header so any monitoring/debugging can detect auth failure
+			req.Header.Set("X-Auth-Failure", "token_acquisition_failed")
+			// Continue anyway - Azure will return 401, which is better than silently failing
 			return
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))

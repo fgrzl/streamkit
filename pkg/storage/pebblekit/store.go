@@ -8,7 +8,6 @@ import (
 	"math"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/fgrzl/enumerators"
@@ -25,6 +24,7 @@ type PebbleStore struct {
 	db        *pebble.DB
 	cache     *cache.ExpiringCache
 	closeOnce sync.Once
+	segLocks  sync.Map // Issue #3: Per-segment write serialization to prevent concurrent produce data corruption
 }
 
 // NewPebbleStore creates a new PebbleStore instance at the specified path with caching.
@@ -42,20 +42,15 @@ func NewPebbleStore(path string, cache *cache.ExpiringCache) (*PebbleStore, erro
 
 func (s *PebbleStore) Close() {
 	s.closeOnce.Do(func() {
-		done := make(chan struct{})
-		go func() {
-			if err := s.db.Close(); err != nil {
-				slog.Error("pebble: close failed", "err", err)
-			}
-			close(done)
-		}()
+		// Issue #9: Close the cache to stop the cleanup goroutine
+		s.cache.Close()
 
-		// Wait up to 10 seconds for close to complete
-		select {
-		case <-done:
-			// Clean close
-		case <-time.After(10 * time.Second):
-			slog.Warn("pebble: close timeout after 10s, forcing shutdown")
+		// Issue #10: Call db.Close() synchronously to avoid leaking a goroutine.
+		// PebbleDB's Close() is not cancellable anyway, so wrapping it in a
+		// goroutine with a timeout just hides the problem. If Close() hangs,
+		// we need to know about it rather than silently leak the goroutine.
+		if err := s.db.Close(); err != nil {
+			slog.Error("pebble: close failed", "err", err)
 		}
 	})
 }
@@ -111,14 +106,12 @@ func (s *PebbleStore) calculateTimeBounds(current, min, max int64) struct{ Min, 
 	if min > current {
 		bounds.Min = current
 	}
-	// If max == 0 treat as unbounded (include all future entries). If a specific max was provided
-	// but it's in the future, clamp it to current for safety.
-	if max == 0 {
-		bounds.Max = math.MaxInt64
-	} else if max > current {
+	// Issue #19: Align with Azure backend behavior.
+	// When max == 0 (unspecified) or max > current, clamp to current timestamp.
+	// This ensures both backends return identical results for the same query.
+	bounds.Max = max
+	if max == 0 || max > current {
 		bounds.Max = current
-	} else {
-		bounds.Max = max
 	}
 	return bounds
 }
@@ -149,6 +142,17 @@ func (s *PebbleStore) Produce(ctx context.Context, args *api.Produce, records en
 	if args == nil || args.Space == "" || args.Segment == "" {
 		return enumerators.Error[*api.SegmentStatus](errors.New("invalid produce args"))
 	}
+
+	// Issue #3: Add per-segment write serialization to prevent concurrent produce data corruption.
+	// Without this lock, two concurrent Produce calls to the same segment could:
+	// 1. Both Peek and get the same lastSeq
+	// 2. Both pass validation with sequences N+1, N+2, etc.
+	// 3. Both call batch.Commit, silently overwriting each other's data
+	key := args.Space + ":" + args.Segment
+	lockI, _ := s.segLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := lockI.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
 
 	lastEntry, err := s.Peek(ctx, args.Space, args.Segment)
 	if err != nil {

@@ -252,7 +252,9 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					conn, err = p.dial()
 				}
 				if err == nil {
-					m2 := p.newClientMuxer(context.Background(), NewClientMuxerSession(), conn)
+					// Issue #25: Use reconnectCtx instead of context.Background()
+					// so muxer goroutines can be cancelled during provider shutdown
+					m2 := p.newClientMuxer(p.reconnectCtx, NewClientMuxerSession(), conn)
 					if m2 != nil {
 						p.replaceMuxer(m2)
 						slog.Info("provider: reconnect successful")
