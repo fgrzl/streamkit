@@ -208,7 +208,13 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	}
 
 	// Clean up on bidi close or context cancellation
+	// Issue #6 FIX: Add panic recovery to cleanup goroutine
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(ctx, "subscription cleanup goroutine panic", "err", r)
+			}
+		}()
 		select {
 		case <-bidi.Closed():
 			sub.Unsubscribe()

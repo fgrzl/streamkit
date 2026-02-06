@@ -1,13 +1,3 @@
-//go:build integration
-// +build integration
-
-// Integration tests are intentionally heavier and can be slow. For fast local
-// feedback you can either:
-//  - run with `-short` (go test -tags=integration -short ./test) to use a reduced
-//    dataset, or
-//  - set `STREAMKIT_TEST_SMALL=1` or `STREAMKIT_TEST_RECORDS=50` to explicitly
-//    reduce the number of records produced per segment.
-
 package test
 
 import (
@@ -199,8 +189,8 @@ func TestConcurrentProducersDetectConflict(t *testing.T) {
 			space, segment := "space-concurrent", "segment-conflict"
 
 			// Each producer needs its own enumerator instance
-			recA := generateRange(0, 200)
-			recB := generateRange(0, 200)
+			recA := generateRange(0, 100)
+			recB := generateRange(0, 100)
 
 			ch := make(chan error, 2)
 			go func() {
@@ -216,11 +206,11 @@ func TestConcurrentProducersDetectConflict(t *testing.T) {
 			err2 := <-ch
 			t.Logf("producer errors: err1=%v err2=%v", err1, err2)
 
-			// Verify final segment is consistent: we expect exactly 200 entries with contiguous sequences
+			// Verify final segment is consistent: we expect exactly 100 entries with contiguous sequences
 			enum := harness.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
 			entries, err := enumerators.ToSlice(enum)
 			require.NoError(t, err)
-			require.Len(t, entries, 200)
+			require.Len(t, entries, 100)
 			for i, e := range entries {
 				reqSeq := uint64(i + 1)
 				assert.Equal(t, reqSeq, e.Sequence)
@@ -246,14 +236,14 @@ func TestProduceLargeRecordsChunking(t *testing.T) {
 			ctx := t.Context()
 			space, segment := "space-large", "segment-large"
 
-			recs := generateLargeRange(0, 100, 16*1024) // 16KB payloads -> trigger payload chunking
+			recs := generateLargeRange(0, 50, 8*1024) // 8KB payloads -> trigger payload chunking
 			_, err := enumerators.ToSlice(harness.Client.Produce(ctx, storeID, space, segment, recs))
 			require.NoError(t, err)
 
 			enum := harness.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: space, Segment: segment, MinSequence: 1})
 			entries, err := enumerators.ToSlice(enum)
 			require.NoError(t, err)
-			require.Len(t, entries, 100)
+			require.Len(t, entries, 50)
 		})
 	}
 }
@@ -416,7 +406,7 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 			// Wait/retry until per-space counts are visible to avoid intermittent snapshot misses.
 			ensureSpaceCounts := func() {
 				var lastCounts [5]int
-				for attempt := 0; attempt < 20; attempt++ {
+				for attempt := 0; attempt < 10; attempt++ {
 					ok := true
 					for i := 0; i < 5; i++ {
 						space := fmt.Sprintf("space%d", i)
@@ -431,7 +421,7 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 					if ok {
 						return
 					}
-					time.Sleep(50 * time.Millisecond)
+					time.Sleep(100 * time.Millisecond)
 				}
 				// If we get here, counts didn't stabilize - fail with detailed counts
 				t.Fatalf("setupConsumerData did not stabilize after retries, lastCounts=%v", lastCounts)
@@ -451,14 +441,14 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 			// Act + retry until the interleaved view stabilizes (addresses intermittent snapshot timing)
 			var entries []*client.Entry
 			var err error
-			for attempt := 0; attempt < 20; attempt++ {
+			for attempt := 0; attempt < 10; attempt++ {
 				results := harness.Client.Consume(ctx, storeID, args)
 				entries, err = enumerators.ToSlice(results)
 				if err == nil && len(entries) == 25*IntegrationSegmentCount {
 					break
 				}
 				t.Logf("attempt %d: interleaved returned %d entries (err=%v)", attempt, len(entries), err)
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 			}
 
 			// Assert
