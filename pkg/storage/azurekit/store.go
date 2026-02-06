@@ -31,9 +31,6 @@ const (
 	CacheTTL             time.Duration = time.Second * 97
 	CacheCleanupInterval time.Duration = time.Second * 59
 	ShutdownTimeout      time.Duration = time.Second * 59
-	InitialRetryDelay    time.Duration = time.Millisecond * 100
-	MaxRetryDelay        time.Duration = time.Second * 10
-	MaxRetryAttempts     int           = 5
 	LAST_ENTRY           string        = "LAST_ENTRY"
 	// Max payload size per Azure Table transaction (keep a cushion)
 	MaxTransactionPayloadBytes int = 4*1024*1024 - 256*1024 // ~3.75MB

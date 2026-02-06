@@ -82,9 +82,10 @@ func (a *AzureTableEnumerator) MoveNext() bool {
 	}
 
 	// Get current entity
-	// Note: Value field is already decoded by JSON unmarshaler.
-	// When JSON sees a base64 string value for a []byte field, it automatically
-	// decodes it. No manual base64 decoding is needed here.
+	// Note: Azure Table Storage only base64-encodes Edm.Binary type fields.
+	// We use odata=nometadata so we don't have type information.
+	// The Value field comes as-is from Azure (base64 only for binary columns).
+	// Our data model expects []byte which JSON unmarshals correctly.
 	a.current = &a.entities[a.index]
 	return true
 }

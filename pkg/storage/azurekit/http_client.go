@@ -7,12 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,18 +21,212 @@ import (
 	"time"
 )
 
+const (
+	// HTTP client configuration
+	HTTPRequestTimeout      = 30 * time.Second
+	HTTPConnectTimeout      = 5 * time.Second
+	HTTPKeepAlive           = 30 * time.Second
+	HTTPIdleConnTimeout     = 90 * time.Second
+	HTTPTLSHandshakeTimeout = 10 * time.Second
+	HTTPMaxIdleConns        = 100
+	HTTPMaxIdleConnsPerHost = 100
+
+	// Azure Table Storage limits
+	AzureBatchMaxEntities = 100
+	AzureDefaultPageSize  = 1000
+	AzureAPIVersion       = "2021-06-08"
+
+	// Retry configuration
+	MaxRetryAttempts  = 3
+	InitialRetryDelay = 100 * time.Millisecond
+	MaxRetryDelay     = 10 * time.Second
+
+	// Buffer pool size hint
+	BufferPoolDefaultSize = 32 * 1024 // 32KB
+)
+
+// AzureError represents a structured error from Azure Table Storage
+type AzureError struct {
+	StatusCode int
+	RequestID  string
+	Message    string
+	Code       string
+}
+
+func (e *AzureError) Error() string {
+	return fmt.Sprintf("azure table error: status=%d code=%s request_id=%s message=%s",
+		e.StatusCode, e.Code, e.RequestID, e.Message)
+}
+
+// IsTransient returns true if the error is likely transient and retryable
+func (e *AzureError) IsTransient() bool {
+	return e.StatusCode == http.StatusTooManyRequests ||
+		e.StatusCode == http.StatusServiceUnavailable ||
+		e.StatusCode == http.StatusRequestTimeout
+}
+
+// ErrorResponse represents Azure error response body
+type ErrorResponse struct {
+	ODataError struct {
+		Code    string `json:"code"`
+		Message struct {
+			Lang  string `json:"lang"`
+			Value string `json:"value"`
+		} `json:"message"`
+	} `json:"odata.error"`
+}
+
+// parseAzureError extracts structured error information from Azure response
+func parseAzureError(resp *http.Response, body []byte) *AzureError {
+	azErr := &AzureError{
+		StatusCode: resp.StatusCode,
+		RequestID:  resp.Header.Get("x-ms-request-id"),
+		Message:    string(body),
+	}
+
+	// Try to parse structured error response
+	var errResp ErrorResponse
+	if err := json.Unmarshal(body, &errResp); err == nil {
+		if errResp.ODataError.Code != "" {
+			azErr.Code = errResp.ODataError.Code
+			azErr.Message = errResp.ODataError.Message.Value
+		}
+	}
+
+	return azErr
+}
+
+// shouldRetry determines if a request should be retried based on error type
+func shouldRetry(err error) bool {
+	var azErr *AzureError
+	if errors.As(err, &azErr) {
+		return azErr.IsTransient()
+	}
+	// Also retry on network errors
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// getRetryDelay calculates exponential backoff delay with optional Retry-After header
+func getRetryDelay(attempt int, resp *http.Response) time.Duration {
+	// Check Retry-After header for 429 responses
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			if seconds, err := strconv.Atoi(retryAfter); err == nil {
+				return time.Duration(seconds) * time.Second
+			}
+		}
+	}
+
+	// Exponential backoff
+	delay := InitialRetryDelay * (1 << uint(attempt))
+	if delay > MaxRetryDelay {
+		delay = MaxRetryDelay
+	}
+	return delay
+}
+
+// retryableRequest executes a request with automatic retry on transient failures
+// Returns the response and any non-retryable error
+func (c *HTTPTableClient) retryableRequest(ctx context.Context, req *http.Request, body []byte) (*http.Response, error) {
+	var lastErr error
+	var resp *http.Response
+
+	for attempt := 0; attempt < MaxRetryAttempts; attempt++ {
+		// Check context cancellation before each attempt
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("context cancelled: %w", err)
+		}
+
+		// Clone request for retry (body needs to be re-readable)
+		var reqBody io.Reader
+		if len(body) > 0 {
+			reqBody = bytes.NewReader(body)
+		}
+		retryReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL.String(), reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("create retry request: %w", err)
+		}
+
+		// Copy headers
+		retryReq.Header = req.Header.Clone()
+
+		resp, err = c.httpClient.Do(retryReq)
+		if err != nil {
+			// Network error - check if retryable
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() && attempt < MaxRetryAttempts-1 {
+				delay := getRetryDelay(attempt, nil)
+				slog.Warn("request timeout, retrying",
+					"attempt", attempt+1,
+					"delay", delay,
+					"error", err)
+				time.Sleep(delay)
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+
+		// Check for transient HTTP errors
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusRequestTimeout {
+
+			if attempt < MaxRetryAttempts-1 {
+				delay := getRetryDelay(attempt, resp)
+				respBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				slog.Warn("transient error, retrying",
+					"status", resp.StatusCode,
+					"attempt", attempt+1,
+					"delay", delay,
+					"request_id", resp.Header.Get("x-ms-request-id"))
+
+				time.Sleep(delay)
+				lastErr = parseAzureError(resp, respBody)
+				continue
+			} else {
+				// Final attempt failed
+				respBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				return nil, parseAzureError(resp, respBody)
+			}
+		}
+
+		// Success or non-retryable error
+		return resp, nil
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
+	}
+	return nil, errors.New("max retries exceeded")
+}
+
 var (
-	// bufferPool for reusing byte buffers
+	// bufferPool for reusing byte buffers with pre-allocated capacity
 	bufferPool = sync.Pool{
 		New: func() interface{} {
-			return new(bytes.Buffer)
+			buf := bytes.NewBuffer(make([]byte, 0, BufferPoolDefaultSize))
+			return buf
 		},
 	}
 
-	// builderPool for reusing strings.Builder
+	// builderPool for reusing strings.Builder with pre-allocated capacity
 	builderPool = sync.Pool{
 		New: func() interface{} {
-			return new(strings.Builder)
+			b := &strings.Builder{}
+			b.Grow(512) // Pre-allocate reasonable URL size
+			return b
+		},
+	}
+
+	// hmacKeyPool for reusing HMAC hashers (pre-compute key, clone per-request)
+	hmacKeyPool = sync.Pool{
+		New: func() interface{} {
+			return nil // Will be set per-client
 		},
 	}
 )
@@ -138,18 +333,20 @@ func NewHTTPTableClientWithManagedIdentity(accountName string, managedCred *Mana
 }
 
 // newOptimizedHTTPClient creates an HTTP client optimized for high throughput
+// Disables compression since stored data is already compressed (zstd events)
 func newOptimizedHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: HTTPRequestTimeout,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:        HTTPMaxIdleConns,
+			MaxIdleConnsPerHost: HTTPMaxIdleConnsPerHost,
+			IdleConnTimeout:     HTTPIdleConnTimeout,
+			DisableCompression:  true, // Data is already compressed
 			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
+				Timeout:   HTTPConnectTimeout,
+				KeepAlive: HTTPKeepAlive,
 			}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
+			TLSHandshakeTimeout:   HTTPTLSHandshakeTimeout,
 			ExpectContinueTimeout: 1 * time.Second,
 			ForceAttemptHTTP2:     true,
 		},
@@ -171,7 +368,7 @@ func (c *HTTPTableClient) CreateTable(ctx context.Context) error {
 
 	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint+"/Tables", bytes.NewReader(data))
 	if err != nil {
-		return err
+		return fmt.Errorf("create request: %w", err)
 	}
 
 	c.signRequest(req, "POST", data, "/Tables")
@@ -179,21 +376,22 @@ func (c *HTTPTableClient) CreateTable(ctx context.Context) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Table already exists is acceptable (409)
 	if resp.StatusCode == http.StatusConflict {
+		slog.Debug("table already exists", "table", c.tableName)
 		return nil
 	}
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		var respBody []byte
-		respBody, _ = io.ReadAll(resp.Body)
-		return fmt.Errorf("create table failed: status=%d body=%s", resp.StatusCode, string(respBody))
+		body, _ := io.ReadAll(resp.Body)
+		return parseAzureError(resp, body)
 	}
 
+	slog.Info("table created", "table", c.tableName, "request_id", resp.Header.Get("x-ms-request-id"))
 	return nil
 }
 
@@ -201,7 +399,7 @@ func (c *HTTPTableClient) CreateTable(ctx context.Context) error {
 func (c *HTTPTableClient) AddEntity(ctx context.Context, data []byte) error {
 	var e entity
 	if err := json.Unmarshal(data, &e); err != nil {
-		return err
+		return fmt.Errorf("unmarshal entity: %w", err)
 	}
 
 	reqBody := map[string]interface{}{
@@ -212,19 +410,26 @@ func (c *HTTPTableClient) AddEntity(ctx context.Context, data []byte) error {
 		reqBody["Value"] = base64.StdEncoding.EncodeToString(e.Value)
 	}
 
-	body := bufferPool.Get().(*bytes.Buffer)
-	body.Reset()
-	defer bufferPool.Put(body)
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufferPool.Put(buf)
 
-	enc := json.NewEncoder(body)
+	enc := json.NewEncoder(buf)
 	if err := enc.Encode(reqBody); err != nil {
-		return err
+		return fmt.Errorf("encode entity: %w", err)
 	}
 
 	// Use odata=nometadata for minimal response
 	b := builderPool.Get().(*strings.Builder)
 	b.Reset()
 	defer builderPool.Put(b)
+
+	// Pre-calculate and grow to exact size
+	expectedLen := len(c.endpoint) + 1 + len(c.tableName)
+	if c.useSAS {
+		expectedLen += 1 + len(c.sasToken)
+	}
+	b.Grow(expectedLen)
 
 	b.WriteString(c.endpoint)
 	b.WriteByte('/')
@@ -235,24 +440,24 @@ func (c *HTTPTableClient) AddEntity(ctx context.Context, data []byte) error {
 	}
 	reqURL := b.String()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(body.Bytes()))
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(buf.Bytes()))
 	if err != nil {
-		return err
+		return fmt.Errorf("create request: %w", err)
 	}
 
-	c.signRequest(req, "POST", body.Bytes(), fmt.Sprintf("/%s", c.tableName))
+	c.signRequest(req, "POST", buf.Bytes(), fmt.Sprintf("/%s", c.tableName))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json;odata=nometadata")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("add entity failed: status=%d body=%s", resp.StatusCode, string(body))
+		return parseAzureError(resp, body)
 	}
 
 	return nil
@@ -264,21 +469,28 @@ func (c *HTTPTableClient) AddEntityBatch(ctx context.Context, entities [][]byte)
 	if len(entities) == 0 {
 		return nil
 	}
-	if len(entities) > 100 {
-		return fmt.Errorf("batch size exceeds maximum of 100 entities")
+	if len(entities) > AzureBatchMaxEntities {
+		return fmt.Errorf("batch size %d exceeds maximum of %d entities", len(entities), AzureBatchMaxEntities)
 	}
 
 	// Generate batch and changeset boundaries
 	batchID := fmt.Sprintf("batch_%d", time.Now().UnixNano())
 	changesetID := fmt.Sprintf("changeset_%d", time.Now().UnixNano())
 
-	body := bufferPool.Get().(*bytes.Buffer)
-	body.Reset()
-	defer bufferPool.Put(body)
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufferPool.Put(buf)
+
+	// Pre-allocate buffer with reasonable estimate (reduce allocations)
+	// Rough estimate: 500 bytes per entity + batch overhead
+	estimatedSize := len(entities)*500 + 1024
+	if buf.Cap() < estimatedSize {
+		buf.Grow(estimatedSize - buf.Len())
+	}
 
 	// Build multipart/mixed request
-	fmt.Fprintf(body, "--%s\r\n", batchID)
-	fmt.Fprintf(body, "Content-Type: multipart/mixed; boundary=%s\r\n\r\n", changesetID)
+	fmt.Fprintf(buf, "--%s\r\n", batchID)
+	fmt.Fprintf(buf, "Content-Type: multipart/mixed; boundary=%s\r\n\r\n", changesetID)
 
 	for i, entData := range entities {
 		var e entity
@@ -296,23 +508,29 @@ func (c *HTTPTableClient) AddEntityBatch(ctx context.Context, entities [][]byte)
 
 		entJSON, _ := json.Marshal(reqBody)
 
-		fmt.Fprintf(body, "--%s\r\n", changesetID)
-		fmt.Fprintf(body, "Content-Type: application/http\r\n")
-		fmt.Fprintf(body, "Content-Transfer-Encoding: binary\r\n\r\n")
-		fmt.Fprintf(body, "POST %s/%s HTTP/1.1\r\n", c.endpoint, c.tableName)
-		fmt.Fprintf(body, "Content-Type: application/json\r\n")
-		fmt.Fprintf(body, "Accept: application/json;odata=nometadata\r\n")
-		fmt.Fprintf(body, "Content-Length: %d\r\n\r\n", len(entJSON))
-		body.Write(entJSON)
-		body.WriteString("\r\n")
+		fmt.Fprintf(buf, "--%s\r\n", changesetID)
+		fmt.Fprintf(buf, "Content-Type: application/http\r\n")
+		fmt.Fprintf(buf, "Content-Transfer-Encoding: binary\r\n\r\n")
+		fmt.Fprintf(buf, "POST %s/%s HTTP/1.1\r\n", c.endpoint, c.tableName)
+		fmt.Fprintf(buf, "Content-Type: application/json\r\n")
+		fmt.Fprintf(buf, "Accept: application/json;odata=nometadata\r\n")
+		fmt.Fprintf(buf, "Content-Length: %d\r\n\r\n", len(entJSON))
+		buf.Write(entJSON)
+		buf.WriteString("\r\n")
 	}
 
-	fmt.Fprintf(body, "--%s--\r\n", changesetID)
-	fmt.Fprintf(body, "--%s--\r\n", batchID)
+	fmt.Fprintf(buf, "--%s--\r\n", changesetID)
+	fmt.Fprintf(buf, "--%s--\r\n", batchID)
 
 	b := builderPool.Get().(*strings.Builder)
 	b.Reset()
 	defer builderPool.Put(b)
+
+	expectedLen := len(c.endpoint) + 7 // "/$batch"
+	if c.useSAS {
+		expectedLen += 1 + len(c.sasToken)
+	}
+	b.Grow(expectedLen)
 
 	b.WriteString(c.endpoint)
 	b.WriteString("/$batch")
@@ -322,25 +540,29 @@ func (c *HTTPTableClient) AddEntityBatch(ctx context.Context, entities [][]byte)
 	}
 	reqURL := b.String()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(body.Bytes()))
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(buf.Bytes()))
 	if err != nil {
-		return err
+		return fmt.Errorf("create request: %w", err)
 	}
 
-	c.signRequest(req, "POST", body.Bytes(), "/$batch")
+	c.signRequest(req, "POST", buf.Bytes(), "/$batch")
 	req.Header.Set("Content-Type", fmt.Sprintf("multipart/mixed; boundary=%s", batchID))
 	req.Header.Set("Accept", "application/json;odata=nometadata")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute batch request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("batch failed: status=%d body=%s", resp.StatusCode, string(body))
+		return parseAzureError(resp, body)
 	}
+
+	slog.Debug("batch entities added",
+		"count", len(entities),
+		"request_id", resp.Header.Get("x-ms-request-id"))
 
 	return nil
 }
@@ -375,6 +597,14 @@ func (c *HTTPTableClient) UpsertEntity(ctx context.Context, data []byte, mode st
 	b.Reset()
 	defer builderPool.Put(b)
 
+	// Pre-calculate URL length for efficiency
+	expectedLen := len(c.endpoint) + 1 + len(c.tableName) + 16 + // "(PartitionKey=''"
+		len(e.PartitionKey)*3 + 11 + len(e.RowKey)*3 + 2 // URL escape worst case is 3x
+	if c.useSAS {
+		expectedLen += 1 + len(c.sasToken)
+	}
+	b.Grow(expectedLen)
+
 	b.WriteString(c.endpoint)
 	b.WriteByte('/')
 	b.WriteString(c.tableName)
@@ -407,13 +637,13 @@ func (c *HTTPTableClient) UpsertEntity(ctx context.Context, data []byte, mode st
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upsert entity failed: status=%d body=%s", resp.StatusCode, string(body))
+		return parseAzureError(resp, body)
 	}
 
 	return nil
@@ -452,7 +682,7 @@ func (c *HTTPTableClient) DeleteEntity(ctx context.Context, pk, rk string) error
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -463,7 +693,7 @@ func (c *HTTPTableClient) DeleteEntity(ctx context.Context, pk, rk string) error
 
 	if resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete entity failed: status=%d body=%s", resp.StatusCode, string(body))
+		return parseAzureError(resp, body)
 	}
 
 	return nil
@@ -475,6 +705,13 @@ func (c *HTTPTableClient) GetEntity(ctx context.Context, pk, rk string) ([]byte,
 	b := builderPool.Get().(*strings.Builder)
 	b.Reset()
 	defer builderPool.Put(b)
+
+	expectedLen := len(c.endpoint) + 1 + len(c.tableName) + 16 +
+		len(pk)*3 + 11 + len(rk)*3 + 2 + 13 // "?$format=json"
+	if c.useSAS {
+		expectedLen += 1 + len(c.sasToken)
+	}
+	b.Grow(expectedLen)
 
 	b.WriteString(c.endpoint)
 	b.WriteByte('/')
@@ -504,7 +741,7 @@ func (c *HTTPTableClient) GetEntity(ctx context.Context, pk, rk string) ([]byte,
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -513,14 +750,13 @@ func (c *HTTPTableClient) GetEntity(ctx context.Context, pk, rk string) ([]byte,
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		var respBody []byte
-		respBody, _ = io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get entity failed: status=%d body=%s", resp.StatusCode, string(respBody))
+		body, _ := io.ReadAll(resp.Body)
+		return nil, parseAzureError(resp, body)
 	}
 
 	var result entity
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
 	// Re-encode as JSON byte slice
@@ -542,8 +778,8 @@ type ListEntitiesPager struct {
 
 // NewListEntitiesPager creates a new pager for listing entities
 func (c *HTTPTableClient) NewListEntitiesPager(filter, selectCols string, top int32) *ListEntitiesPager {
-	if top == 0 || top > 1000 {
-		top = 1000
+	if top == 0 || top > AzureDefaultPageSize {
+		top = AzureDefaultPageSize
 	}
 	return &ListEntitiesPager{
 		client:     c,
@@ -572,6 +808,13 @@ func (p *ListEntitiesPager) FetchPage(ctx context.Context) ([]entity, error) {
 	b := builderPool.Get().(*strings.Builder)
 	b.Reset()
 	defer builderPool.Put(b)
+
+	// Pre-allocate with reasonable estimate
+	estimatedLen := len(p.client.endpoint) + 1 + len(p.client.tableName) + 256
+	if p.client.useSAS {
+		estimatedLen += len(p.client.sasToken)
+	}
+	b.Grow(estimatedLen)
 
 	b.WriteString(p.client.endpoint)
 	b.WriteByte('/')
@@ -611,13 +854,13 @@ func (p *ListEntitiesPager) FetchPage(ctx context.Context) ([]entity, error) {
 
 	resp, err := p.client.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list entities failed: status=%d body=%s", resp.StatusCode, string(body))
+		return nil, parseAzureError(resp, body)
 	}
 
 	// Extract continuation tokens from response headers
@@ -668,7 +911,7 @@ func (p *ListEntitiesPager) Close() error {
 // Based on: https://docs.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
 func (c *HTTPTableClient) signRequest(req *http.Request, method string, body []byte, resourcePath string) {
 	// Set standard headers
-	req.Header.Set("x-ms-version", "2021-06-08")
+	req.Header.Set("x-ms-version", AzureAPIVersion)
 	date := time.Now().UTC().Format(time.RFC1123)
 	req.Header.Set("x-ms-date", date)
 
@@ -682,9 +925,11 @@ func (c *HTTPTableClient) signRequest(req *http.Request, method string, body []b
 	if c.useBearerToken && c.managedCred != nil {
 		token, err := c.managedCred.GetToken(req.Context())
 		if err != nil {
-			// Fallback behavior - log error but don't fail the request
-			// The request will likely fail with 401 but that's better than panicking
-			fmt.Fprintf(os.Stderr, "[WARN] Failed to acquire managed identity token: %v\n", err)
+			// Log error but don't fail - request will likely get 401
+			slog.Error("failed to acquire managed identity token",
+				"error", err,
+				"method", method,
+				"path", resourcePath)
 			return
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
