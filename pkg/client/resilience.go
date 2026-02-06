@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 )
@@ -200,13 +201,24 @@ func RetryWithBackoff(ctx context.Context, policy RetryPolicy, fn func(context.C
 			nextBackoff = policy.MaxBackoff
 		}
 
-		// Add ±25% jitter to prevent thundering herd on mass reconnects
-		jitterRange := nextBackoff / 4
-		jitter := time.Duration(pseudoRand(int64(jitterRange * 2)))
-		backoff = nextBackoff - jitterRange + jitter
+		// Apply jitter to prevent thundering herd on mass reconnects
+		backoff = applyBackoffJitter(nextBackoff)
 	}
 
 	return lastErr
+}
+
+// applyBackoffJitter applies ±25% jitter to a duration unless tests disable jitter via STREAMKIT_TEST_NO_JITTER.
+func applyBackoffJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	if os.Getenv("STREAMKIT_TEST_NO_JITTER") != "" {
+		return d
+	}
+	jitterRange := d / 4
+	jitter := time.Duration(pseudoRand(int64(jitterRange * 2)))
+	return d - jitterRange + jitter
 }
 
 // pseudoRand generates a pseudo-random number without importing math/rand

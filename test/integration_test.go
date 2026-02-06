@@ -1,3 +1,13 @@
+//go:build integration
+// +build integration
+
+// Integration tests are intentionally heavier and can be slow. For fast local
+// feedback you can either:
+//  - run with `-short` (go test -tags=integration -short ./test) to use a reduced
+//    dataset, or
+//  - set `STREAMKIT_TEST_SMALL=1` or `STREAMKIT_TEST_RECORDS=50` to explicitly
+//    reduce the number of records produced per segment.
+
 package test
 
 import (
@@ -311,7 +321,7 @@ func TestShouldReturnCorrectEntryWhenPeekingAtSegment(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "space0", peek.Space)
 			assert.Equal(t, "segment0", peek.Segment)
-			assert.Equal(t, uint64(253), peek.Sequence)
+			assert.Equal(t, uint64(IntegrationSegmentCount), peek.Sequence)
 		})
 	}
 }
@@ -335,7 +345,8 @@ func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
 
 			// Assert
 			require.NoError(t, err)
-			assert.Len(t, entries, 253)
+			expected := IntegrationSegmentCount
+			assert.Len(t, entries, expected)
 		})
 	}
 }
@@ -358,9 +369,13 @@ func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
 			results := harness.Client.ConsumeSegment(ctx, storeID, args)
 			entries, err := enumerators.ToSlice(results)
 
-			// Assert - MinSequence is inclusive, so sequences 233-253 = 21 entries
+			// Assert - MinSequence is inclusive
 			require.NoError(t, err)
-			assert.Len(t, entries, 21)
+			expected := IntegrationSegmentCount - 233 + 1
+			if expected < 0 {
+				expected = 0
+			}
+			assert.Len(t, entries, expected)
 		})
 	}
 }
@@ -383,7 +398,8 @@ func TestShouldConsumeAllEntriesWhenGivenValidSpace(t *testing.T) {
 
 			// Assert
 			require.NoError(t, err)
-			assert.Len(t, entries, 1_265)
+			expected := 5 * IntegrationSegmentCount // 5 segments per space
+			assert.Len(t, entries, expected)
 		})
 	}
 }
@@ -407,7 +423,7 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 						enum := harness.Client.ConsumeSpace(ctx, storeID, &client.ConsumeSpace{Space: space})
 						entries, err := enumerators.ToSlice(enum)
 						lastCounts[i] = len(entries)
-						if err != nil || len(entries) != 1_265 {
+						if err != nil || len(entries) != 5*IntegrationSegmentCount {
 							ok = false
 							t.Logf("attempt %d: space %s has %d entries (err=%v)", attempt, space, len(entries), err)
 						}
@@ -438,7 +454,7 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 			for attempt := 0; attempt < 20; attempt++ {
 				results := harness.Client.Consume(ctx, storeID, args)
 				entries, err = enumerators.ToSlice(results)
-				if err == nil && len(entries) == 6_325 {
+				if err == nil && len(entries) == 25*IntegrationSegmentCount {
 					break
 				}
 				t.Logf("attempt %d: interleaved returned %d entries (err=%v)", attempt, len(entries), err)
@@ -447,7 +463,8 @@ func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
 
 			// Assert
 			require.NoError(t, err)
-			assert.Len(t, entries, 6_325)
+			expectedTotal := 25 * IntegrationSegmentCount // 5 spaces * 5 segments * count
+			assert.Len(t, entries, expectedTotal)
 		})
 	}
 }

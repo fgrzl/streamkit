@@ -707,9 +707,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 					if backoff > maxBackoff {
 						backoff = maxBackoff
 					}
-					jitterRange := backoff / 4
-					jitter := time.Duration(pseudoRand(int64(jitterRange * 2)))
-					backoff = backoff - jitterRange + jitter
+					backoff = applyBackoffJitter(backoff)
 					continue
 				}
 			}
