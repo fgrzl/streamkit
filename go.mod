@@ -13,7 +13,7 @@ require (
 	github.com/fgrzl/mux v0.0.1-alpha.166
 	github.com/fgrzl/timestamp v1.0.0-alpha.2
 	github.com/google/uuid v1.6.0
-	github.com/klauspost/compress v1.18.3
+	github.com/klauspost/compress v1.18.4
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/net v0.49.0
 )
