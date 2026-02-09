@@ -29,8 +29,6 @@ import (
 var secret = []byte("top-secret")
 var tester = claims.NewClaimsList("tenant_id", uuid.NewString()).Add("scopes", "streamkit::*")
 
-var storeID = uuid.New()
-
 func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 
 	validator := &jwtkit.HMAC256Validator{
@@ -74,6 +72,10 @@ func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 	addr := "ws://" + url.Host
 	provider := wskit.NewBidiStreamProvider(addr, func() (string, error) { return token, nil })
 	clientInstance := client.NewClient(provider)
+
+	t.Cleanup(func() {
+		clientInstance.Close()
+	})
 
 	harness := &TestHarness{
 		Client: clientInstance,
@@ -124,6 +126,7 @@ func inprockitTestHarness(t *testing.T) *TestHarness {
 	clientInstance := client.NewClient(provider)
 
 	t.Cleanup(func() {
+		clientInstance.Close()
 		nodeManager.Close()
 	})
 
@@ -144,6 +147,7 @@ func TestShouldAllowMultiplexedCallsWhenUsingDifferentSegments(t *testing.T) {
 	for name, h := range configurations() {
 		t.Run("should allow for multiplexed calls "+name, func(t *testing.T) {
 			harness := h(t)
+			storeID := uuid.New()
 			for i := range 3 {
 				// Arrange
 				ctx := t.Context()
@@ -164,6 +168,7 @@ func TestShouldProduceRecordsSuccessfullyWhenGivenValidInput(t *testing.T) {
 	for name, h := range configurations() {
 		t.Run("should produce "+name, func(t *testing.T) {
 			harness := h(t)
+			storeID := uuid.New()
 			for i := range 3 {
 				// Arrange
 				ctx := t.Context()
@@ -185,6 +190,7 @@ func TestConcurrentProducersDetectConflict(t *testing.T) {
 	for name, h := range configurations() {
 		t.Run("concurrent producers "+name, func(t *testing.T) {
 			harness := h(t)
+			storeID := uuid.New()
 			ctx := t.Context()
 			space, segment := "space-concurrent", "segment-conflict"
 
@@ -233,6 +239,7 @@ func TestProduceLargeRecordsChunking(t *testing.T) {
 			if name == "azure" {
 				t.Skip("skipping azure for large produce test due to entity size limits")
 			}
+			storeID := uuid.New()
 			ctx := t.Context()
 			space, segment := "space-large", "segment-large"
 
@@ -248,213 +255,151 @@ func TestProduceLargeRecordsChunking(t *testing.T) {
 	}
 }
 
-func TestShouldReturnAllSpacesWhenRequested(t *testing.T) {
+// TestConsumerOperations groups all tests that require pre-populated consumer data.
+// Data is set up once per configuration (azure/pebble/inproc), then shared across
+// all sub-tests. This avoids redundant Azure setup (25 segments × ~0.7s each = ~17s)
+// which previously caused timeouts when repeated per-test.
+func TestConsumerOperations(t *testing.T) {
 	for name, h := range configurations() {
-		t.Run("should get spaces "+name, func(t *testing.T) {
+		t.Run(name, func(t *testing.T) {
 			harness := h(t)
-			// Arrange
-			ctx := t.Context()
-			setupConsumerData(t, storeID, harness.Client)
-
-			// Act
-			enumerator := harness.Client.GetSpaces(ctx, storeID)
-			spaces, err := enumerators.ToSlice(enumerator)
-
-			// Assert
-			require.NoError(t, err)
-			assert.Len(t, spaces, 5)
-			assert.Equal(t, "space0", spaces[0])
-			assert.Equal(t, "space1", spaces[1])
-			assert.Equal(t, "space2", spaces[2])
-			assert.Equal(t, "space3", spaces[3])
-			assert.Equal(t, "space4", spaces[4])
-		})
-	}
-}
-
-func TestShouldReturnAllSegmentsWhenGivenValidSpace(t *testing.T) {
-	for name, h := range configurations() {
-		t.Run("should get segments "+name, func(t *testing.T) {
-			harness := h(t)
-			// Arrange
-			ctx := t.Context()
-			setupConsumerData(t, storeID, harness.Client)
-
-			// Act
-			enumerator := harness.Client.GetSegments(ctx, storeID, "space0")
-			segments, err := enumerators.ToSlice(enumerator)
-
-			// Assert
-			require.NoError(t, err)
-			assert.Len(t, segments, 5)
-			assert.Equal(t, "segment0", segments[0])
-			assert.Equal(t, "segment1", segments[1])
-			assert.Equal(t, "segment2", segments[2])
-			assert.Equal(t, "segment3", segments[3])
-			assert.Equal(t, "segment4", segments[4])
-		})
-	}
-}
-
-func TestShouldReturnCorrectEntryWhenPeekingAtSegment(t *testing.T) {
-	for name, h := range configurations() {
-		t.Run("should peek "+name, func(t *testing.T) {
-			harness := h(t)
-			// Arrange
-			ctx := t.Context()
-			setupConsumerData(t, storeID, harness.Client)
-
-			// Act
-			peek, err := harness.Client.Peek(ctx, storeID, "space0", "segment0")
-
-			// Assert
-			require.NoError(t, err)
-			assert.Equal(t, "space0", peek.Space)
-			assert.Equal(t, "segment0", peek.Segment)
-			assert.Equal(t, uint64(IntegrationSegmentCount), peek.Sequence)
-		})
-	}
-}
-
-func TestShouldConsumeAllEntriesWhenGivenValidSegment(t *testing.T) {
-	for name, h := range configurations() {
-		t.Run("should consume segment "+name, func(t *testing.T) {
-			harness := h(t)
-			// Arrange
-			ctx := t.Context()
-			setupConsumerData(t, storeID, harness.Client)
-
-			args := &client.ConsumeSegment{
-				Space:   "space0",
-				Segment: "segment0",
-			}
-
-			// Act
-			results := harness.Client.ConsumeSegment(ctx, storeID, args)
-			entries, err := enumerators.ToSlice(results)
-
-			// Assert
-			require.NoError(t, err)
-			expected := IntegrationSegmentCount
-			assert.Len(t, entries, expected)
-		})
-	}
-}
-
-func TestShouldConsumePartialEntriesWhenGivenMinSequence(t *testing.T) {
-	for name, h := range configurations() {
-		t.Run("should consume segment with inclusive min "+name, func(t *testing.T) {
-			harness := h(t)
-			// Arrange
-			ctx := t.Context()
-			setupConsumerData(t, storeID, harness.Client)
-
-			args := &client.ConsumeSegment{
-				Space:       "space0",
-				Segment:     "segment0",
-				MinSequence: 233,
-			}
-
-			// Act
-			results := harness.Client.ConsumeSegment(ctx, storeID, args)
-			entries, err := enumerators.ToSlice(results)
-
-			// Assert - MinSequence is inclusive
-			require.NoError(t, err)
-			expected := IntegrationSegmentCount - 233 + 1
-			if expected < 0 {
-				expected = 0
-			}
-			assert.Len(t, entries, expected)
-		})
-	}
-}
-
-func TestShouldConsumeAllEntriesWhenGivenValidSpace(t *testing.T) {
-	for name, h := range configurations() {
-		t.Run("should consume space "+name, func(t *testing.T) {
-			harness := h(t)
-			// Arrange
-			ctx := t.Context()
-			setupConsumerData(t, storeID, harness.Client)
-
-			args := &client.ConsumeSpace{
-				Space: "space0",
-			}
-
-			// Act
-			results := harness.Client.ConsumeSpace(ctx, storeID, args)
-			entries, err := enumerators.ToSlice(results)
-
-			// Assert
-			require.NoError(t, err)
-			expected := 5 * IntegrationSegmentCount // 5 segments per space
-			assert.Len(t, entries, expected)
-		})
-	}
-}
-
-func TestShouldConsumeInterleavedEntriesWhenGivenMultipleSpaces(t *testing.T) {
-	for name, h := range configurations() {
-		t.Run("should consume interleaved spaces "+name, func(t *testing.T) {
-			harness := h(t)
-			// Arrange
+			storeID := uuid.New()
 			ctx := t.Context()
 
+			// One-time setup for all consumer sub-tests
 			setupConsumerData(t, storeID, harness.Client)
 
-			// Wait/retry until per-space counts are visible to avoid intermittent snapshot misses.
-			ensureSpaceCounts := func() {
-				var lastCounts [5]int
-				for attempt := 0; attempt < 10; attempt++ {
-					ok := true
-					for i := 0; i < 5; i++ {
-						space := fmt.Sprintf("space%d", i)
-						enum := harness.Client.ConsumeSpace(ctx, storeID, &client.ConsumeSpace{Space: space})
-						entries, err := enumerators.ToSlice(enum)
-						lastCounts[i] = len(entries)
-						if err != nil || len(entries) != 5*IntegrationSegmentCount {
-							ok = false
-							t.Logf("attempt %d: space %s has %d entries (err=%v)", attempt, space, len(entries), err)
+			t.Run("should get spaces", func(t *testing.T) {
+				enumerator := harness.Client.GetSpaces(ctx, storeID)
+				spaces, err := enumerators.ToSlice(enumerator)
+
+				require.NoError(t, err)
+				assert.Len(t, spaces, 5)
+				assert.Equal(t, "space0", spaces[0])
+				assert.Equal(t, "space1", spaces[1])
+				assert.Equal(t, "space2", spaces[2])
+				assert.Equal(t, "space3", spaces[3])
+				assert.Equal(t, "space4", spaces[4])
+			})
+
+			t.Run("should get segments", func(t *testing.T) {
+				enumerator := harness.Client.GetSegments(ctx, storeID, "space0")
+				segments, err := enumerators.ToSlice(enumerator)
+
+				require.NoError(t, err)
+				assert.Len(t, segments, 5)
+				assert.Equal(t, "segment0", segments[0])
+				assert.Equal(t, "segment1", segments[1])
+				assert.Equal(t, "segment2", segments[2])
+				assert.Equal(t, "segment3", segments[3])
+				assert.Equal(t, "segment4", segments[4])
+			})
+
+			t.Run("should peek", func(t *testing.T) {
+				peek, err := harness.Client.Peek(ctx, storeID, "space0", "segment0")
+
+				require.NoError(t, err)
+				assert.Equal(t, "space0", peek.Space)
+				assert.Equal(t, "segment0", peek.Segment)
+				assert.Equal(t, uint64(IntegrationSegmentCount), peek.Sequence)
+			})
+
+			t.Run("should consume segment", func(t *testing.T) {
+				args := &client.ConsumeSegment{
+					Space:   "space0",
+					Segment: "segment0",
+				}
+
+				results := harness.Client.ConsumeSegment(ctx, storeID, args)
+				entries, err := enumerators.ToSlice(results)
+
+				require.NoError(t, err)
+				expected := IntegrationSegmentCount
+				assert.Len(t, entries, expected)
+			})
+
+			t.Run("should consume segment with inclusive min", func(t *testing.T) {
+				args := &client.ConsumeSegment{
+					Space:       "space0",
+					Segment:     "segment0",
+					MinSequence: 233,
+				}
+
+				results := harness.Client.ConsumeSegment(ctx, storeID, args)
+				entries, err := enumerators.ToSlice(results)
+
+				require.NoError(t, err)
+				expected := IntegrationSegmentCount - 233 + 1
+				if expected < 0 {
+					expected = 0
+				}
+				assert.Len(t, entries, expected)
+			})
+
+			t.Run("should consume space", func(t *testing.T) {
+				args := &client.ConsumeSpace{
+					Space: "space0",
+				}
+
+				results := harness.Client.ConsumeSpace(ctx, storeID, args)
+				entries, err := enumerators.ToSlice(results)
+
+				require.NoError(t, err)
+				expected := 5 * IntegrationSegmentCount
+				assert.Len(t, entries, expected)
+			})
+
+			t.Run("should consume interleaved spaces", func(t *testing.T) {
+				// Wait/retry until per-space counts are visible to avoid intermittent snapshot misses.
+				ensureSpaceCounts := func() {
+					var lastCounts [5]int
+					for attempt := 0; attempt < 10; attempt++ {
+						ok := true
+						for i := 0; i < 5; i++ {
+							space := fmt.Sprintf("space%d", i)
+							enum := harness.Client.ConsumeSpace(ctx, storeID, &client.ConsumeSpace{Space: space})
+							entries, err := enumerators.ToSlice(enum)
+							lastCounts[i] = len(entries)
+							if err != nil || len(entries) != 5*IntegrationSegmentCount {
+								ok = false
+								t.Logf("attempt %d: space %s has %d entries (err=%v)", attempt, space, len(entries), err)
+							}
 						}
+						if ok {
+							return
+						}
+						time.Sleep(100 * time.Millisecond)
 					}
-					if ok {
-						return
+					t.Fatalf("setupConsumerData did not stabilize after retries, lastCounts=%v", lastCounts)
+				}
+				ensureSpaceCounts()
+
+				args := &client.Consume{
+					Offsets: map[string]lexkey.LexKey{
+						"space0": {},
+						"space1": {},
+						"space2": {},
+						"space3": {},
+						"space4": {},
+					},
+				}
+
+				var entries []*client.Entry
+				var err error
+				for attempt := 0; attempt < 10; attempt++ {
+					results := harness.Client.Consume(ctx, storeID, args)
+					entries, err = enumerators.ToSlice(results)
+					if err == nil && len(entries) == 25*IntegrationSegmentCount {
+						break
 					}
+					t.Logf("attempt %d: interleaved returned %d entries (err=%v)", attempt, len(entries), err)
 					time.Sleep(100 * time.Millisecond)
 				}
-				// If we get here, counts didn't stabilize - fail with detailed counts
-				t.Fatalf("setupConsumerData did not stabilize after retries, lastCounts=%v", lastCounts)
-			}
-			ensureSpaceCounts()
 
-			args := &client.Consume{
-				Offsets: map[string]lexkey.LexKey{
-					"space0": {},
-					"space1": {},
-					"space2": {},
-					"space3": {},
-					"space4": {},
-				},
-			}
-
-			// Act + retry until the interleaved view stabilizes (addresses intermittent snapshot timing)
-			var entries []*client.Entry
-			var err error
-			for attempt := 0; attempt < 10; attempt++ {
-				results := harness.Client.Consume(ctx, storeID, args)
-				entries, err = enumerators.ToSlice(results)
-				if err == nil && len(entries) == 25*IntegrationSegmentCount {
-					break
-				}
-				t.Logf("attempt %d: interleaved returned %d entries (err=%v)", attempt, len(entries), err)
-				time.Sleep(100 * time.Millisecond)
-			}
-
-			// Assert
-			require.NoError(t, err)
-			expectedTotal := 25 * IntegrationSegmentCount // 5 spaces * 5 segments * count
-			assert.Len(t, entries, expectedTotal)
+				require.NoError(t, err)
+				expectedTotal := 25 * IntegrationSegmentCount
+				assert.Len(t, entries, expectedTotal)
+			})
 		})
 	}
 }
