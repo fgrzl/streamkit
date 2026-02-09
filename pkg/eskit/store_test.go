@@ -126,6 +126,9 @@ func (f *fakeClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, 
 func (f *fakeClient) GetSubscriptionStatus(id string) *client.SubscriptionStatus {
 	return &client.SubscriptionStatus{}
 }
+func (f *fakeClient) Close() error {
+	return nil
+}
 
 func TestLoadEventsShouldUnmarshalDomainEvents(t *testing.T) {
 	// Arrange
