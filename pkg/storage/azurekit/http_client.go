@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,7 +75,9 @@ type ErrorResponse struct {
 	} `json:"odata.error"`
 }
 
-// parseAzureError extracts structured error information from Azure response
+// parseAzureError extracts structured error information from Azure response.
+// Supports both JSON (OData) and XML error formats — Azure Table Storage can
+// return either depending on the request headers and error type.
 func parseAzureError(resp *http.Response, body []byte) *AzureError {
 	azErr := &AzureError{
 		StatusCode: resp.StatusCode,
@@ -84,13 +85,57 @@ func parseAzureError(resp *http.Response, body []byte) *AzureError {
 		Message:    string(body),
 	}
 
-	// Try to parse structured error response
+	// Try JSON (OData) format first
 	var errResp ErrorResponse
 	if err := json.Unmarshal(body, &errResp); err == nil {
 		if errResp.ODataError.Code != "" {
 			azErr.Code = errResp.ODataError.Code
 			azErr.Message = errResp.ODataError.Message.Value
+			return azErr
 		}
+	}
+
+	// Fallback: Try XML format (Azure Table Storage returns XML for auth errors)
+	bodyStr := string(body)
+	if strings.Contains(bodyStr, "<m:code>") {
+		if start := strings.Index(bodyStr, "<m:code>"); start != -1 {
+			start += len("<m:code>")
+			if end := strings.Index(bodyStr[start:], "</m:code>"); end != -1 {
+				azErr.Code = bodyStr[start : start+end]
+			}
+		}
+		if start := strings.Index(bodyStr, "<m:message"); start != -1 {
+			if tagEnd := strings.Index(bodyStr[start:], ">"); tagEnd != -1 {
+				msgStart := start + tagEnd + 1
+				if end := strings.Index(bodyStr[msgStart:], "</m:message>"); end != -1 {
+					azErr.Message = bodyStr[msgStart : msgStart+end]
+				}
+			}
+		}
+	}
+
+	// Log additional response headers on auth failures for diagnostics
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		diagHeaders := make(map[string]string)
+		for _, key := range []string{
+			"x-ms-error-code",
+			"x-ms-request-id",
+			"WWW-Authenticate",
+			"x-ms-version",
+			"Server",
+			"Date",
+		} {
+			if v := resp.Header.Get(key); v != "" {
+				diagHeaders[key] = v
+			}
+		}
+		slog.Error("azure auth failure diagnostic",
+			"status", resp.StatusCode,
+			"code", azErr.Code,
+			"request_id", azErr.RequestID,
+			"response_headers", diagHeaders,
+			"message", azErr.Message,
+		)
 	}
 
 	return azErr
@@ -960,12 +1005,21 @@ func (p *ListEntitiesPager) Close() error {
 	return nil
 }
 
-// signRequest signs an HTTP request with either SharedKey or Bearer token authentication
-// Based on: https://docs.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
+// signRequest signs an HTTP request with either Bearer token or SharedKeyLite authentication.
+// For Table service, this uses SharedKeyLite per the Azure SDK and REST API spec:
+// https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key
+//
+// SharedKeyLite StringToSign for Table service:
+//
+//	Date + "\n" + CanonicalizedResource
+//
+// CanonicalizedResource format (Table service / SharedKeyLite):
+//
+//	/<accountName>/<path>[?comp=<value>]
 func (c *HTTPTableClient) signRequest(req *http.Request, method string, _ []byte, resourcePath string) {
 	// Set standard headers
 	req.Header.Set("x-ms-version", AzureAPIVersion)
-	date := time.Now().UTC().Format(time.RFC1123)
+	date := time.Now().UTC().Format(http.TimeFormat)
 	req.Header.Set("x-ms-date", date)
 
 	contentType := req.Header.Get("Content-Type")
@@ -990,67 +1044,238 @@ func (c *HTTPTableClient) signRequest(req *http.Request, method string, _ []byte
 			return
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+		// Diagnostic logging for Bearer token requests
+		tokenPrefix := token
+		if len(tokenPrefix) > 20 {
+			tokenPrefix = tokenPrefix[:20] + "..."
+		}
+		slog.Debug("azure bearer auth: request signed",
+			"method", method,
+			"url", req.URL.String(),
+			"resource_path", resourcePath,
+			"x-ms-version", req.Header.Get("x-ms-version"),
+			"x-ms-date", req.Header.Get("x-ms-date"),
+			"token_prefix", tokenPrefix,
+			"account", c.accountName,
+		)
 		return
 	}
 
-	// Use SharedKey authentication
-	// Extract and normalize x-ms-* headers for signing
-	type header struct {
-		name  string
-		value string
-	}
-	var xmsHeaders []header
+	// Use SharedKeyLite authentication for Table service
+	// Per the Azure REST API spec and the official Azure SDK for Go (aztables),
+	// Table service uses SharedKeyLite with a simplified StringToSign.
+	//
+	// StringToSign = Date + "\n" + CanonicalizedResource
+	// Authorization = "SharedKeyLite " + accountName + ":" + Base64(HMAC-SHA256(key, StringToSign))
 
-	// Collect x-ms-* headers but EXCLUDE x-ms-date (it goes in Date field for string to sign)
-	for headerName, headerValues := range req.Header {
-		lowerName := strings.ToLower(headerName)
-		if strings.HasPrefix(lowerName, "x-ms-") && lowerName != "x-ms-date" {
-			if len(headerValues) > 0 {
-				xmsHeaders = append(xmsHeaders, header{
-					name:  lowerName,
-					value: headerValues[0],
-				})
+	// Build CanonicalizedResource: /<accountName>/<path>[?comp=<value>]
+	canonicalResource := fmt.Sprintf("/%s%s", c.accountName, resourcePath)
+
+	// Include ?comp= query parameter if present (per spec)
+	if req.URL != nil && req.URL.RawQuery != "" {
+		params, err := url.ParseQuery(req.URL.RawQuery)
+		if err == nil {
+			if compVal, ok := params["comp"]; ok && len(compVal) > 0 {
+				canonicalResource += "?comp=" + compVal[0]
 			}
 		}
 	}
 
-	// Sort headers alphabetically by name
-	sort.Slice(xmsHeaders, func(i, j int) bool {
-		return xmsHeaders[i].name < xmsHeaders[j].name
-	})
-
-	// Build canonicalized headers string
-	canonicalHeaders := ""
-	for _, h := range xmsHeaders {
-		canonicalHeaders += fmt.Sprintf("%s:%s\n", h.name, h.value)
-	}
-
-	// Canonicalized resource: /accountname/resourcepath
-	canonicalResource := fmt.Sprintf("/%s%s", c.accountName, resourcePath)
-
-	// Build StringToSign
-	// Format: VERB\nContent-MD5\nContent-Type\nDate\nCanonicalizedHeaders\nCanonicalizedResource
-	// When using x-ms-date, put it in the Date field
-	stringToSign := fmt.Sprintf("%s\n\n%s\n%s\n%s%s",
-		method,
-		contentType,
-		date,
-		canonicalHeaders,
-		canonicalResource,
-	)
+	// Build StringToSign per SharedKeyLite for Table service
+	stringToSign := date + "\n" + canonicalResource
 
 	// Compute HMAC-SHA256
 	decodedKey, err := base64.StdEncoding.DecodeString(c.accountKey)
 	if err != nil {
-		// If key is not base64 encoded, use it as-is
-		decodedKey = []byte(c.accountKey)
+		slog.Error("failed to base64-decode account key for signing",
+			"error", err,
+			"method", method,
+			"path", resourcePath)
+		return
 	}
 
 	h := hmac.New(sha256.New, decodedKey)
 	h.Write([]byte(stringToSign))
 	signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
-	// Set Authorization header
-	authHeader := fmt.Sprintf("SharedKey %s:%s", c.accountName, signature)
+	// Set Authorization header using SharedKeyLite scheme
+	authHeader := fmt.Sprintf("SharedKeyLite %s:%s", c.accountName, signature)
 	req.Header.Set("Authorization", authHeader)
+}
+
+// AuthDiagnostic contains the results of an auth diagnostic check
+type AuthDiagnostic struct {
+	AuthMode        string            `json:"auth_mode"`
+	Endpoint        string            `json:"endpoint"`
+	AccountName     string            `json:"account_name"`
+	TableName       string            `json:"table_name"`
+	TokenAcquired   bool              `json:"token_acquired,omitempty"`
+	TokenError      string            `json:"token_error,omitempty"`
+	TokenAudience   string            `json:"token_audience,omitempty"`
+	TokenIssuer     string            `json:"token_issuer,omitempty"`
+	TokenTenantID   string            `json:"token_tenant_id,omitempty"`
+	TokenObjectID   string            `json:"token_object_id,omitempty"`
+	RequestURL      string            `json:"request_url"`
+	ResponseStatus  int               `json:"response_status"`
+	ResponseHeaders map[string]string `json:"response_headers,omitempty"`
+	ResponseBody    string            `json:"response_body,omitempty"`
+	ErrorCode       string            `json:"error_code,omitempty"`
+	ErrorMessage    string            `json:"error_message,omitempty"`
+	Suggestion      string            `json:"suggestion,omitempty"`
+}
+
+// DiagnoseAuth performs a lightweight diagnostic request to help identify authentication
+// and authorization issues. It attempts to list tables (GET /Tables?$top=1) and returns
+// detailed information about the request, token, response, and suggested fixes.
+func (c *HTTPTableClient) DiagnoseAuth(ctx context.Context) *AuthDiagnostic {
+	diag := &AuthDiagnostic{
+		Endpoint:    c.endpoint,
+		AccountName: c.accountName,
+		TableName:   c.tableName,
+	}
+
+	// Determine auth mode
+	switch {
+	case c.useBearerToken:
+		diag.AuthMode = "ManagedIdentity (Bearer)"
+	case c.useSAS:
+		diag.AuthMode = "SAS"
+	default:
+		diag.AuthMode = "SharedKey"
+	}
+
+	// If using Bearer, inspect the token
+	if c.useBearerToken && c.managedCred != nil {
+		token, err := c.managedCred.GetToken(ctx)
+		if err != nil {
+			diag.TokenAcquired = false
+			diag.TokenError = err.Error()
+			diag.Suggestion = "Token acquisition failed. Check: (1) IDENTITY_ENDPOINT and IDENTITY_HEADER env vars are set, " +
+				"(2) Managed identity is assigned to the Container App, " +
+				"(3) If using user-assigned identity, ManagedIdentityID matches the client ID"
+			return diag
+		}
+		diag.TokenAcquired = true
+
+		// Decode JWT claims for diagnostics
+		claims := decodeJWTClaims(token)
+		if claims != nil {
+			diag.TokenAudience, _ = claims["aud"].(string)
+			diag.TokenIssuer, _ = claims["iss"].(string)
+			diag.TokenTenantID, _ = claims["tid"].(string)
+			diag.TokenObjectID, _ = claims["oid"].(string)
+		}
+	}
+
+	// Make a lightweight diagnostic request: list tables with $top=1
+	reqURL := c.endpoint + "/Tables?$top=1"
+	if c.useSAS {
+		reqURL += "&" + c.sasToken
+	}
+	diag.RequestURL = reqURL
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		diag.ErrorMessage = fmt.Sprintf("failed to create request: %v", err)
+		return diag
+	}
+
+	c.signRequest(req, "GET", nil, "/Tables")
+	req.Header.Set("Accept", "application/json;odata=nometadata")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		diag.ErrorMessage = fmt.Sprintf("request failed (network): %v", err)
+		diag.Suggestion = "Network error. Check: (1) Storage account firewall allows Container App outbound IPs or VNet, " +
+			"(2) Private endpoint DNS is configured correctly, " +
+			"(3) Storage account endpoint is reachable"
+		return diag
+	}
+	defer resp.Body.Close()
+
+	diag.ResponseStatus = resp.StatusCode
+
+	// Capture response headers
+	diag.ResponseHeaders = make(map[string]string)
+	for _, key := range []string{
+		"x-ms-error-code", "x-ms-request-id", "WWW-Authenticate",
+		"x-ms-version", "Server", "Date", "Content-Type",
+	} {
+		if v := resp.Header.Get(key); v != "" {
+			diag.ResponseHeaders[key] = v
+		}
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) > 2048 {
+		diag.ResponseBody = string(body[:2048]) + "...(truncated)"
+	} else {
+		diag.ResponseBody = string(body)
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		diag.Suggestion = "Authentication is working correctly."
+		return diag
+	}
+
+	// Parse error
+	azErr := parseAzureError(resp, body)
+	diag.ErrorCode = azErr.Code
+	diag.ErrorMessage = azErr.Message
+
+	// Provide targeted suggestions based on the error
+	switch {
+	case resp.StatusCode == http.StatusForbidden && (diag.ErrorCode == "AuthenticationFailed" || strings.Contains(diag.ErrorMessage, "AuthenticationFailed")):
+		diag.Suggestion = "Azure rejected the authentication token. Check: " +
+			"(1) Token audience should be 'https://storage.azure.com' (got: '" + diag.TokenAudience + "'), " +
+			"(2) Token tenant ID should match the storage account's tenant, " +
+			"(3) The storage account exists and the endpoint URL is correct"
+
+	case resp.StatusCode == http.StatusForbidden && (diag.ErrorCode == "AuthorizationPermissionMismatch" || strings.Contains(diag.ErrorMessage, "AuthorizationPermissionMismatch")):
+		diag.Suggestion = "Token is valid but identity lacks permissions. Assign 'Storage Table Data Contributor' role to the managed identity " +
+			"(Object ID: " + diag.TokenObjectID + ") on the storage account. " +
+			"Note: 'Contributor' and 'Owner' roles do NOT grant data-plane access."
+
+	case resp.StatusCode == http.StatusForbidden && (diag.ErrorCode == "AuthorizationFailure" || strings.Contains(diag.ErrorMessage, "AuthorizationFailure")):
+		diag.Suggestion = "Authorization failed. This usually means no RBAC role is assigned at all. " +
+			"Assign 'Storage Table Data Contributor' to the managed identity on the storage account."
+
+	case resp.StatusCode == http.StatusUnauthorized:
+		diag.Suggestion = "Request was not authenticated. Check: (1) Bearer token is present in Authorization header, " +
+			"(2) Token has not expired, (3) Storage account allows AAD authentication"
+
+	default:
+		diag.Suggestion = fmt.Sprintf("Unexpected status %d. Check Azure Storage account health and network connectivity.", resp.StatusCode)
+	}
+
+	return diag
+}
+
+// decodeJWTClaims extracts the claims from a JWT token without validation.
+// Returns nil if the token cannot be decoded.
+func decodeJWTClaims(token string) map[string]interface{} {
+	parts := strings.SplitN(token, ".", 3)
+	if len(parts) < 2 {
+		return nil
+	}
+
+	payload := parts[1]
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return nil
+	}
+
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return nil
+	}
+	return claims
 }

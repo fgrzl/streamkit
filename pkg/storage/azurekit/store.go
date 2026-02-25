@@ -95,6 +95,13 @@ func NewAzureStore(ctx context.Context, client *HTTPTableClient, cache *cache.Ex
 	}
 
 	if err := store.createTableIfNotExists(ctx); err != nil {
+		slog.ErrorContext(ctx, "azure store: table creation failed — check auth, RBAC, and network config",
+			"error", err,
+			"account", client.accountName,
+			"endpoint", client.endpoint,
+			"table", client.tableName,
+			"auth_mode_bearer", client.useBearerToken,
+		)
 		return nil, fmt.Errorf("create table if not exists failed: %w", err)
 	}
 
@@ -137,6 +144,13 @@ type AzureStore struct {
 	opts                *AzureStoreOptions
 	stopWALMonitor      chan struct{}
 	walRecoveryComplete chan struct{}
+}
+
+// DiagnoseAuth exposes diagnostic information about the authentication
+// configuration and tests connectivity against Azure Table Storage.
+// Returns a structured diagnostic result with suggestions for fixing issues.
+func (s *AzureStore) DiagnoseAuth(ctx context.Context) *AuthDiagnostic {
+	return s.client.DiagnoseAuth(ctx)
 }
 
 func (s *AzureStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {

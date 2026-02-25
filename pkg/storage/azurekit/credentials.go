@@ -2,6 +2,7 @@ package azurekit
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -179,10 +181,78 @@ func (c *ManagedIdentityCredential) GetToken(ctx context.Context) (string, error
 	c.tokenExpiry = time.Unix(expiresOn, 0)
 	c.token = tokenResp.AccessToken
 
+	// Log JWT claims for diagnostic purposes (audience, issuer, tenant, identity)
+	logJWTClaims(c.token, endpointType)
+
 	slog.Debug("successfully refreshed managed identity token",
 		"expires_at", c.tokenExpiry,
 		"request_id", requestID,
 		"endpoint_type", endpointType)
 
 	return c.token, nil
+}
+
+// logJWTClaims decodes and logs key claims from a JWT access token for diagnostic purposes.
+// This helps identify misconfigurations such as wrong audience, tenant, or identity.
+func logJWTClaims(token, endpointType string) {
+	parts := strings.SplitN(token, ".", 3)
+	if len(parts) < 2 {
+		slog.Warn("managed identity: token is not a valid JWT (cannot inspect claims)",
+			"endpoint_type", endpointType)
+		return
+	}
+
+	// JWT payload is base64url-encoded (no padding)
+	payload := parts[1]
+	// Add padding if necessary
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		slog.Warn("managed identity: failed to decode JWT payload",
+			"error", err,
+			"endpoint_type", endpointType)
+		return
+	}
+
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		slog.Warn("managed identity: failed to parse JWT claims",
+			"error", err,
+			"endpoint_type", endpointType)
+		return
+	}
+
+	// Extract diagnostic fields — these reveal the most common misconfigurations
+	aud, _ := claims["aud"].(string)
+	iss, _ := claims["iss"].(string)
+	oid, _ := claims["oid"].(string)
+	sub, _ := claims["sub"].(string)
+	tid, _ := claims["tid"].(string)
+	appid, _ := claims["appid"].(string)
+
+	slog.Info("managed identity: JWT claims (diagnostic)",
+		"aud", aud,
+		"iss", iss,
+		"oid", oid,
+		"sub", sub,
+		"tid", tid,
+		"appid", appid,
+		"endpoint_type", endpointType,
+	)
+
+	// Warn about common misconfigurations
+	expectedAud := "https://storage.azure.com"
+	if aud != "" && aud != expectedAud && aud != expectedAud+"/" {
+		slog.Error("managed identity: TOKEN AUDIENCE MISMATCH — this will cause 403 AuthenticationFailed",
+			"got_aud", aud,
+			"expected_aud", expectedAud,
+			"endpoint_type", endpointType,
+		)
+	}
 }
