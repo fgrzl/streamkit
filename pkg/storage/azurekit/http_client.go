@@ -334,6 +334,11 @@ func NewHTTPTableClient(accountName, accountKey, tableName string, allowInsecure
 		return nil, fmt.Errorf("account name and key are required")
 	}
 
+	// Validate that the account key is valid base64 (required for HMAC-SHA256 signing)
+	if _, err := base64.StdEncoding.DecodeString(accountKey); err != nil {
+		return nil, fmt.Errorf("account key must be valid base64: %w", err)
+	}
+
 	var endpoint string
 	if customEndpoint != "" {
 		endpoint = customEndpoint
@@ -456,6 +461,7 @@ func (c *HTTPTableClient) CreateTable(ctx context.Context) error {
 
 	c.signRequest(req, "POST", data, "/Tables")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json;odata=nometadata")
 
 	resp, err := c.retryableRequest(ctx, req, data)
 	if err != nil {
@@ -1062,6 +1068,11 @@ func (c *HTTPTableClient) signRequest(req *http.Request, method string, _ []byte
 		return
 	}
 
+	// SAS tokens do not require signing; the token is appended to the URL as a query parameter
+	if c.useSAS {
+		return
+	}
+
 	// Use SharedKeyLite authentication for Table service
 	// Per the Azure REST API spec and the official Azure SDK for Go (aztables),
 	// Table service uses SharedKeyLite with a simplified StringToSign.
@@ -1086,12 +1097,17 @@ func (c *HTTPTableClient) signRequest(req *http.Request, method string, _ []byte
 	stringToSign := date + "\n" + canonicalResource
 
 	// Compute HMAC-SHA256
+	// Note: Account key validity is verified in NewHTTPTableClient,
+	// so this should never fail in normal operation.
 	decodedKey, err := base64.StdEncoding.DecodeString(c.accountKey)
 	if err != nil {
-		slog.Error("failed to base64-decode account key for signing",
+		// This is a programming error (invalid key made it past factory validation)
+		slog.Error("FATAL: account key failed to decode despite factory validation",
 			"error", err,
 			"method", method,
-			"path", resourcePath)
+			"path", resourcePath,
+			"account", c.accountName)
+		req.Header.Set("X-Auth-Failure", "key_decode_error")
 		return
 	}
 
