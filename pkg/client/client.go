@@ -110,14 +110,16 @@ func NewClient(provider api.BidiStreamProvider) Client {
 func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolicy) Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &client{
-		provider:        provider,
-		policy:          policy,
-		handlerTimeout:  30 * time.Second,
-		subscriptions:   make(map[string]*activeSubscription),
-		reconnectQueue:  make(chan []string, 100), // large buffer to prevent signal loss
-		reconnectCtx:    ctx,
-		reconnectCancel: cancel,
-		produceLocks:    make(map[string]*sync.Mutex),
+		provider:              provider,
+		policy:                policy,
+		handlerTimeout:        30 * time.Second,
+		handlerQueueSize:      100,
+		maxConcurrentHandlers: 50,
+		subscriptions:         make(map[string]*activeSubscription),
+		reconnectQueue:        make(chan []string, 100), // large buffer to prevent signal loss
+		reconnectCtx:          ctx,
+		reconnectCancel:       cancel,
+		produceLocks:          make(map[string]*sync.Mutex),
 	}
 	c.startReconnectDispatcher()
 	provider.RegisterReconnectListener(c)
@@ -131,14 +133,16 @@ func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolic
 func NewClientWithHandlerTimeout(provider api.BidiStreamProvider, handlerTimeout time.Duration) Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &client{
-		provider:        provider,
-		policy:          DefaultRetryPolicy(),
-		handlerTimeout:  handlerTimeout,
-		subscriptions:   make(map[string]*activeSubscription),
-		reconnectQueue:  make(chan []string, 100), // large buffer to prevent signal loss
-		reconnectCtx:    ctx,
-		reconnectCancel: cancel,
-		produceLocks:    make(map[string]*sync.Mutex), // Issue 9: Initialize for Peek+Produce atomicity
+		provider:              provider,
+		policy:                DefaultRetryPolicy(),
+		handlerTimeout:        handlerTimeout,
+		handlerQueueSize:      100,
+		maxConcurrentHandlers: 50,
+		subscriptions:         make(map[string]*activeSubscription),
+		reconnectQueue:        make(chan []string, 100), // large buffer to prevent signal loss
+		reconnectCtx:          ctx,
+		reconnectCancel:       cancel,
+		produceLocks:          make(map[string]*sync.Mutex), // Issue 9: Initialize for Peek+Produce atomicity
 	}
 
 	c.startReconnectDispatcher()
@@ -165,7 +169,7 @@ type activeSubscription struct {
 	lastError       atomic.Value         // stores last error encountered
 	handlerTimeouts atomic.Int32         // counts handler timeout occurrences
 	handlerPanics   atomic.Int32         // counts handler panic occurrences
-	activeHandlers  atomic.Int32         // tracks currently running handlers to prevent goroutine leak
+	handlerCh       chan SegmentStatus   // buffered dispatch channel for non-blocking handler delivery
 	reconnectSignal chan struct{}        // signaled by OnReconnected to wake subscription from backoff
 }
 
@@ -180,9 +184,11 @@ type ClientMetrics interface {
 }
 
 type client struct {
-	provider       api.BidiStreamProvider
-	policy         RetryPolicy
-	handlerTimeout time.Duration // max time allowed for handler to execute (Issue 7)
+	provider              api.BidiStreamProvider
+	policy                RetryPolicy
+	handlerTimeout        time.Duration // max time allowed for handler to execute (Issue 7)
+	handlerQueueSize      int           // buffer size for per-subscription handler dispatch channel
+	maxConcurrentHandlers int           // worker goroutines per subscription for handler execution
 
 	// subscription registry for tracking active subscriptions
 	subscriptionsMu sync.RWMutex
@@ -683,6 +689,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 		cancel:          cancel,
 		done:            done,
 		ctx:             ctx,
+		handlerCh:       make(chan SegmentStatus, c.handlerQueueSize),
 		reconnectSignal: make(chan struct{}, 1),
 	}
 
@@ -700,6 +707,22 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				slog.ErrorContext(ctx, "subscription goroutine panic (cleanup completed)", "id", subID, "panic", r)
 			}
 		}()
+
+		// Start a fixed pool of worker goroutines that process handler dispatches.
+		// Workers survive stream reconnects and exit when handlerCh is closed.
+		var workerWg sync.WaitGroup
+		for i := 0; i < c.maxConcurrentHandlers; i++ {
+			workerWg.Add(1)
+			go func() {
+				defer workerWg.Done()
+				for status := range activeSub.handlerCh {
+					c.runHandler(ctx, activeSub, subID, handler, &status)
+				}
+			}()
+		}
+		// Defer order matters (LIFO): close channel first so workers exit, then wait for them.
+		defer workerWg.Wait()
+		defer close(activeSub.handlerCh)
 
 		backoff := time.Second
 		maxBackoff := 30 * time.Second
@@ -774,50 +797,13 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 					activeSub.failureCount.Store(0)
 				}
 
-				// Limit concurrent handler goroutines to prevent unbounded accumulation
-				const maxActiveHandlers = 10
-				if activeSub.activeHandlers.Load() >= maxActiveHandlers {
-					slog.WarnContext(ctx, "subscription: too many active handlers, skipping message",
-						"id", subID, "activeHandlers", activeSub.activeHandlers.Load())
-					continue
+				// Non-blocking dispatch to worker pool via buffered channel
+				select {
+				case activeSub.handlerCh <- status:
+				default:
+					slog.WarnContext(ctx, "subscription: handler queue full, skipping message",
+						"id", subID)
 				}
-
-				activeSub.activeHandlers.Add(1)
-				go func() {
-					defer activeSub.activeHandlers.Add(-1)
-
-					// Track last delivered sequence for offset tracking
-					if status.LastSequence > 0 {
-						activeSub.lastDelivered.Store(int64(status.LastSequence))
-					}
-
-					// Create timeout context for handler execution
-					handlerCtx, cancel := context.WithTimeout(ctx, c.handlerTimeout)
-					defer cancel()
-
-					// Run handler in a goroutine so we can enforce the timeout.
-					// The recover() must be inside this goroutine since panics
-					// don't propagate across goroutine boundaries.
-					done := make(chan struct{})
-					go func() {
-						defer close(done)
-						defer func() {
-							if r := recover(); r != nil {
-								activeSub.handlerPanics.Add(1)
-								slog.ErrorContext(ctx, "subscription handler panic", "id", subID, "panic", r)
-							}
-						}()
-						handler(&status)
-					}()
-
-					select {
-					case <-done:
-						// Handler completed (or panicked and recovered)
-					case <-handlerCtx.Done():
-						activeSub.handlerTimeouts.Add(1)
-						slog.WarnContext(ctx, "subscription handler exceeded timeout", "id", subID, "timeout", c.handlerTimeout)
-					}
-				}()
 			}
 
 			// Stream failed — backoff before reconnecting, but wake on provider reconnect
@@ -837,6 +823,35 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 	}()
 
 	return &subscription{cancel: cancel, done: done}, nil
+}
+
+// runHandler executes a subscription handler with timeout and panic recovery.
+func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID string, handler func(*SegmentStatus), status *SegmentStatus) {
+	if status.LastSequence > 0 {
+		sub.lastDelivered.Store(int64(status.LastSequence))
+	}
+
+	handlerCtx, cancel := context.WithTimeout(ctx, c.handlerTimeout)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				sub.handlerPanics.Add(1)
+				slog.ErrorContext(ctx, "subscription handler panic", "id", subID, "panic", r)
+			}
+		}()
+		handler(status)
+	}()
+
+	select {
+	case <-done:
+	case <-handlerCtx.Done():
+		sub.handlerTimeouts.Add(1)
+		slog.WarnContext(ctx, "subscription handler exceeded timeout", "id", subID, "timeout", c.handlerTimeout)
+	}
 }
 
 type subscription struct {
