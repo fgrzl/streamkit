@@ -113,7 +113,7 @@ func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolic
 		provider:              provider,
 		policy:                policy,
 		handlerTimeout:        30 * time.Second,
-		handlerQueueSize:      100,
+		handlerQueueSize:      500,
 		maxConcurrentHandlers: 50,
 		subscriptions:         make(map[string]*activeSubscription),
 		reconnectQueue:        make(chan []string, 100), // large buffer to prevent signal loss
@@ -136,7 +136,7 @@ func NewClientWithHandlerTimeout(provider api.BidiStreamProvider, handlerTimeout
 		provider:              provider,
 		policy:                DefaultRetryPolicy(),
 		handlerTimeout:        handlerTimeout,
-		handlerQueueSize:      100,
+		handlerQueueSize:      500,
 		maxConcurrentHandlers: 50,
 		subscriptions:         make(map[string]*activeSubscription),
 		reconnectQueue:        make(chan []string, 100), // large buffer to prevent signal loss
@@ -801,7 +801,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				select {
 				case activeSub.handlerCh <- status:
 				default:
-					slog.WarnContext(ctx, "subscription: handler queue full, skipping message",
+					slog.DebugContext(ctx, "subscription: handler queue full, skipping message",
 						"id", subID)
 				}
 			}
