@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -20,6 +21,8 @@ const (
 	IMDSRequestTimeout = 10 * time.Second
 	// IMDSAPIVersion is the API version for Azure IMDS
 	IMDSAPIVersion = "2018-02-01"
+	// AppServiceAPIVersion is the API version for App Service / Container Apps token endpoint
+	AppServiceAPIVersion = "2019-08-01"
 )
 
 // SharedKeyCredential holds Azure Table Storage account credentials
@@ -37,15 +40,18 @@ func NewSharedKeyCredential(accountName, accountKey string) (*SharedKeyCredentia
 	}, nil
 }
 
-// ManagedIdentityCredential acquires tokens from Azure IMDS endpoint
+// ManagedIdentityCredential acquires tokens from Azure IMDS or App Service/Container Apps endpoint
 // This provides DefaultCredential-like behavior for Azure Container Apps and VMs
 type ManagedIdentityCredential struct {
-	clientID     string
-	token        string
-	tokenExpiry  time.Time
-	mu           sync.RWMutex
-	httpClient   *http.Client
-	imdsEndpoint string
+	clientID         string
+	token            string
+	tokenExpiry      time.Time
+	mu               sync.RWMutex
+	httpClient       *http.Client
+	imdsEndpoint     string
+	identityEndpoint string // from IDENTITY_ENDPOINT env var (App Service / ACA)
+	identityHeader   string // from IDENTITY_HEADER env var
+	useAppService    bool   // true when running in ACA / App Service
 }
 
 // imdsTokenResponse represents the response from Azure IMDS
@@ -58,13 +64,30 @@ type imdsTokenResponse struct {
 	ClientID    string `json:"client_id"`
 }
 
-// NewManagedIdentityCredential creates a credential that uses Azure Managed Identity
+// NewManagedIdentityCredential creates a credential that uses Azure Managed Identity.
+// When IDENTITY_ENDPOINT and IDENTITY_HEADER are set (App Service / Container Apps), uses that endpoint;
+// otherwise falls back to IMDS (VMs / VMSS).
 func NewManagedIdentityCredential(clientID string) *ManagedIdentityCredential {
-	return &ManagedIdentityCredential{
-		clientID:     clientID,
-		httpClient:   &http.Client{Timeout: IMDSRequestTimeout},
-		imdsEndpoint: "http://169.254.169.254/metadata/identity/oauth2/token",
+	cred := &ManagedIdentityCredential{
+		clientID:   clientID,
+		httpClient: &http.Client{Timeout: IMDSRequestTimeout},
 	}
+
+	identityEndpoint := os.Getenv("IDENTITY_ENDPOINT")
+	identityHeader := os.Getenv("IDENTITY_HEADER")
+
+	if identityEndpoint != "" && identityHeader != "" {
+		cred.identityEndpoint = identityEndpoint
+		cred.identityHeader = identityHeader
+		cred.useAppService = true
+		slog.Info("managed identity: using App Service/Container Apps endpoint",
+			"endpoint", identityEndpoint)
+	} else {
+		cred.imdsEndpoint = "http://169.254.169.254/metadata/identity/oauth2/token"
+		slog.Info("managed identity: using IMDS endpoint")
+	}
+
+	return cred
 }
 
 // GetToken retrieves a valid access token, refreshing if necessary
@@ -89,28 +112,41 @@ func (c *ManagedIdentityCredential) GetToken(ctx context.Context) (string, error
 		return c.token, nil
 	}
 
-	// Build IMDS request
+	// Build token request: App Service/ACA vs IMDS
 	query := url.Values{}
-	query.Set("api-version", IMDSAPIVersion)
 	query.Set("resource", "https://storage.azure.com/")
 	if c.clientID != "" {
 		query.Set("client_id", c.clientID)
 	}
 
-	reqURL := fmt.Sprintf("%s?%s", c.imdsEndpoint, query.Encode())
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create IMDS request: %w", err)
+	var reqURL string
+	endpointType := "IMDS"
+	if c.useAppService {
+		query.Set("api-version", AppServiceAPIVersion)
+		reqURL = fmt.Sprintf("%s?%s", c.identityEndpoint, query.Encode())
+		endpointType = "AppService"
+	} else {
+		query.Set("api-version", IMDSAPIVersion)
+		reqURL = fmt.Sprintf("%s?%s", c.imdsEndpoint, query.Encode())
 	}
 
-	req.Header.Set("Metadata", "true")
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create %s request: %w", endpointType, err)
+	}
 
-	slog.Debug("requesting managed identity token", "client_id", c.clientID)
+	if c.useAppService {
+		req.Header.Set("X-IDENTITY-HEADER", c.identityHeader)
+	} else {
+		req.Header.Set("Metadata", "true")
+	}
+
+	slog.Debug("requesting managed identity token", "client_id", c.clientID, "endpoint_type", endpointType)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		slog.Warn("failed to call IMDS endpoint", "error", err)
-		return "", fmt.Errorf("failed to call IMDS endpoint: %w", err)
+		slog.Warn("failed to call managed identity endpoint", "error", err, "endpoint_type", endpointType)
+		return "", fmt.Errorf("failed to call %s endpoint: %w", endpointType, err)
 	}
 	defer resp.Body.Close()
 
@@ -119,23 +155,24 @@ func (c *ManagedIdentityCredential) GetToken(ctx context.Context) (string, error
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		slog.Error("IMDS returned error",
+		slog.Error("managed identity endpoint returned error",
 			"status", resp.StatusCode,
 			"request_id", requestID,
+			"endpoint_type", endpointType,
 			"body", string(body))
-		return "", fmt.Errorf("IMDS returned status %d (request_id=%s): %s", resp.StatusCode, requestID, string(body))
+		return "", fmt.Errorf("%s returned status %d (request_id=%s): %s", endpointType, resp.StatusCode, requestID, string(body))
 	}
 
 	var tokenResp imdsTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		slog.Error("failed to decode IMDS response", "error", err, "request_id", requestID)
-		return "", fmt.Errorf("failed to decode IMDS response: %w", err)
+		slog.Error("failed to decode token response", "error", err, "request_id", requestID, "endpoint_type", endpointType)
+		return "", fmt.Errorf("failed to decode token response: %w", err)
 	}
 
 	// Parse expiry time (Unix timestamp as string) - use strconv for better performance
 	expiresOn, err := strconv.ParseInt(tokenResp.ExpiresOn, 10, 64)
 	if err != nil {
-		slog.Error("failed to parse token expiry", "error", err, "expires_on", tokenResp.ExpiresOn)
+		slog.Error("failed to parse token expiry", "error", err, "expires_on", tokenResp.ExpiresOn, "endpoint_type", endpointType)
 		return "", fmt.Errorf("failed to parse token expiry: %w", err)
 	}
 
@@ -144,7 +181,8 @@ func (c *ManagedIdentityCredential) GetToken(ctx context.Context) (string, error
 
 	slog.Debug("successfully refreshed managed identity token",
 		"expires_at", c.tokenExpiry,
-		"request_id", requestID)
+		"request_id", requestID,
+		"endpoint_type", endpointType)
 
 	return c.token, nil
 }
