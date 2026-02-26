@@ -402,87 +402,66 @@ func TestHandlerPanicResilience(t *testing.T) {
 }
 
 func TestNoDuplicateReplayOnRapidReconnect(t *testing.T) {
-	// Arrange
-	// This tests Critical Issue #2: Duplicate Subscriptions During Rapid Reconnects
-	// Rapid reconnects should not cause duplicate message delivery due to concurrent replay goroutines
+	// Reconnections are serialized through a single-threaded dispatcher.
+	// Verify that at most one CallStream is in-flight at any given time,
+	// even when multiple subscriptions enqueue concurrently.
 
-	replayAttempts := 0
-	replayAttemptsMu := sync.Mutex{}
+	var concurrent atomic.Int32
+	var maxConcurrent atomic.Int32
 
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			cur := concurrent.Add(1)
+			defer concurrent.Add(-1)
+			for {
+				old := maxConcurrent.Load()
+				if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			// Small sleep so concurrent calls would overlap if they existed
+			time.Sleep(5 * time.Millisecond)
+
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
-
-			// Track that a stream was created for replay
-			replayAttemptsMu.Lock()
-			replayAttempts++
-			replayAttemptsMu.Unlock()
-
-			callCount := 0
 			stream.decodeFn = func(m any) error {
-				callCount++
 				if status, ok := m.(*SegmentStatus); ok {
 					status.Segment = "test-segment"
-					status.LastSequence = uint64(callCount)
+					status.LastSequence = 1
 				}
-
-				// Return error after first decode to close stream quickly
-				if callCount > 0 {
-					return errors.New("stream ended")
-				}
-
-				return nil
+				// Block until context cancelled — stable stream
+				<-ctx.Done()
+				return ctx.Err()
 			}
-
 			return stream, nil
 		},
 	}
 
 	c := NewClient(provider)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	storeID := uuid.New()
 
-	handler := func(status *SegmentStatus) {
-		// Handler just receives the status
-	}
-
-	// Act: create subscription
-	sub, err := c.SubscribeToSegment(ctx, storeID, "space", "segment", handler)
-	require.NoError(t, err)
-
-	time.Sleep(100 * time.Millisecond)
-
-	// Reset counter for replay phase
-	replayAttemptsMu.Lock()
-	replayAttempts = 0
-	replayAttemptsMu.Unlock()
-
-	clientInst := c.(*client)
-
-	// Simulate rapid reconnects (5 times quickly)
-	for i := 0; i < 5; i++ {
-		err = clientInst.OnReconnected(ctx, uuid.Nil)
+	// Create multiple subscriptions
+	const numSubs = 5
+	subs := make([]api.Subscription, numSubs)
+	for i := 0; i < numSubs; i++ {
+		var err error
+		subs[i], err = c.SubscribeToSegment(ctx, storeID, "space", fmt.Sprintf("seg%d", i), func(s *SegmentStatus) {})
 		require.NoError(t, err)
-		// No delay - reconnects happen rapidly
 	}
 
-	// Give all replays time to stabilize
+	// Wait for all subscriptions to connect (serialized through dispatcher)
 	time.Sleep(500 * time.Millisecond)
 
-	// Assert: The isReplaying atomic flag should prevent duplicate concurrent replays
-	// Without the flag, we'd see many concurrent streams created
-	// With proper protection, each reconnect call should only see one active stream per subscription
-	replayAttemptsMu.Lock()
-	totalReplayAttempts := replayAttempts
-	replayAttemptsMu.Unlock()
-
-	// Without atomic flag: we'd see 1 initial + many concurrent replays = 20+ streams
-	// With atomic flag: we should see 1 initial + limited replays = < 15 streams
-	t.Logf("Total streams created during rapid reconnects: %d", totalReplayAttempts)
-	assert.Less(t, totalReplayAttempts, 20, "atomic isReplaying flag should prevent duplicate concurrent replays")
+	// Assert: concurrent CallStream never exceeded 1 (single-threaded dispatcher)
+	t.Logf("Max concurrent CallStream: %d", maxConcurrent.Load())
+	assert.LessOrEqual(t, maxConcurrent.Load(), int32(1), "reconnect dispatcher should call CallStream one at a time")
 
 	// Cleanup
-	sub.Unsubscribe()
+	cancel()
+	for _, sub := range subs {
+		sub.Unsubscribe()
+	}
 }
 
 // TestHealthStatusTracking tests Issue 4: Silent subscription failures detection

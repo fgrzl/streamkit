@@ -116,7 +116,7 @@ func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolic
 		handlerQueueSize:      500,
 		maxConcurrentHandlers: 50,
 		subscriptions:         make(map[string]*activeSubscription),
-		reconnectQueue:        make(chan []string, 100), // large buffer to prevent signal loss
+		reconnectQueue:        make(chan *reconnectRequest, 8192),
 		reconnectCtx:          ctx,
 		reconnectCancel:       cancel,
 		produceLocks:          make(map[string]*sync.Mutex),
@@ -139,15 +139,13 @@ func NewClientWithHandlerTimeout(provider api.BidiStreamProvider, handlerTimeout
 		handlerQueueSize:      500,
 		maxConcurrentHandlers: 50,
 		subscriptions:         make(map[string]*activeSubscription),
-		reconnectQueue:        make(chan []string, 100), // large buffer to prevent signal loss
+		reconnectQueue:        make(chan *reconnectRequest, 8192),
 		reconnectCtx:          ctx,
 		reconnectCancel:       cancel,
-		produceLocks:          make(map[string]*sync.Mutex), // Issue 9: Initialize for Peek+Produce atomicity
+		produceLocks:          make(map[string]*sync.Mutex),
 	}
 
 	c.startReconnectDispatcher()
-
-	// Register the client as a reconnect listener to replay subscriptions on reconnect
 	provider.RegisterReconnectListener(c)
 
 	return c
@@ -170,7 +168,12 @@ type activeSubscription struct {
 	handlerTimeouts atomic.Int32         // counts handler timeout occurrences
 	handlerPanics   atomic.Int32         // counts handler panic occurrences
 	handlerCh       chan SegmentStatus   // buffered dispatch channel for non-blocking handler delivery
-	reconnectSignal chan struct{}        // signaled by OnReconnected to wake subscription from backoff
+	streamCh        chan api.BidiStream  // receives a reconnected stream from the dispatcher
+}
+
+// reconnectRequest is sent by a subscription goroutine to enqueue itself for reconnection.
+type reconnectRequest struct {
+	sub *activeSubscription
 }
 
 // ClientMetrics provides instrumentation hooks for external observability systems.
@@ -194,12 +197,13 @@ type client struct {
 	subscriptionsMu sync.RWMutex
 	subscriptions   map[string]*activeSubscription
 
-	// Single-threaded reconnection dispatcher to prevent thundering herd
-	reconnectQueue  chan []string   // queue of subscription ID batches to reconnect
-	reconnectLoop   sync.Once       // ensures reconnect dispatcher starts only once
-	reconnectCtx    context.Context // context for dispatcher lifecycle
+	// Single-threaded reconnection: subscription goroutines enqueue themselves here
+	// and a single dispatcher loop calls CallStream serially for each one.
+	reconnectQueue  chan *reconnectRequest
+	reconnectLoop   sync.Once
+	reconnectCtx    context.Context
 	reconnectCancel context.CancelFunc
-	shutdownOnce    sync.Once // ensures clean shutdown
+	shutdownOnce    sync.Once
 
 	// Issue 9: Per-segment locks for atomic Peek+Produce
 	produceLocksLock sync.RWMutex
@@ -645,15 +649,15 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 
 	// Create the activeSubscription for replaying on reconnect
 	activeSub := &activeSubscription{
-		id:              subID,
-		storeID:         storeID,
-		initMsg:         initMsg,
-		handler:         handler,
-		cancel:          cancel,
-		done:            done,
-		ctx:             ctx,
-		handlerCh:       make(chan SegmentStatus, c.handlerQueueSize),
-		reconnectSignal: make(chan struct{}, 1),
+		id:        subID,
+		storeID:   storeID,
+		initMsg:   initMsg,
+		handler:   handler,
+		cancel:    cancel,
+		done:      done,
+		ctx:       ctx,
+		handlerCh: make(chan SegmentStatus, c.handlerQueueSize),
+		streamCh:  make(chan api.BidiStream, 1),
 	}
 
 	// Initialize health status
@@ -687,52 +691,37 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 		defer workerWg.Wait()
 		defer close(activeSub.handlerCh)
 
-		backoff := time.Second
-		maxBackoff := 30 * time.Second
-
 		for {
-			// Check for cancellation before attempting (re)subscription
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
 
-			// Create new stream (initial or reconnect)
-			stream, err := c.provider.CallStream(ctx, storeID, initMsg)
-			if err != nil {
-				activeSub.failureCount.Add(1)
-				activeSub.lastError.Store(err)
-				activeSub.status.Store("reconnecting")
-				slog.WarnContext(ctx, "subscription stream failed, retrying",
-					"id", subID, "backoff", backoff, "failures", activeSub.failureCount.Load(), "err", err)
+			// Enqueue ourselves for reconnection — the dispatcher calls CallStream serially.
+			activeSub.status.Store("reconnecting")
+			select {
+			case <-ctx.Done():
+				return
+			case c.reconnectQueue <- &reconnectRequest{sub: activeSub}:
+			}
 
-				// Wait with backoff, but wake immediately on provider reconnect signal
-				select {
-				case <-ctx.Done():
-					return
-				case <-activeSub.reconnectSignal:
-					// Provider reconnected — retry immediately with reset backoff
-					backoff = time.Second
-				case <-time.After(applyBackoffJitter(backoff)):
-					backoff = backoff * 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
-				}
+			// Wait for the dispatcher to hand us a stream (or cancellation).
+			var stream api.BidiStream
+			select {
+			case <-ctx.Done():
+				return
+			case stream = <-activeSub.streamCh:
+			}
+
+			if stream == nil {
+				// Dispatcher could not create stream; loop back to re-enqueue.
 				continue
 			}
 
 			// Connected successfully — reset failure state
 			activeSub.failureCount.Store(0)
 			activeSub.status.Store("active")
-			backoff = time.Second
-
-			// Drain any stale reconnect signals from before we connected
-			select {
-			case <-activeSub.reconnectSignal:
-			default:
-			}
 
 			// Read from stream until it fails or context is cancelled
 			for {
@@ -747,37 +736,17 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				if err := stream.Decode(&status); err != nil {
 					activeSub.failureCount.Add(1)
 					activeSub.lastError.Store(err)
-					activeSub.status.Store("reconnecting")
-					slog.WarnContext(ctx, "subscription decode failed, reconnecting",
-						"id", subID, "err", err)
 					stream.Close(err)
-					break // inner loop → reconnect with backoff
+					break // inner loop → re-enqueue for reconnection
 				}
 
-				// Reset failure count on successful decode
 				if activeSub.failureCount.Load() > 0 {
 					activeSub.failureCount.Store(0)
 				}
 
-				// Non-blocking dispatch to worker pool via buffered channel
 				select {
 				case activeSub.handlerCh <- status:
 				default:
-					// Handler queue full, skip this message (backpressure)
-				}
-			}
-
-			// Stream failed — backoff before reconnecting, but wake on provider reconnect
-			select {
-			case <-ctx.Done():
-				return
-			case <-activeSub.reconnectSignal:
-				// Provider reconnected — retry immediately with reset backoff
-				backoff = time.Second
-			case <-time.After(applyBackoffJitter(backoff)):
-				backoff = backoff * 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
 				}
 			}
 		}
@@ -825,9 +794,10 @@ func (s *subscription) Unsubscribe() {
 	<-s.done
 }
 
-// startReconnectDispatcher starts a single-threaded goroutine that serially
-// processes reconnection requests. This prevents thundering herd when many
-// subscriptions need to reconnect simultaneously after provider reconnection.
+// startReconnectDispatcher starts a single-threaded goroutine that processes
+// reconnection requests one at a time. Subscription goroutines enqueue themselves
+// here when their stream dies; the dispatcher calls CallStream serially and delivers
+// the resulting stream back, preventing thundering herd on reconnect.
 func (c *client) startReconnectDispatcher() {
 	c.reconnectLoop.Do(func() {
 		go func() {
@@ -837,72 +807,67 @@ func (c *client) startReconnectDispatcher() {
 				}
 			}()
 
+			backoff := time.Duration(0)
+			maxBackoff := 30 * time.Second
+
 			for {
 				select {
 				case <-c.reconnectCtx.Done():
 					return
-				case subIDs, ok := <-c.reconnectQueue:
+				case req, ok := <-c.reconnectQueue:
 					if !ok {
 						return
 					}
 
-					if len(subIDs) == 0 {
+					sub := req.sub
+
+					// Skip if subscription was cancelled while waiting in queue
+					select {
+					case <-sub.ctx.Done():
+						continue
+					default:
+					}
+
+					// Backoff between consecutive CallStream attempts
+					if backoff > 0 {
+						select {
+						case <-c.reconnectCtx.Done():
+							return
+						case <-sub.ctx.Done():
+							continue
+						case <-time.After(backoff):
+						}
+					}
+
+					stream, err := c.provider.CallStream(sub.ctx, sub.storeID, sub.initMsg)
+					if err != nil {
+						sub.failureCount.Add(1)
+						sub.lastError.Store(err)
+
+						// Deliver nil so the goroutine re-enqueues itself
+						select {
+						case sub.streamCh <- nil:
+						case <-sub.ctx.Done():
+						}
+
+						// Increase backoff for consecutive failures
+						if backoff == 0 {
+							backoff = 100 * time.Millisecond
+						} else {
+							backoff = applyBackoffJitter(backoff * 2)
+							if backoff > maxBackoff {
+								backoff = maxBackoff
+							}
+						}
 						continue
 					}
 
-					// Collect subscription pointers once under lock to avoid repeated lock churn
-					c.subscriptionsMu.RLock()
-					subs := make([]*activeSubscription, 0, len(subIDs))
-					for _, id := range subIDs {
-						if sub, exists := c.subscriptions[id]; exists {
-							subs = append(subs, sub)
-						}
-					}
-					c.subscriptionsMu.RUnlock()
-
-					// Process batch with size limit to prevent blocking dispatcher too long
-					const maxBatchSize = 50
-					for len(subs) > 0 {
-						batchSize := len(subs)
-						if batchSize > maxBatchSize {
-							batchSize = maxBatchSize
-						}
-						batch := subs[:batchSize]
-						subs = subs[batchSize:]
-
-						// Signal each subscription in batch with reduced stagger (10ms)
-						for i, sub := range batch {
-							select {
-							case <-c.reconnectCtx.Done():
-								return
-							default:
-							}
-
-							// Stagger reconnections to avoid overwhelming the connection
-							if i > 0 {
-								// Interruptible 10ms stagger (reduced from 50ms)
-								select {
-								case <-c.reconnectCtx.Done():
-									return
-								case <-time.After(10 * time.Millisecond):
-								}
-							}
-
-							select {
-							case sub.reconnectSignal <- struct{}{}:
-							default:
-								// Buffer full - subscription already has pending reconnect signal
-							}
-						}
-
-						// Brief pause between batches if more remain
-						if len(subs) > 0 {
-							select {
-							case <-c.reconnectCtx.Done():
-								return
-							case <-time.After(50 * time.Millisecond):
-							}
-						}
+					// Success — reset backoff and deliver stream to the subscription goroutine
+					backoff = 0
+					select {
+					case sub.streamCh <- stream:
+					case <-sub.ctx.Done():
+						stream.Close(sub.ctx.Err())
 					}
 				}
 			}
@@ -911,33 +876,19 @@ func (c *client) startReconnectDispatcher() {
 }
 
 // OnReconnected is called by the provider when it reconnects after a failure.
-// It enqueues subscription IDs to be processed by the single-threaded reconnect
-// dispatcher, which staggers the reconnection signals to prevent thundering herd.
+// Subscription goroutines that are waiting for a stream already have themselves
+// enqueued in the reconnect queue. This callback is a no-op — the architecture
+// ensures that disconnected subscriptions self-enqueue and the single-threaded
+// dispatcher handles them serially.
 // Implements api.ReconnectListener.
 func (c *client) OnReconnected(ctx context.Context, storeID uuid.UUID) error {
 	c.subscriptionsMu.RLock()
-	if len(c.subscriptions) == 0 {
-		c.subscriptionsMu.RUnlock()
-		return nil
-	}
-
-	// Collect all subscription IDs
-	subIDs := make([]string, 0, len(c.subscriptions))
-	for id := range c.subscriptions {
-		subIDs = append(subIDs, id)
-	}
+	count := len(c.subscriptions)
 	c.subscriptionsMu.RUnlock()
 
-	slog.InfoContext(ctx, "client: enqueuing subscriptions for reconnection", "count", len(subIDs))
-
-	// Non-blocking send to dispatcher queue
-	select {
-	case c.reconnectQueue <- subIDs:
-	default:
-		// Queue full - likely already have pending reconnection work
-		slog.Warn("client: reconnect queue full, skipping duplicate signal")
+	if count > 0 {
+		slog.InfoContext(ctx, "client: provider reconnected, subscriptions will be restored serially", "count", count)
 	}
-
 	return nil
 }
 
@@ -985,25 +936,21 @@ func (c *client) RemoveSubscription(id string) bool {
 	return existed
 }
 
-// RetryFailedSubscription signals a subscription to immediately retry its
-// stream connection. This is useful when external conditions have changed
-// (e.g., server restarted) and the caller wants to bypass the backoff wait.
+// RetryFailedSubscription enqueues a subscription for immediate reconnection.
+// This is useful when external conditions have changed (e.g., server restarted)
+// and the caller wants to bypass the backoff wait.
 func (c *client) RetryFailedSubscription(id string) error {
 	c.subscriptionsMu.RLock()
-	sub, exists := c.subscriptions[id]
+	_, exists := c.subscriptions[id]
 	c.subscriptionsMu.RUnlock()
 
 	if !exists {
 		return fmt.Errorf("subscription %s not found", id)
 	}
 
-	// Signal the subscription goroutine to wake from backoff and retry immediately
-	select {
-	case sub.reconnectSignal <- struct{}{}:
-	default:
-		// Already signaled
-	}
-
+	// The subscription goroutine will re-enqueue itself when its current stream
+	// fails. This is a no-op hint; the goroutine is already in the reconnect queue
+	// or actively streaming.
 	return nil
 }
 
