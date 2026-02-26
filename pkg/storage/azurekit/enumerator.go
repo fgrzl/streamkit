@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 
+	client "github.com/fgrzl/azkit/tables"
 	"github.com/fgrzl/enumerators"
 )
 
-// NewAzureTableEnumerator creates a new enumerator for Azure Table Storage entities
+// NewAzureTableEnumerator creates a new enumerator for Azure Table Storage entities.
 // Note: This enumerator is one-shot only. Once an error occurs during enumeration,
 // the enumerator becomes permanently failed and will return false from MoveNext().
 // Create a new enumerator if you need to retry after an error.
-func NewAzureTableEnumerator(ctx context.Context, pager *ListEntitiesPager) enumerators.Enumerator[*entity] {
+func NewAzureTableEnumerator(ctx context.Context, pager *client.ListEntitiesPager) enumerators.Enumerator[*client.Entity] {
 	return &AzureTableEnumerator{
 		pager:    pager,
 		ctx:      ctx,
@@ -23,16 +24,16 @@ func NewAzureTableEnumerator(ctx context.Context, pager *ListEntitiesPager) enum
 }
 
 type AzureTableEnumerator struct {
-	pager    *ListEntitiesPager
+	pager    *client.ListEntitiesPager
 	ctx      context.Context
-	current  *entity
+	current  *client.Entity
 	index    int
-	entities []entity
+	entities []client.Entity
 	err      error
 }
 
 // Current returns the current entity in the enumeration
-func (a *AzureTableEnumerator) Current() (*entity, error) {
+func (a *AzureTableEnumerator) Current() (*client.Entity, error) {
 	if a.err != nil {
 		return nil, a.err
 	}

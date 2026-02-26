@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fgrzl/azkit/credentials"
+	client "github.com/fgrzl/azkit/tables"
 	"github.com/fgrzl/streamkit/internal/cache"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/google/uuid"
@@ -36,7 +38,7 @@ type AzureStoreOptions struct {
 	ManagedIdentityID  string // Optional: specific managed identity client ID
 
 	// Optional: use an existing HTTP client (useful for tests)
-	HTTPClient *HTTPTableClient
+	HTTPClient *client.HTTPTableClient
 
 	// Runtime knobs
 	AddWorkers                 int
@@ -91,18 +93,16 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 		slog.String("account", f.options.AccountName),
 	)
 
-	var httpClient *HTTPTableClient
+	var httpClient *client.HTTPTableClient
 	if f.options.HTTPClient != nil {
 		httpClient = f.options.HTTPClient
 	} else {
 		var err error
 		if f.options.UseManagedIdentity {
-			// Use Managed Identity authentication
-			managedCred := NewManagedIdentityCredential(f.options.ManagedIdentityID)
-			httpClient, err = NewHTTPTableClientWithManagedIdentity(f.options.AccountName, managedCred, tableName, f.options.AllowInsecureHTTP, f.options.Endpoint)
+			managedCred := credentials.NewManagedIdentityCredential(f.options.ManagedIdentityID)
+			httpClient, err = client.NewHTTPTableClientWithManagedIdentity(f.options.AccountName, managedCred, tableName, f.options.AllowInsecureHTTP, f.options.Endpoint)
 		} else {
-			// Use SharedKey authentication
-			httpClient, err = NewHTTPTableClient(f.options.AccountName, f.options.AccountKey, tableName, f.options.AllowInsecureHTTP, f.options.Endpoint)
+			httpClient, err = client.NewHTTPTableClient(f.options.AccountName, f.options.AccountKey, tableName, f.options.AllowInsecureHTTP, f.options.Endpoint)
 		}
 		if err != nil {
 			slog.ErrorContext(ctx, "azure store: failed to create HTTP client", slog.String("err", err.Error()))

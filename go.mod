@@ -4,6 +4,7 @@ go 1.25.6
 
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.4
+	github.com/fgrzl/azkit v0.1.0
 	github.com/fgrzl/claims v0.0.1-alpha.22
 	github.com/fgrzl/enumerators v1.0.0-alpha.3
 	github.com/fgrzl/es v0.0.1-alpha.36
@@ -15,7 +16,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.18.4
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/net v0.50.0
+	golang.org/x/net v0.51.0
 )
 
 require (
@@ -38,7 +39,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
