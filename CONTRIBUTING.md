@@ -94,6 +94,17 @@ Be respectful, inclusive, and professional. We aim to maintain a welcoming commu
 - **Constants:** All caps for unexported (`const maxRetries`, `const maxActiveHandlers`)
 - **Types:** Public types start with capital letter
 
+### Logging
+
+Use `log/slog` and be **strategic about levels** so production logs stay actionable:
+
+- **Info** — Lifecycle and important operational events only (e.g. factory initialized, first connection, reconnect successful, connection closed, enqueuing reconnection). Avoid per-request or per-message Info.
+- **Warn** — Recoverable or degraded conditions (e.g. handler timeout, reconnect queue full, backoff).
+- **Error** — Failures that need attention (e.g. stream creation failed, handler panic, table creation failed).
+- **Debug** — Reserved for troubleshooting; keep minimal so default (Info) stays quiet.
+
+Do not add Info logs on hot paths (peek, publish, produce, per-subscription connect, per-offset retry). Prefer metrics or tracing for high-cardinality observability.
+
 ### Project Architecture
 
 Streamkit has a clear layered architecture:

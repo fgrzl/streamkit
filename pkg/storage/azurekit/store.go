@@ -301,12 +301,6 @@ func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enu
 		lastEntry = &api.Entry{Sequence: 0, TRX: api.TRX{Number: 0}}
 	}
 
-	slog.InfoContext(ctx, "Produce starting",
-		"space", args.Space,
-		"segment", args.Segment,
-		"peek_last_sequence", lastEntry.Sequence,
-	)
-
 	chunks := enumerators.ChunkByCount(records, s.batchSize())
 	var lastSeq, lastTrx = lastEntry.Sequence, lastEntry.TRX.Number
 

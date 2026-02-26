@@ -238,32 +238,18 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
 	requestID := uuid.New().String()
 	ctx = context.WithValue(ctx, requestIDKey, requestID)
-	slog.DebugContext(ctx, "consume space request",
-		"request_id", requestID,
-		"store_id", storeID,
-		"space", args.Space)
-	// Returns a resilience-wrapped enumerator that retries on disconnect (Issue 8)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
 	requestID := uuid.New().String()
 	ctx = context.WithValue(ctx, requestIDKey, requestID)
-	slog.DebugContext(ctx, "consume segment request",
-		"request_id", requestID,
-		"store_id", storeID,
-		"space", args.Space, "segment", args.Segment)
-	// Returns a resilience-wrapped enumerator that retries on disconnect (Issue 8)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
 	requestID := uuid.New().String()
 	ctx = context.WithValue(ctx, requestIDKey, requestID)
-	slog.DebugContext(ctx, "consume request",
-		"request_id", requestID,
-		"store_id", storeID)
-	// Returns a resilience-wrapped enumerator that retries on disconnect (Issue 8)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
@@ -348,11 +334,9 @@ func (e *resilienceEnumerator) MoveNext() bool {
 		// Only retry if there was an actual error (disconnect), not on clean EOF
 		if streamErr != nil && e.lastEntry != nil {
 			if e.attemptCount < e.maxAttempts {
-				// Update the consume args with new position
 				e.updateConsumePosition()
 				e.attemptCount++
 				e.disconnectedAt = time.Now()
-				slog.InfoContext(e.ctx, "resilience enumerator: retrying from last position", "sequence", e.lastEntry.Sequence, "attempt", e.attemptCount, "err", streamErr)
 				continue
 			}
 		}
@@ -402,27 +386,19 @@ func (e *resilienceEnumerator) updateConsumePosition() {
 		// Resume from next sequence after last consumed (Issue 8)
 		if e.lastEntry != nil && e.lastEntry.Sequence > 0 {
 			args.MinSequence = e.lastEntry.Sequence + 1
-			slog.DebugContext(e.ctx, "resilience: updated ConsumeSegment offset",
-				"space", args.Space, "segment", args.Segment, "minSeq", args.MinSequence)
 		}
 	case *api.ConsumeSpace:
 		// For ConsumeSpace, we need to resume past the last timestamp
 		// Add 1 nanosecond to avoid re-receiving entries with same timestamp
 		if e.lastEntry != nil && e.lastEntry.Timestamp > 0 {
 			args.MinTimestamp = e.lastEntry.Timestamp + 1
-			slog.DebugContext(e.ctx, "resilience: updated ConsumeSpace offset",
-				"space", args.Space, "minTimestamp", args.MinTimestamp)
 		}
 	case *api.Consume:
 		// For Consume (multi-space), update offset map with last seen position
 		// If Offsets map exists, update the specific space/segment pair
 		if e.lastEntry != nil && args.Offsets != nil {
-			// Create offset key for this space/segment
 			offsetKey := e.lastEntry.Space + "/" + e.lastEntry.Segment
-			// Store sequence after last consumed entry using lexkey encoding
 			args.Offsets[offsetKey] = lexkey.Encode(e.lastEntry.Sequence + 1)
-			slog.DebugContext(e.ctx, "resilience: updated Consume offset",
-				"offsetKey", offsetKey, "sequence", e.lastEntry.Sequence+1)
 		}
 	}
 }
@@ -438,14 +414,10 @@ func (e *resilienceEnumerator) updateArgsWithOffset() api.Routeable {
 	case *api.ConsumeSegment:
 		newArgs := *args
 		newArgs.MinSequence = e.lastEntry.Sequence + 1
-		slog.DebugContext(e.ctx, "resilience: built updated ConsumeSegment args",
-			"space", newArgs.Space, "segment", newArgs.Segment, "minSeq", newArgs.MinSequence)
 		return &newArgs
 	case *api.ConsumeSpace:
 		newArgs := *args
 		newArgs.Offset = e.lastEntry.GetSpaceOffset()
-		slog.DebugContext(e.ctx, "resilience: built updated ConsumeSpace args",
-			"space", newArgs.Space, "offset", newArgs.Offset)
 		return &newArgs
 	case *api.Consume:
 		newArgs := *args
@@ -454,8 +426,6 @@ func (e *resilienceEnumerator) updateArgsWithOffset() api.Routeable {
 		}
 		offsetKey := e.lastEntry.Space + "/" + e.lastEntry.Segment
 		newArgs.Offsets[offsetKey] = lexkey.Encode(e.lastEntry.Timestamp, e.lastEntry.Space, e.lastEntry.Segment, e.lastEntry.Sequence)
-		slog.DebugContext(e.ctx, "resilience: built updated Consume args",
-			"offsetKey", offsetKey, "offset", newArgs.Offsets[offsetKey])
 		return &newArgs
 	}
 
@@ -498,8 +468,6 @@ func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment str
 	if err := bidi.Decode(entry); err != nil {
 		return nil, err
 	}
-	// Debug: log returned peek entry
-	slog.InfoContext(ctx, "peek: returned entry", "space", space, "segment", segment, "seq", entry.Sequence)
 	return entry, nil
 }
 
@@ -602,16 +570,12 @@ func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment 
 	if err != nil {
 		return err
 	}
-	// Debug: log peeked sequence for diagnostics
-	slog.InfoContext(ctx, "publish: peek sequence", "space", space, "segment", segment, "seq", peek.Sequence)
 	// If peek returns sequence 0, retry a few times to handle transient peek anomalies.
 	for i := 0; i < 3 && peek.Sequence == 0; i++ {
-		// Issue #2: Check context before sleeping
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(5 * time.Millisecond):
-			// Verify context still not canceled after sleep
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -619,7 +583,6 @@ func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment 
 			if err != nil {
 				return err
 			}
-			slog.InfoContext(ctx, "publish: retry peek sequence", "space", space, "segment", segment, "seq", peek.Sequence, "attempt", i+1)
 		}
 	}
 
@@ -764,7 +727,6 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			activeSub.failureCount.Store(0)
 			activeSub.status.Store("active")
 			backoff = time.Second
-			slog.InfoContext(ctx, "subscription stream connected", "id", subID)
 
 			// Drain any stale reconnect signals from before we connected
 			select {
@@ -801,8 +763,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				select {
 				case activeSub.handlerCh <- status:
 				default:
-					slog.DebugContext(ctx, "subscription: handler queue full, skipping message",
-						"id", subID)
+					// Handler queue full, skip this message (backpressure)
 				}
 			}
 
@@ -879,20 +840,15 @@ func (c *client) startReconnectDispatcher() {
 			for {
 				select {
 				case <-c.reconnectCtx.Done():
-					slog.Debug("reconnect dispatcher: shutting down")
 					return
 				case subIDs, ok := <-c.reconnectQueue:
-					// Channel closed - exit gracefully
 					if !ok {
-						slog.Debug("reconnect dispatcher: queue closed, exiting")
 						return
 					}
 
 					if len(subIDs) == 0 {
 						continue
 					}
-
-					slog.Debug("reconnect dispatcher: processing batch", "count", len(subIDs))
 
 					// Collect subscription pointers once under lock to avoid repeated lock churn
 					c.subscriptionsMu.RLock()
@@ -916,10 +872,8 @@ func (c *client) startReconnectDispatcher() {
 
 						// Signal each subscription in batch with reduced stagger (10ms)
 						for i, sub := range batch {
-							// Check for shutdown between each signal
 							select {
 							case <-c.reconnectCtx.Done():
-								slog.Debug("reconnect dispatcher: shutdown during batch")
 								return
 							default:
 							}
@@ -934,13 +888,10 @@ func (c *client) startReconnectDispatcher() {
 								}
 							}
 
-							// Non-blocking send to subscription's reconnect signal
 							select {
 							case sub.reconnectSignal <- struct{}{}:
-								slog.Debug("reconnect dispatcher: signaled subscription", "id", sub.id)
 							default:
 								// Buffer full - subscription already has pending reconnect signal
-								slog.Debug("reconnect dispatcher: subscription already signaled", "id", sub.id)
 							}
 						}
 
@@ -953,8 +904,6 @@ func (c *client) startReconnectDispatcher() {
 							}
 						}
 					}
-
-					slog.Debug("reconnect dispatcher: batch complete")
 				}
 			}
 		}()
@@ -984,7 +933,6 @@ func (c *client) OnReconnected(ctx context.Context, storeID uuid.UUID) error {
 	// Non-blocking send to dispatcher queue
 	select {
 	case c.reconnectQueue <- subIDs:
-		slog.Debug("client: reconnection batch enqueued")
 	default:
 		// Queue full - likely already have pending reconnection work
 		slog.Warn("client: reconnect queue full, skipping duplicate signal")
@@ -998,8 +946,6 @@ func (c *client) OnReconnected(ctx context.Context, storeID uuid.UUID) error {
 func (c *client) Close() error {
 	var closeErr error
 	c.shutdownOnce.Do(func() {
-		slog.Debug("client: shutting down")
-
 		// Cancel dispatcher context to stop background goroutine
 		if c.reconnectCancel != nil {
 			c.reconnectCancel()
@@ -1011,8 +957,6 @@ func (c *client) Close() error {
 
 		// Unregister from provider
 		c.provider.UnregisterReconnectListener(c)
-
-		slog.Debug("client: shutdown complete")
 	})
 	return closeErr
 }

@@ -200,9 +200,6 @@ func (m *WebSocketMuxer) Ping() bool {
 	pongTimeoutMs := m.pongTimeout * 1000
 	idleMs := ts - last
 	if idleMs > pongTimeoutMs {
-		slog.Debug("muxer: ping health check failed due to stale activity",
-			slog.Int64("idle_ms", idleMs),
-			slog.Int64("timeout_ms", pongTimeoutMs))
 		return false
 	}
 

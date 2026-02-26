@@ -21,7 +21,6 @@ func (e *BidiStreamEnumerator[T]) MoveNext() bool {
 
 	err := e.stream.Decode(&current)
 	if err == io.EOF || errors.Is(err, e.stream.EndOfStreamError()) {
-		slog.Debug("BidiStreamEnumerator: stream ended (EOF)", "err", err)
 		e.current = nil
 		return false
 	}

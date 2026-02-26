@@ -127,10 +127,6 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 					backoff = backoff - jitter
 				}
 
-				slog.DebugContext(ctx, "provider: encode retry backoff",
-					slog.Duration("backoff", backoff),
-					slog.Int("attempt", attempt))
-
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -232,7 +228,6 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 				// reconnect loop creates a new muxer that immediately replaces one just
 				// created by getOrCreateMuxer, causing "muxer closed" errors on in-flight streams.
 				if !p.dialing.CompareAndSwap(false, true) {
-					slog.Debug("provider: reconnect loop skipping dial, another dial in progress")
 					select {
 					case <-p.reconnectCtx.Done():
 						return
@@ -240,8 +235,6 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					}
 					continue
 				}
-
-				slog.Debug("provider: reconnect loop attempting dial", slog.Duration("backoff", backoff))
 
 				// attempt to dial and create a new muxer
 				var conn *websocket.Conn
@@ -451,7 +444,6 @@ func (p *WebSocketBidiStreamProvider) Close() error {
 
 	if currentMuxer != nil {
 		p.closeMuxer(currentMuxer)
-		slog.Debug("provider: closed active muxer")
 	}
 
 	return nil

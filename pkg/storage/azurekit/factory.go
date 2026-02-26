@@ -93,11 +93,6 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 		tableName = sanitizeTableName(f.options.Prefix + storeID.String())
 	}
 
-	slog.DebugContext(ctx, "azure store: creating client",
-		slog.String("table", tableName),
-		slog.String("account", f.options.AccountName),
-	)
-
 	var httpClient *client.HTTPTableClient
 	if f.options.HTTPClient != nil {
 		httpClient = f.options.HTTPClient
