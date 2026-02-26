@@ -95,15 +95,17 @@ func NewAzureStore(ctx context.Context, client *client.HTTPTableClient, cache *c
 		store.opts.MaxTransactionPayloadBytes = MaxTransactionPayloadBytes
 	}
 
-	if err := store.createTableIfNotExists(ctx); err != nil {
-		slog.ErrorContext(ctx, "azure store: table creation failed — check auth, RBAC, and network config",
-			"error", err,
-			"account", client.AccountName(),
-			"endpoint", client.Endpoint(),
-			"table", client.TableName(),
-			"auth_mode_bearer", client.UseBearerToken(),
-		)
-		return nil, fmt.Errorf("create table if not exists failed: %w", err)
+	if !store.opts.SkipTableCreation {
+		if err := store.createTableIfNotExists(ctx); err != nil {
+			slog.ErrorContext(ctx, "azure store: table creation failed — check auth, RBAC, and network config",
+				"error", err,
+				"account", client.AccountName(),
+				"endpoint", client.Endpoint(),
+				"table", client.TableName(),
+				"auth_mode_bearer", client.UseBearerToken(),
+			)
+			return nil, fmt.Errorf("create table if not exists failed: %w", err)
+		}
 	}
 
 	if err := store.recoverWAL(ctx); err != nil {

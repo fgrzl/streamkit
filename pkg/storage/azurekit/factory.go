@@ -11,6 +11,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fgrzl/azkit/credentials"
@@ -49,11 +50,15 @@ type AzureStoreOptions struct {
 
 	// Optional override table name (useful for tests)
 	TableNameOverride string
+
+	// SkipTableCreation skips the create-table-if-not-exists call (set by factory when table already ensured in this process).
+	SkipTableCreation bool
 }
 
 // StoreFactory creates Azure-backed stores using shared credentials.
 type StoreFactory struct {
-	options *AzureStoreOptions
+	options       *AzureStoreOptions
+	ensuredTables sync.Map // table name -> struct{}; tables we've already ensured in this process
 }
 
 // NewStoreFactory validates options.
@@ -121,7 +126,20 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 	}
 	cacheObj := cache.NewExpiringCache(cacheTTL, cacheCleanup)
 
-	return NewAzureStore(ctx, httpClient, cacheObj, f.options)
+	opts := *f.options
+	_, alreadyEnsured := f.ensuredTables.Load(tableName)
+	if alreadyEnsured {
+		opts.SkipTableCreation = true
+	}
+
+	store, err := NewAzureStore(ctx, httpClient, cacheObj, &opts)
+	if err != nil {
+		return nil, err
+	}
+	if !alreadyEnsured {
+		f.ensuredTables.Store(tableName, struct{}{})
+	}
+	return store, nil
 }
 
 // sanitizeTableName ensures the table name conforms to Azure naming rules.
