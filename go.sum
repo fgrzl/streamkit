@@ -43,6 +43,8 @@ github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2
 github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
 github.com/fgrzl/azkit v0.1.0 h1:DKdLeCNAJ5ihOYFOWUZQRf0RrMkVvwwgpe+eBWUbKZc=
 github.com/fgrzl/azkit v0.1.0/go.mod h1:wp4ERu9o0swLR03+CwtLqoZOHKoJgkbH75Q7loDyS48=
+github.com/fgrzl/azkit v0.1.1 h1:niOVIkGxMK0KI3htaqkrr2FPZYxMCh5p/gtgrldpZn0=
+github.com/fgrzl/azkit v0.1.1/go.mod h1:wp4ERu9o0swLR03+CwtLqoZOHKoJgkbH75Q7loDyS48=
 github.com/fgrzl/claims v0.0.1-alpha.22 h1:L2Xv8mTuH24X3mA640cKyWUwkCImtXfhrPodrBmdPbw=
 github.com/fgrzl/claims v0.0.1-alpha.22/go.mod h1:pkdT+RIMZGF8ij7zhVicPHNuKZA5fLOD9p6viVXjcH4=
 github.com/fgrzl/enumerators v1.0.0-alpha.3 h1:HsAlKt+DHFKZaO0Lq7wnhPgtrGdYmWFMBOSwNYdV5GQ=

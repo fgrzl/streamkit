@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.4
-	github.com/fgrzl/azkit v0.1.0
+	github.com/fgrzl/azkit v0.1.1
 	github.com/fgrzl/claims v0.0.1-alpha.22
 	github.com/fgrzl/enumerators v1.0.0-alpha.3
 	github.com/fgrzl/es v0.0.1-alpha.36
