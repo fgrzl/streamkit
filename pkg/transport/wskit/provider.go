@@ -312,13 +312,18 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 // rather than failing immediately, enabling resilient concurrent recovery.
 func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (providerMuxer, error) {
 	p.mu.Lock()
-	// If existing muxer is healthy, reuse it
 	if p.muxer != nil && p.muxer.Ping() {
 		m := p.muxer
 		p.mu.Unlock()
 		return m, nil
 	}
 	p.mu.Unlock()
+
+	// Ensure background reconnect loop is running from first attempt, not just
+	// first success. If foreground dial attempts exhaust their budget, the
+	// background loop continues retrying so subsequent callers find a healthy
+	// muxer without repeating the full dial sequence.
+	p.startReconnectLoop()
 
 	// Prevent concurrent dial storms: only one goroutine dials at a time
 	if !p.dialing.CompareAndSwap(false, true) {
@@ -383,8 +388,6 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 				p.hasConnected.Store(true)
 			}
 
-			// start background reconnect loop now that we have an initial muxer
-			p.startReconnectLoop()
 			return m, nil
 		}
 
