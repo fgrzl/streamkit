@@ -160,6 +160,52 @@ func (t *testBidi) Close(err error)           {}
 func (t *testBidi) EndOfStreamError() error   { return nil }
 func (t *testBidi) Closed() <-chan struct{}   { c := make(chan struct{}); close(c); return c }
 
+func TestShouldTreatAuthErrorsAsPermanentByDefault(t *testing.T) {
+	// Arrange
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+
+	calls := 0
+	p.maxDialAttempts = 5
+	p.dialFn = func() (*websocket.Conn, error) {
+		calls++
+		return nil, errors.New("dial error: 401 unauthorized")
+	}
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := p.getOrCreateMuxer(ctx)
+
+	// Assert
+	assert.Equal(t, 1, calls, "expected dialFn to be called only once for permanent error")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "401", "expected error to contain 401")
+}
+
+func TestShouldRetryAuthErrorsWhenRetryAuthFailuresEnabled(t *testing.T) {
+	// Arrange
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+	p.RetryAuthFailures = true
+
+	calls := 0
+	p.maxDialAttempts = 3
+	p.dialFn = func() (*websocket.Conn, error) {
+		calls++
+		return nil, errors.New("dial error: 401 unauthorized")
+	}
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := p.getOrCreateMuxer(ctx)
+
+	// Assert
+	assert.Equal(t, 3, calls, "expected dialFn to retry until max attempts when RetryAuthFailures is enabled")
+	assert.Error(t, err)
+}
+
 // fakeMuxer implements providerMuxer for tests
 type fakeMuxer struct {
 	pingFn func() bool

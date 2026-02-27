@@ -40,6 +40,10 @@ type WebSocketBidiStreamProvider struct {
 	maxDialAttempts int
 	// injectable muxer factory for easier testing
 	newClientMuxer func(ctx context.Context, session MuxerSession, conn *websocket.Conn) providerMuxer
+	// RetryAuthFailures controls whether 401/auth errors are retried.
+	// When true, auth failures are treated as transient (useful during JWKS propagation).
+	// When false (default), auth failures are treated as permanent and fail fast.
+	RetryAuthFailures bool
 
 	// background reconnect management
 	reconnectOnce   sync.Once
@@ -63,6 +67,13 @@ type WebSocketBidiStreamProvider struct {
 // If the server rejects the token (e.g. 401 Unauthorized), the same token must not be returned on the
 // next attempt—refresh or clear the application's token cache so the next fetchJWT returns a valid token.
 // Optionally set OnDialFailure on the returned provider to be notified when dial fails (e.g. to invalidate cache).
+//
+// By default, 401 auth errors are treated as permanent and fail fast. To handle JWKS propagation delays
+// where tokens may be temporarily rejected during key rotation, set RetryAuthFailures to true on the
+// returned provider:
+//
+//	provider := wskit.NewBidiStreamProvider(addr, fetchJWT).(*wskit.WebSocketBidiStreamProvider)
+//	provider.RetryAuthFailures = true
 func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.BidiStreamProvider {
 
 	// normalize address: ensure it ends with /streamz and avoid duplicate slashes
@@ -268,10 +279,10 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 						backoff = time.Second
 					}
 				} else {
-					permanentErr = isPermanentDialError(err)
 					if p.OnDialFailure != nil {
 						p.OnDialFailure(err)
 					}
+					permanentErr = p.isPermanentDialError(err)
 					slog.Warn("provider: reconnect dial failed", slog.String("error", err.Error()))
 					if permanentErr {
 						// Don't hammer the server: use a single longer backoff before next attempt.
@@ -380,7 +391,7 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 		if p.OnDialFailure != nil {
 			p.OnDialFailure(err)
 		}
-		if isPermanentDialError(err) {
+		if p.isPermanentDialError(err) {
 			return nil, err
 		}
 
@@ -478,12 +489,17 @@ func (p *WebSocketBidiStreamProvider) Close() error {
 }
 
 // isPermanentDialError returns true for auth-related errors (401, unauthorized,
-// etc.) so the provider can fail fast instead of burning retries.
+// etc.) so the provider can fail fast instead of burning retries, unless
+// RetryAuthFailures is enabled.
+//
+// When RetryAuthFailures is true, auth failures are treated as transient — this is
+// useful during JWKS propagation delays where a valid token may be temporarily rejected
+// until the new signing key is fully propagated.
 //
 // Server-side: When 401s persist in logs, check signing key/algorithm, audience/issuer
 // mismatch, token expiry or clock skew, and that the path does not return 401 for
 // non-auth reasons. Inspect server logs and JWT validation config.
-func isPermanentDialError(err error) bool {
+func (p *WebSocketBidiStreamProvider) isPermanentDialError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -491,6 +507,10 @@ func isPermanentDialError(err error) bool {
 	permanent := []string{"401", "unauthorized", "authentication failed", "forbidden", "permission denied"}
 	for _, sub := range permanent {
 		if strings.Contains(s, sub) {
+			// If RetryAuthFailures is enabled, treat auth errors as transient
+			if p.RetryAuthFailures {
+				return false
+			}
 			return true
 		}
 	}
