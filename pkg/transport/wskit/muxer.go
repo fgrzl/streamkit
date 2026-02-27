@@ -225,6 +225,25 @@ func (m *WebSocketMuxer) Register(storeID, channelID uuid.UUID) api.BidiStream {
 
 // internal registration logic (safe for reuse)
 func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream {
+	// Fast-fail if the muxer is already shut down. Without this check,
+	// Register on a closed muxer creates an orphaned stream in the channels
+	// map that will never be cleaned up by shutdown (which already ran).
+	// The stream's sendFn still fast-fails via sendData, but we avoid the
+	// unnecessary allocation and map entry.
+	select {
+	case <-m.done:
+		// Return a stream whose sendFn immediately returns ErrMuxerClosed.
+		// This keeps the interface contract intact — caller gets a stream
+		// that fails on first Encode rather than requiring a nil check.
+		bidi := NewMuxerBidiStream(
+			func([]byte) error { return ErrMuxerClosed },
+			func() {},
+		)
+		bidi.SetChannelID(channelID)
+		return bidi
+	default:
+	}
+
 	sendFn := func(payload []byte) error { return m.sendData(storeID, channelID, payload) }
 
 	cleanup := func() {

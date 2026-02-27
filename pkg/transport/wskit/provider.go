@@ -170,38 +170,6 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 		slog.ErrorContext(ctx, "provider: exhausted all retry attempts",
 			slog.Int("maxAttempts", maxEncodeAttempts),
 			slog.String("lastError", lastErr.Error()))
-
-		// Final fallback: if all retries failed with muxer closed, attempt one final aggressive recovery
-		// by forcing a complete muxer invalidation and trying once more. This handles the case where
-		// the muxer becomes unhealthy right after Ping() succeeds due to race conditions.
-		if errors.Is(lastErr, ErrMuxerClosed) || lastErr == ErrMuxerClosed {
-			slog.WarnContext(ctx, "provider: attempting final recovery with forced muxer recreation")
-			p.invalidateMuxer()
-
-			// Give a brief moment for any pending closure to complete
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-
-			// Final attempt: create completely fresh muxer
-			muxer, err := p.getOrCreateMuxer(ctx)
-			if err == nil {
-				channelID := uuid.New()
-				bidi := muxer.Register(storeID, channelID)
-				envelope := polymorphic.NewEnvelope(msg)
-				if err = bidi.Encode(envelope); err == nil {
-					slog.InfoContext(ctx, "provider: final recovery attempt succeeded")
-					return bidi, nil
-				}
-				bidi.Close(err)
-				slog.WarnContext(ctx, "provider: final recovery attempt failed",
-					slog.String("error", err.Error()),
-					slog.String("channelID", channelID.String()))
-			}
-		}
-
 		return nil, lastErr
 	}
 	return nil, errors.New("failed to call stream")
@@ -268,15 +236,44 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 				} else {
 					conn, err = p.dial()
 				}
+				success := false
 				if err == nil {
+					// Check if provider was stopped during dial
+					if p.stopped.Load() {
+						if conn != nil {
+							conn.Close()
+						}
+						p.dialing.Store(false)
+						return
+					}
+
+					// Guard: if another goroutine already installed a healthy muxer
+					// while we were dialing, discard this connection to avoid
+					// replacing a working muxer and killing in-flight streams.
+					p.mu.Lock()
+					alreadyHealthy := p.muxer != nil && p.muxer.Ping()
+					p.mu.Unlock()
+					if alreadyHealthy {
+						if conn != nil {
+							conn.Close()
+						}
+						p.dialing.Store(false)
+						backoff = time.Second
+						continue
+					}
+
 					// Issue #25: Use reconnectCtx instead of context.Background()
 					// so muxer goroutines can be cancelled during provider shutdown
 					m2 := p.newClientMuxer(p.reconnectCtx, NewClientMuxerSession(), conn)
 					if m2 != nil {
+						isReconnect := p.hasConnected.Swap(true)
 						p.replaceMuxer(m2)
 						slog.Info("provider: reconnect successful")
-						// reset backoff
-						backoff = time.Second
+						success = true
+
+						if isReconnect {
+							go p.notifyReconnected(p.reconnectCtx, uuid.Nil)
+						}
 					}
 				} else {
 					if p.OnDialFailure != nil {
@@ -293,14 +290,18 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 				// Release dialing lock before sleeping
 				p.dialing.Store(false)
 
+				// Backoff: reset on success, escalate on transient failure
+				if success {
+					backoff = time.Second
+				} else if !permanentErr && backoff < 30*time.Second {
+					backoff *= 2
+				}
+
 				// jittered backoff before next attempt
 				select {
 				case <-p.reconnectCtx.Done():
 					return
 				case <-time.After(backoff + time.Duration(p.randInt63n(500))*time.Millisecond):
-				}
-				if !permanentErr && backoff < 30*time.Second {
-					backoff *= 2
 				}
 			}
 		}()
@@ -311,6 +312,7 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 // Implements coordinated reconnect: if a dial is in progress, waits for completion
 // rather than failing immediately, enabling resilient concurrent recovery.
 func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (providerMuxer, error) {
+	// Fast path: existing healthy muxer.
 	p.mu.Lock()
 	if p.muxer != nil && p.muxer.Ping() {
 		m := p.muxer
@@ -319,108 +321,66 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 	}
 	p.mu.Unlock()
 
-	// Ensure background reconnect loop is running from first attempt, not just
-	// first success. If foreground dial attempts exhaust their budget, the
-	// background loop continues retrying so subsequent callers find a healthy
-	// muxer without repeating the full dial sequence.
+	// Ensure the background reconnect loop is running. It retries indefinitely
+	// with backoff and is the single owner of dialing when no foreground caller
+	// holds the lock. On the very first call this starts the goroutine; the
+	// reconnectOnce guard makes subsequent calls a no-op.
 	p.startReconnectLoop()
 
-	// Prevent concurrent dial storms: only one goroutine dials at a time
-	if !p.dialing.CompareAndSwap(false, true) {
-		// Another goroutine is dialing; wait for it to complete rather than failing immediately.
-		// This enables resilient concurrent reconnection - multiple goroutines can coordinate
-		// recovery by waiting for the first successful dial.
-		waitBackoff := 50 * time.Millisecond
-		maxWaitTime := time.Duration(p.maxDialAttempts*3) * time.Second // scaled to total dial budget
-		waitDeadline := time.Now().Add(maxWaitTime)
-
-		for time.Now().Before(waitDeadline) {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(waitBackoff):
-				// Recheck if muxer is now available
-				p.mu.Lock()
-				if p.muxer != nil && p.muxer.Ping() {
-					m := p.muxer
-					p.mu.Unlock()
-					return m, nil
-				}
-				p.mu.Unlock()
-				// Still dialing, continue waiting with exponential backoff
-				if waitBackoff < 500*time.Millisecond {
-					waitBackoff *= 2
-				}
-			}
-		}
-		return nil, errors.New("dial in progress by another goroutine, timed out waiting for completion")
-	}
-	defer p.dialing.Store(false)
-
-	// immediate connect attempts for caller (keep previous getOrCreate behavior)
-	var (
-		maxAttempts = p.maxDialAttempts
-		baseDelay   = time.Second // initial backoff
-	)
-
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		var conn *websocket.Conn
-		var err error
-		if p.dialFn != nil {
-			conn, err = p.dialFn()
-		} else {
-			conn, err = p.dial()
-		}
+	// Try to become the dialing goroutine for a quick inline attempt.
+	if p.dialing.CompareAndSwap(false, true) {
+		conn, err := p.dialOnce()
 		if err == nil {
-			m := p.newClientMuxer(ctx, NewClientMuxerSession(), conn)
-
-			// Check if this is a reconnect (not initial connect)
-			isReconnect := p.hasConnected.Load()
+			// Use reconnectCtx (not the caller's ctx) so the muxer outlives the
+			// request that triggered its creation. A short-lived request context
+			// would cancel the muxer's goroutines while it's still installed.
+			m := p.newClientMuxer(p.reconnectCtx, NewClientMuxerSession(), conn)
+			isReconnect := p.hasConnected.Swap(true)
 			p.replaceMuxer(m)
+			p.dialing.Store(false)
 
 			if isReconnect {
 				slog.InfoContext(ctx, "provider: muxer recreated after reconnection")
-				// Notify listeners of reconnection - use uuid.Nil to indicate all stores
 				go p.notifyReconnected(p.reconnectCtx, uuid.Nil)
 			} else {
 				slog.InfoContext(ctx, "provider: initial muxer created")
-				p.hasConnected.Store(true)
 			}
-
 			return m, nil
 		}
+		p.dialing.Store(false)
+		// Inline attempt failed; fall through to wait on the background loop.
+	}
 
-		if p.OnDialFailure != nil {
-			p.OnDialFailure(err)
-		}
-		if p.isPermanentDialError(err) {
-			return nil, err
-		}
-
-		lastErr = err
-		slog.WarnContext(ctx, "provider: dial attempt failed", slog.Int("attempt", attempt), slog.String("error", err.Error()))
-
-		// compute jittered backoff: baseDelay * 2^(attempt-1) +/- 0..500ms
-		backoff := baseDelay * (1 << uint(attempt-1))
-		jitter := time.Duration(p.randInt63n(500)) * time.Millisecond
-		// randomize add/subtract
-		if p.randIntn(2) == 0 {
-			backoff = backoff + jitter
-		} else {
-			if backoff > jitter {
-				backoff = backoff - jitter
-			}
-		}
-
+	// Wait for the background reconnect loop to establish a healthy muxer.
+	// This avoids burning a full 5-attempt foreground dial cycle per request
+	// while the background loop is already retrying.
+	pollInterval := 250 * time.Millisecond
+	deadline := time.After(time.Duration(p.maxDialAttempts*6) * time.Second)
+	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(backoff):
+		case <-deadline:
+			return nil, errors.New("timed out waiting for stream connection")
+		case <-time.After(pollInterval):
+			p.mu.Lock()
+			if p.muxer != nil && p.muxer.Ping() {
+				m := p.muxer
+				p.mu.Unlock()
+				return m, nil
+			}
+			p.mu.Unlock()
 		}
 	}
+}
 
-	return nil, lastErr
+// dialOnce performs a single dial attempt. Extracted so getOrCreateMuxer can
+// make one quick inline try before falling back to the background loop.
+func (p *WebSocketBidiStreamProvider) dialOnce() (*websocket.Conn, error) {
+	if p.dialFn != nil {
+		return p.dialFn()
+	}
+	return p.dial()
 }
 
 // replaceMuxer safely replaces the current muxer, closing the old one to prevent leaks.
@@ -447,15 +407,24 @@ func (p *WebSocketBidiStreamProvider) replaceMuxer(newMuxer providerMuxer) {
 // forcing the next getOrCreateMuxer call to dial and create a fresh connection.
 // This is used when a muxer closure is detected during encode to prevent
 // reusing a closed or closing muxer.
+// The old muxer is closed after a grace period to allow in-flight streams
+// on the old muxer to complete — matching replaceMuxer's behavior.
 func (p *WebSocketBidiStreamProvider) invalidateMuxer() {
 	p.mu.Lock()
 	oldMuxer := p.muxer
 	p.muxer = nil
 	p.mu.Unlock()
 
-	// Close old muxer outside the lock to prevent deadlock
+	// Close old muxer outside the lock with a grace period to allow
+	// in-flight operations to complete. Without this delay, concurrent
+	// goroutines that already obtained a reference to this muxer via
+	// getOrCreateMuxer and are mid-Register/Encode get killed, causing
+	// cascading ErrMuxerClosed failures.
 	if oldMuxer != nil {
-		p.closeMuxer(oldMuxer)
+		go func(m providerMuxer) {
+			time.Sleep(500 * time.Millisecond)
+			p.closeMuxer(m)
+		}(oldMuxer)
 	}
 }
 

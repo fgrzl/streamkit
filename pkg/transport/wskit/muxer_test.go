@@ -308,3 +308,35 @@ func TestMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {
 		t.Fatal("writer did not finish after shutdown")
 	}
 }
+
+// TestRegisterOnClosedMuxerReturnsFailingStream verifies that calling Register
+// on a muxer that has already been shut down returns a stream that immediately
+// fails on Encode with ErrMuxerClosed, rather than creating an orphaned entry
+// in the channels map.
+func TestRegisterOnClosedMuxerReturnsFailingStream(t *testing.T) {
+	// Arrange
+	done := make(chan struct{})
+	close(done) // muxer is already shut down
+	m := &WebSocketMuxer{
+		done:     done,
+		channels: make(map[uuid.UUID]*MuxerBidiStream),
+	}
+
+	storeID := uuid.New()
+	channelID := uuid.New()
+
+	// Act
+	bidi := m.Register(storeID, channelID)
+
+	// Assert: stream should be returned (not nil) but Encode must fail immediately
+	require.NotNil(t, bidi, "Register on closed muxer should return a non-nil stream")
+
+	err := bidi.Encode([]byte("test"))
+	assert.ErrorIs(t, err, ErrMuxerClosed, "Encode on stream from closed muxer should return ErrMuxerClosed")
+
+	// The stream should NOT be in the channels map (no orphan)
+	m.channelsMu.RLock()
+	_, exists := m.channels[channelID]
+	m.channelsMu.RUnlock()
+	assert.False(t, exists, "Register on closed muxer should not add stream to channels map")
+}
