@@ -1,7 +1,5 @@
-
 [![CI](https://github.com/fgrzl/streamkit/actions/workflows/ci.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/ci.yml)
-[![CI](https://github.com/fgrzl/streamkit/actions/workflows/pre-release.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/pre-release.yml)
-
+[![CI](https://github.com/fgrzl/streamkit/actions/workflows/publish.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/publish.yml)
 
 # Streamkit
 
@@ -58,9 +56,11 @@ func main() {
     }
 }
 ```
+
 ## 📋 Known Limitations (Alpha)
 
 ### Client Resilience
+
 The client includes production-grade resilience features but has documented limitations:
 
 1. **Lock Management**: Per-segment produce locks accumulate over time. Not an issue for typical workloads (<10K segments) but may impact scenarios with millions of unique segments over time.
@@ -70,6 +70,7 @@ The client includes production-grade resilience features but has documented limi
 3. **Subscription Failures**: Failed subscriptions (after 2 consecutive replay failures) are removed from the client registry. Monitor subscription health using `GetSubscriptionStatus()` before failures occur.
 
 **Recommendations for Alpha Testing:**
+
 - ✅ Use `client.GetSubscriptionStatus(id)` to monitor subscription health
 - ✅ Implement application-level deduplication using `Entry.Sequence` numbers
 - ✅ Monitor segment churn if creating more than 10K unique segments
