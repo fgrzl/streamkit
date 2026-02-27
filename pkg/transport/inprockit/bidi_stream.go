@@ -382,7 +382,10 @@ func reflectFallbackAssign(msg any, v any) error {
 
 func (s *InProcBidiStream) CloseSend(err error) error {
 	s.closeSend(err)
-	return s.closeErr
+	s.sendCloseMu.Lock()
+	errOut := s.closeErr
+	s.sendCloseMu.Unlock()
+	return errOut
 }
 
 func (s *InProcBidiStream) Close(err error) {
@@ -412,7 +415,9 @@ func LinkStreams(client, server *InProcBidiStream) {
 func (s *InProcBidiStream) closeSend(err error) {
 	var didClose bool
 	s.sendClosed.Do(func() {
+		s.sendCloseMu.Lock()
 		s.closeErr = err
+		s.sendCloseMu.Unlock()
 		didClose = true
 		close(s.sendChan)
 	})

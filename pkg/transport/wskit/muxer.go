@@ -382,7 +382,9 @@ func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 
 func (m *WebSocketMuxer) handlePing(_ context.Context) {
 	atomic.AddInt64(&m.pingsReceived, 1)
-	_ = m.sendControl(ControlTypePong, uuid.Nil, uuid.Nil, nil)
+	if err := m.sendControl(ControlTypePong, uuid.Nil, uuid.Nil, nil); err != nil {
+		slog.WarnContext(m.Context, "muxer: pong send failed", "err", err)
+	}
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 }
 
@@ -420,12 +422,18 @@ func (m *WebSocketMuxer) handleDataMessage(ctx context.Context, msg *MuxerMsg) {
 }
 
 // canAccessOrSendError checks store access and sends an error control frame on denial.
-func (m *WebSocketMuxer) canAccessOrSendError(_ context.Context, storeID, channelID uuid.UUID) bool {
+func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, channelID uuid.UUID) bool {
 	if m.session.CanAccessStore(storeID) {
 		return true
 	}
-	payload, _ := json.Marshal(&ErrorMessage{Type: "err", Err: "access denied"})
-	_ = m.sendControl(ControlTypeError, storeID, channelID, payload)
+	payload, err := json.Marshal(&ErrorMessage{Type: "err", Err: "access denied"})
+	if err != nil {
+		slog.WarnContext(ctx, "muxer: marshal access-denied error failed", "err", err)
+		return false
+	}
+	if err := m.sendControl(ControlTypeError, storeID, channelID, payload); err != nil {
+		slog.WarnContext(ctx, "muxer: send error control failed", "err", err)
+	}
 	return false
 }
 
@@ -454,8 +462,12 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 		slog.ErrorContext(ctx, "muxer: failed to get or create node",
 			slog.String("store_id", msg.StoreID.String()),
 			slog.String("err", err.Error()))
-		payload, _ := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
-		_ = m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload)
+		payload, marshalErr := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
+		if marshalErr != nil {
+			slog.WarnContext(ctx, "muxer: marshal store-unavailable error failed", "err", marshalErr)
+		} else if sendErr := m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload); sendErr != nil {
+			slog.WarnContext(ctx, "muxer: send error control failed", "err", sendErr)
+		}
 		return nil, err
 	}
 
@@ -648,7 +660,8 @@ func (m *WebSocketMuxer) sendJSONWithLock(msg *MuxerMsg, shutdownOnErr bool) err
 		fields := m.buildSendErrorFields(err, msg)
 		slog.ErrorContext(m.Context, "muxer: write/send failed", fields...)
 		if shutdownOnErr {
-			m.shutdown(err)
+			// Do not call shutdown while holding writeMu: shutdown locks writeMu and would deadlock.
+			go m.shutdown(err)
 		}
 		return err
 	}
@@ -796,9 +809,13 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 			// Issue #22: Acquire writeMu lock before final write to prevent concurrent writes.
 			// Without this lock, if a goroutine is still writing, the frame gets corrupted.
 			m.writeMu.Lock()
-			_ = m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypeClose})
+			if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypeClose}); err != nil {
+				slog.WarnContext(m.Context, "muxer: shutdown close frame send failed", "err", err)
+			}
 			m.writeMu.Unlock()
-			_ = m.conn.Close()
+			if err := m.conn.Close(); err != nil {
+				slog.WarnContext(m.Context, "muxer: shutdown conn close failed", "err", err)
+			}
 		}
 		if m.cancelFunc != nil {
 			m.cancelFunc()

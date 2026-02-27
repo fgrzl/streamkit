@@ -197,13 +197,15 @@ func TestShouldShutdownOnSendDataError(t *testing.T) {
 	// sendJSON was attempted
 	assert.Equal(t, int32(1), atomic.LoadInt32(&sendCalled))
 
-	// shutdown should have closed done
-	select {
-	case <-m.done:
-		// success
-	default:
-		t.Fatalf("expected muxer to be shutdown after send error")
-	}
+	// shutdown runs asynchronously (go m.shutdown) to avoid deadlock; wait for done to close
+	require.Eventually(t, func() bool {
+		select {
+		case <-m.done:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond, "expected muxer to be shutdown after send error")
 }
 
 func TestShouldSendAccessDeniedError(t *testing.T) {

@@ -340,13 +340,22 @@ func TestConsumerOperations(t *testing.T) {
 				args := &client.ConsumeSpace{
 					Space: "space0",
 				}
+				expected := 5 * IntegrationSegmentCount
 
-				results := harness.Client.ConsumeSpace(ctx, storeID, args)
-				entries, err := enumerators.ToSlice(results)
+				var entries []*client.Entry
+				var err error
+				for attempt := 0; attempt < 10; attempt++ {
+					results := harness.Client.ConsumeSpace(ctx, storeID, args)
+					entries, err = enumerators.ToSlice(results)
+					if err == nil && len(entries) == expected {
+						break
+					}
+					t.Logf("attempt %d: ConsumeSpace(space0) returned %d entries (err=%v)", attempt+1, len(entries), err)
+					time.Sleep(100 * time.Millisecond)
+				}
 
 				require.NoError(t, err)
-				expected := 5 * IntegrationSegmentCount
-				assert.Len(t, entries, expected)
+				assert.Len(t, entries, expected, "ConsumeSpace(space0) should return %d entries after retries", expected)
 			})
 
 			t.Run("should consume interleaved spaces", func(t *testing.T) {

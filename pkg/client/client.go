@@ -538,14 +538,19 @@ func (c *client) getProduceLock(storeID uuid.UUID, space, segment string) *sync.
 		return mu
 	}
 
-	// Evict old locks if map is too large (simple random eviction)
+	// Evict old locks if map is too large. Only remove entries whose mutex we can lock,
+	// so we never delete a mutex that another goroutine is holding (preserves mutual exclusion).
 	if len(c.produceLocks) >= MaxProduceLocks {
 		toRemove := MaxProduceLocks / 10
 		for k := range c.produceLocks {
-			delete(c.produceLocks, k)
-			toRemove--
 			if toRemove <= 0 {
 				break
+			}
+			mu := c.produceLocks[k]
+			if mu.TryLock() {
+				delete(c.produceLocks, k)
+				mu.Unlock()
+				toRemove--
 			}
 		}
 	}
@@ -642,7 +647,17 @@ func (c *client) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, spac
 }
 
 func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg api.Routeable, handler func(*SegmentStatus)) (api.Subscription, error) {
-	ctx, cancel := context.WithCancel(ctx)
+	subCtx, cancel := context.WithCancel(ctx)
+	// Tie subscription lifecycle to client shutdown so subscription goroutines exit before
+	// Close() closes reconnectQueue (avoids send on closed channel panic).
+	go func() {
+		select {
+		case <-subCtx.Done():
+			return
+		case <-c.reconnectCtx.Done():
+			cancel()
+		}
+	}()
 	done := make(chan struct{})
 
 	// Generate unique subscription ID for tracking
@@ -656,7 +671,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 		handler:   handler,
 		cancel:    cancel,
 		done:      done,
-		ctx:       ctx,
+		ctx:       subCtx,
 		handlerCh: make(chan SegmentStatus, c.handlerQueueSize),
 		streamCh:  make(chan api.BidiStream, 1),
 	}
@@ -668,11 +683,12 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 	c.registerSubscription(subID, activeSub)
 
 	go func() {
+		subCtx := activeSub.ctx
 		defer close(done)
 		defer c.unregisterSubscription(subID)
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "subscription goroutine panic (cleanup completed)", "id", subID, "panic", r)
+				slog.ErrorContext(subCtx, "subscription goroutine panic (cleanup completed)", "id", subID, "panic", r)
 			}
 		}()
 
@@ -684,7 +700,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			go func() {
 				defer workerWg.Done()
 				for status := range activeSub.handlerCh {
-					c.runHandler(ctx, activeSub, subID, handler, &status)
+					c.runHandler(subCtx, activeSub, subID, handler, &status)
 				}
 			}()
 		}
@@ -694,7 +710,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 
 		for {
 			select {
-			case <-ctx.Done():
+			case <-subCtx.Done():
 				return
 			default:
 			}
@@ -702,7 +718,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			// Enqueue ourselves for reconnection — the dispatcher calls CallStream serially.
 			activeSub.status.Store("reconnecting")
 			select {
-			case <-ctx.Done():
+			case <-subCtx.Done():
 				return
 			case c.reconnectQueue <- &reconnectRequest{sub: activeSub}:
 			}
@@ -710,7 +726,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			// Wait for the dispatcher to hand us a stream (or cancellation).
 			var stream api.BidiStream
 			select {
-			case <-ctx.Done():
+			case <-subCtx.Done():
 				return
 			case stream = <-activeSub.streamCh:
 			}
@@ -731,8 +747,8 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 					break
 				}
 				select {
-				case <-ctx.Done():
-					stream.Close(ctx.Err())
+				case <-subCtx.Done():
+					stream.Close(subCtx.Err())
 					return
 				default:
 				}

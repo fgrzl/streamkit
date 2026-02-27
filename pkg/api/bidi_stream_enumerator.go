@@ -17,6 +17,9 @@ type BidiStreamEnumerator[T any] struct {
 }
 
 func (e *BidiStreamEnumerator[T]) MoveNext() bool {
+	if e.stream == nil {
+		return false
+	}
 	var current T
 
 	err := e.stream.Decode(&current)
@@ -47,10 +50,16 @@ func (e *BidiStreamEnumerator[T]) Err() error {
 }
 
 func (e *BidiStreamEnumerator[T]) Dispose() {
-	e.stream.Close(e.Err())
+	if e.stream != nil {
+		e.stream.Close(e.Err())
+	}
 }
 
 // NewStreamEnumerator creates a new enumerator that reads responses from a bidirectional stream.
+// If stream is nil, returns a degenerate enumerator that never yields and Err() returns an error.
 func NewStreamEnumerator[T any](stream BidiStream) enumerators.Enumerator[T] {
+	if stream == nil {
+		return &BidiStreamEnumerator[T]{err: errors.New("streamkit: nil stream")}
+	}
 	return &BidiStreamEnumerator[T]{stream: stream, end: stream.EndOfStreamError()}
 }

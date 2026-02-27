@@ -127,8 +127,12 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 				if backoff > maxDelay {
 					backoff = maxDelay
 				}
-				// Add jitter: +/- 10% of backoff
-				jitter := time.Duration(p.randInt63n(int64(backoff/5))) * time.Nanosecond
+				// Add jitter: +/- 10% of backoff (ensure n >= 1 to avoid randInt63n(0) panic)
+				jitterMax := backoff / 5
+				if jitterMax == 0 {
+					jitterMax = 1
+				}
+				jitter := time.Duration(p.randInt63n(int64(jitterMax))) * time.Nanosecond
 				if p.randIntn(2) == 0 {
 					backoff = backoff + jitter
 				} else {
