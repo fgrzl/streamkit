@@ -169,6 +169,7 @@ type activeSubscription struct {
 	handlerPanics   atomic.Int32         // counts handler panic occurrences
 	handlerCh       chan SegmentStatus   // buffered dispatch channel for non-blocking handler delivery
 	streamCh        chan api.BidiStream  // receives a reconnected stream from the dispatcher
+	retryRequested  atomic.Bool          // set by RetryFailedSubscription to break out and re-enqueue immediately
 }
 
 // reconnectRequest is sent by a subscription goroutine to enqueue itself for reconnection.
@@ -723,8 +724,12 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			activeSub.failureCount.Store(0)
 			activeSub.status.Store("active")
 
-			// Read from stream until it fails or context is cancelled
+			// Read from stream until it fails, context is cancelled, or retry requested
 			for {
+				if activeSub.retryRequested.Swap(false) {
+					stream.Close(nil)
+					break
+				}
 				select {
 				case <-ctx.Done():
 					stream.Close(ctx.Err())
@@ -936,21 +941,21 @@ func (c *client) RemoveSubscription(id string) bool {
 	return existed
 }
 
-// RetryFailedSubscription enqueues a subscription for immediate reconnection.
-// This is useful when external conditions have changed (e.g., server restarted)
-// and the caller wants to bypass the backoff wait.
+// RetryFailedSubscription requests that a subscription reconnect immediately.
+// If the subscription is currently streaming, it will close the stream and re-enqueue
+// for a new one on the next loop iteration. If it is already waiting in the reconnect
+// queue or on a stream from the dispatcher, the next attempt is unchanged.
+// This is useful when external conditions have changed (e.g., server restarted).
 func (c *client) RetryFailedSubscription(id string) error {
 	c.subscriptionsMu.RLock()
-	_, exists := c.subscriptions[id]
+	sub, exists := c.subscriptions[id]
 	c.subscriptionsMu.RUnlock()
 
 	if !exists {
 		return fmt.Errorf("subscription %s not found", id)
 	}
 
-	// The subscription goroutine will re-enqueue itself when its current stream
-	// fails. This is a no-op hint; the goroutine is already in the reconnect queue
-	// or actively streaming.
+	sub.retryRequested.Store(true)
 	return nil
 }
 

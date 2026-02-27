@@ -105,38 +105,6 @@ func IsRetryable(err error) bool {
 	return true
 }
 
-// contains performs case-insensitive substring search
-func contains(s, substr string) bool {
-	// Simple case-insensitive check
-	s, substr = toLower(s), toLower(substr)
-	return len(s) >= len(substr) && (s == substr || indexSubstring(s, substr) >= 0)
-}
-
-func toLower(s string) string {
-	b := make([]byte, len(s))
-	for i := range s {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
-}
-
-func indexSubstring(s, substr string) int {
-	n := len(substr)
-	if n == 0 {
-		return 0
-	}
-	for i := 0; i <= len(s)-n; i++ {
-		if s[i:i+n] == substr {
-			return i
-		}
-	}
-	return -1
-}
-
 // RetryWithBackoff executes fn with exponential backoff retry on failure.
 // Returns immediately on success or if ctx is cancelled.
 func RetryWithBackoff(ctx context.Context, policy RetryPolicy, fn func(context.Context) error) error {

@@ -1163,9 +1163,10 @@ func TestProduceLockIsolatesBySegment(t *testing.T) {
 				}
 				mu.Unlock()
 
-				if prod.Segment == "seg1" {
+				switch prod.Segment {
+				case "seg1":
 					atomic.AddInt32(&seg1Count, 1)
-				} else if prod.Segment == "seg2" {
+				case "seg2":
 					atomic.AddInt32(&seg2Count, 1)
 				}
 

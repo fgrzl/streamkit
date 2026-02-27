@@ -52,9 +52,17 @@ type WebSocketBidiStreamProvider struct {
 	listeners   []api.ReconnectListener
 	// hasConnected tracks if we've ever successfully connected (vs initial connect)
 	hasConnected atomic.Bool
+
+	// OnDialFailure, when set, is called whenever a dial fails (before retrying or returning).
+	// Applications can use it to invalidate a token cache so the next fetchJWT returns a refreshed token.
+	OnDialFailure func(err error)
 }
 
 // NewBidiStreamProvider creates a provider that uses a dedicated WebSocket connection per client.
+// fetchJWT is invoked on every dial attempt and should return a fresh or refreshed token when possible.
+// If the server rejects the token (e.g. 401 Unauthorized), the same token must not be returned on the
+// next attempt—refresh or clear the application's token cache so the next fetchJWT returns a valid token.
+// Optionally set OnDialFailure on the returned provider to be notified when dial fails (e.g. to invalidate cache).
 func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.BidiStreamProvider {
 
 	// normalize address: ensure it ends with /streamz and avoid duplicate slashes
@@ -239,6 +247,7 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 				// attempt to dial and create a new muxer
 				var conn *websocket.Conn
 				var err error
+				var permanentErr bool
 				if p.dialFn != nil {
 					conn, err = p.dialFn()
 				} else {
@@ -255,7 +264,15 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 						backoff = time.Second
 					}
 				} else {
+					permanentErr = isPermanentDialError(err)
+					if p.OnDialFailure != nil {
+						p.OnDialFailure(err)
+					}
 					slog.Warn("provider: reconnect dial failed", slog.String("error", err.Error()))
+					if permanentErr {
+						// Don't hammer the server: use a single longer backoff before next attempt.
+						backoff = 30 * time.Second
+					}
 				}
 
 				// Release dialing lock before sleeping
@@ -267,7 +284,7 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					return
 				case <-time.After(backoff + time.Duration(p.randInt63n(500))*time.Millisecond):
 				}
-				if backoff < 30*time.Second {
+				if !permanentErr && backoff < 30*time.Second {
 					backoff *= 2
 				}
 			}
@@ -354,6 +371,13 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 			// start background reconnect loop now that we have an initial muxer
 			p.startReconnectLoop()
 			return m, nil
+		}
+
+		if p.OnDialFailure != nil {
+			p.OnDialFailure(err)
+		}
+		if isPermanentDialError(err) {
+			return nil, err
 		}
 
 		lastErr = err
@@ -447,6 +471,26 @@ func (p *WebSocketBidiStreamProvider) Close() error {
 	}
 
 	return nil
+}
+
+// isPermanentDialError returns true for auth-related errors (401, unauthorized,
+// etc.) so the provider can fail fast instead of burning retries.
+//
+// Server-side: When 401s persist in logs, check signing key/algorithm, audience/issuer
+// mismatch, token expiry or clock skew, and that the path does not return 401 for
+// non-auth reasons. Inspect server logs and JWT validation config.
+func isPermanentDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	permanent := []string{"401", "unauthorized", "authentication failed", "forbidden", "permission denied"}
+	for _, sub := range permanent {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // dial establishes the raw WebSocket connection with token-based auth.
