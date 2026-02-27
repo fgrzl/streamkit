@@ -112,7 +112,39 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 	for attempt := 1; attempt <= maxEncodeAttempts; attempt++ {
 		muxer, err := p.getOrCreateMuxer(ctx)
 		if err != nil {
-			return nil, err
+			lastErr = err
+			slog.WarnContext(ctx, "provider: failed to get or create muxer, retrying",
+				slog.Int("attempt", attempt),
+				slog.Int("maxAttempts", maxEncodeAttempts),
+				slog.String("error", err.Error()))
+
+			// Check context before backoff
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+
+			// Backoff before retrying muxer creation
+			backoff := baseDelay * (1 << uint(attempt-1))
+			if backoff > maxDelay {
+				backoff = maxDelay
+			}
+			jitterMax := backoff / 5
+			if jitterMax == 0 {
+				jitterMax = 1
+			}
+			jitter := time.Duration(p.randInt63n(int64(jitterMax))) * time.Nanosecond
+			if p.randIntn(2) == 0 {
+				backoff = backoff + jitter
+			} else {
+				backoff = backoff - jitter
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
 		}
 		channelID := uuid.New()
 		bidi := muxer.Register(storeID, channelID)
@@ -355,12 +387,13 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 	// This avoids burning a full 5-attempt foreground dial cycle per request
 	// while the background loop is already retrying.
 	pollInterval := 250 * time.Millisecond
-	deadline := time.After(time.Duration(p.maxDialAttempts*6) * time.Second)
+	timer := time.NewTimer(time.Duration(p.maxDialAttempts*6) * time.Second)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-deadline:
+		case <-timer.C:
 			return nil, errors.New("timed out waiting for stream connection")
 		case <-time.After(pollInterval):
 			p.mu.Lock()
@@ -409,7 +442,8 @@ func (p *WebSocketBidiStreamProvider) replaceMuxer(newMuxer providerMuxer) {
 // reusing a closed or closing muxer.
 // The old muxer is closed after a grace period to allow in-flight streams
 // on the old muxer to complete — matching replaceMuxer's behavior.
-func (p *WebSocketBidiStreamProvider) invalidateMuxer() {
+// Returns true if there was an existing muxer that will be closed.
+func (p *WebSocketBidiStreamProvider) invalidateMuxer() bool {
 	p.mu.Lock()
 	oldMuxer := p.muxer
 	p.muxer = nil
@@ -422,10 +456,13 @@ func (p *WebSocketBidiStreamProvider) invalidateMuxer() {
 	// cascading ErrMuxerClosed failures.
 	if oldMuxer != nil {
 		go func(m providerMuxer) {
+			// Wait for any in-flight encode operations to complete
 			time.Sleep(500 * time.Millisecond)
 			p.closeMuxer(m)
 		}(oldMuxer)
+		return true
 	}
+	return false
 }
 
 // closeMuxer attempts to close a muxer if it's a *WebSocketMuxer.
