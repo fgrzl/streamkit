@@ -44,7 +44,9 @@ const (
 // StoreID and ChannelID scope payloads to logical streams.
 // TraceContext carries W3C trace context (traceparent, baggage) for distributed tracing.
 type MuxerMsg struct {
-	ControlType  ControlType       `json:"control_type"`
+	// ControlType uses type tag (ignored by encoding/json) so the field keeps
+	// serializing as "ControlType" for wire compatibility; do not add json tag.
+	ControlType  ControlType       `type:"control_type"`
 	StoreID      uuid.UUID         `json:"store_id"`
 	ChannelID    uuid.UUID         `json:"channel_id"`
 	Payload      []byte            `json:"payload"`

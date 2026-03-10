@@ -61,7 +61,7 @@ type otelClientMetrics struct {
 
 func (o *otelClientMetrics) RecordProduceLatency(space, segment string, duration time.Duration) {
 	if o.produceLatency != nil {
-		o.produceLatency.Record(context.Background(), duration.Seconds()*1000,
+		o.produceLatency.Record(context.Background(), float64(duration.Milliseconds()),
 			metric.WithAttributes(
 				attribute.String("streamkit.space", space),
 				attribute.String("streamkit.segment", segment),
@@ -71,7 +71,7 @@ func (o *otelClientMetrics) RecordProduceLatency(space, segment string, duration
 
 func (o *otelClientMetrics) RecordConsumeLatency(space, segment string, duration time.Duration) {
 	if o.consumeLatency != nil {
-		o.consumeLatency.Record(context.Background(), duration.Seconds()*1000,
+		o.consumeLatency.Record(context.Background(), float64(duration.Milliseconds()),
 			metric.WithAttributes(
 				attribute.String("streamkit.space", space),
 				attribute.String("streamkit.segment", segment),

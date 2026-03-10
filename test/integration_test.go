@@ -415,6 +415,13 @@ func TestConsumerOperations(t *testing.T) {
 // TestOtelTraceContinuityOverWskit verifies that a client request over WebSocket
 // produces connected client and server spans (same trace ID).
 func TestOtelTraceContinuityOverWskit(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
 	exporter := tracetest.NewInMemoryExporter()
 	tp := trace.NewTracerProvider(
 		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),

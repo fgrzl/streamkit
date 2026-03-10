@@ -214,8 +214,6 @@ func (c *tracingClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUI
 		telemetry.RecordError(span, err)
 		return nil, err
 	}
-
-	span.SetAttributes(telemetry.WithRequestID(generateOrGetRequestID(ctx)))
 	return sub, nil
 }
 
@@ -279,13 +277,11 @@ func wrapStringEnumerator(ctx context.Context, enum enumerators.Enumerator[strin
 
 	return enumerators.Map(enum, func(s string) (string, error) {
 		chunkCount++
-		if chunkCount == 1 {
-			_, span := tracer.Start(ctx, spanName,
-				trace.WithAttributes(
-					attribute.Int("streamkit.chunk_num", chunkCount),
-				))
-			defer span.End()
-		}
+		_, span := tracer.Start(ctx, spanName,
+			trace.WithAttributes(
+				attribute.Int("streamkit.chunk_num", chunkCount),
+			))
+		defer span.End()
 		return s, nil
 	})
 }
