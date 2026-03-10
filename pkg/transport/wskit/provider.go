@@ -13,7 +13,9 @@ import (
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/websocket"
 )
 
@@ -21,6 +23,7 @@ import (
 type providerMuxer interface {
 	Ping() bool
 	Register(uuid.UUID, uuid.UUID) api.BidiStream
+	RegisterWithContext(context.Context, uuid.UUID, uuid.UUID) api.BidiStream
 }
 
 // WebSocketBidiStreamProvider manages a per-tenant WebSocket connection and muxer.
@@ -101,6 +104,14 @@ func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.Bid
 // CallStream opens or reuses a muxed stream over the WebSocket for a single logical interaction.
 // Implements resilient retry with exponential backoff for transient muxer closure.
 func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uuid.UUID, msg api.Routeable) (api.BidiStream, error) {
+	tracer := telemetry.GetTracer()
+	ctx, span := tracer.Start(ctx, "streamkit.transport.call_stream",
+		trace.WithAttributes(
+			telemetry.WithStoreID(storeID),
+			telemetry.WithTransportType("websocket"),
+		))
+	defer span.End()
+
 	// Retry loop for transient muxer closure: if muxer closes during Encode,
 	// recreate the muxer and retry with exponential backoff.
 	// Max attempts tuned to allow sufficient reconnection time in production.
@@ -110,6 +121,7 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 	maxDelay := time.Duration(10) * time.Second
 
 	for attempt := 1; attempt <= maxEncodeAttempts; attempt++ {
+		span.SetAttributes(telemetry.WithAttempt(attempt))
 		muxer, err := p.getOrCreateMuxer(ctx)
 		if err != nil {
 			lastErr = err
@@ -147,7 +159,7 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 			continue
 		}
 		channelID := uuid.New()
-		bidi := muxer.Register(storeID, channelID)
+		bidi := muxer.RegisterWithContext(ctx, storeID, channelID)
 
 		// we use a polymorphic envelope so that we can
 		// unmarshal server side and route the msg
@@ -190,6 +202,7 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 				continue
 			}
 			// Non-muxer errors are fatal (context cancellation, auth errors, etc.)
+			telemetry.RecordError(span, err)
 			slog.WarnContext(ctx, "provider: encode failed with non-transient error",
 				slog.String("error", err.Error()),
 				slog.String("channelID", channelID.String()))
@@ -199,12 +212,15 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 	}
 
 	if lastErr != nil {
+		telemetry.RecordError(span, lastErr)
 		slog.ErrorContext(ctx, "provider: exhausted all retry attempts",
 			slog.Int("maxAttempts", maxEncodeAttempts),
 			slog.String("lastError", lastErr.Error()))
 		return nil, lastErr
 	}
-	return nil, errors.New("failed to call stream")
+	err := errors.New("failed to call stream")
+	telemetry.RecordError(span, err)
+	return nil, err
 }
 
 // randInt63n returns a thread-safe random int64 in [0,n)

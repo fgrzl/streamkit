@@ -15,12 +15,15 @@ import (
 	"time"
 
 	"github.com/fgrzl/timestamp"
-
 	"sync/atomic"
 
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/server"
+	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/websocket"
 )
 
@@ -39,11 +42,15 @@ const (
 // MuxerMsg is the wire representation for framed messages exchanged over the
 // multiplexed websocket. The ControlType field selects the frame kind; the
 // StoreID and ChannelID scope payloads to logical streams.
+// TraceContext carries W3C trace context (traceparent, baggage) for distributed tracing.
 type MuxerMsg struct {
-	ControlType ControlType `type:"control_type"`
-	StoreID     uuid.UUID   `json:"store_id"`
-	ChannelID   uuid.UUID   `json:"channel_id"`
-	Payload     []byte      `json:"payload"`
+	// ControlType uses type tag (ignored by encoding/json) so the field keeps
+	// serializing as "ControlType" for wire compatibility; do not add json tag.
+	ControlType  ControlType       `type:"control_type"`
+	StoreID      uuid.UUID         `json:"store_id"`
+	ChannelID    uuid.UUID         `json:"channel_id"`
+	Payload      []byte            `json:"payload"`
+	TraceContext map[string]string `json:"trace_context,omitempty"`
 }
 
 // WebSocketMuxer multiplexes multiple logical bidirectional streams over a single WebSocket connection.
@@ -220,11 +227,17 @@ func (m *WebSocketMuxer) Serve() {
 // channelID and returns an api.BidiStream that can be used to send and receive
 // payloads on that logical stream.
 func (m *WebSocketMuxer) Register(storeID, channelID uuid.UUID) api.BidiStream {
-	return m.register(storeID, channelID)
+	return m.RegisterWithContext(context.Background(), storeID, channelID)
+}
+
+// RegisterWithContext is like Register but uses ctx for trace context propagation
+// when sending data frames. Used by the provider to correlate client and server spans.
+func (m *WebSocketMuxer) RegisterWithContext(ctx context.Context, storeID, channelID uuid.UUID) api.BidiStream {
+	return m.register(ctx, storeID, channelID)
 }
 
 // internal registration logic (safe for reuse)
-func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream {
+func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.UUID) *MuxerBidiStream {
 	// Fast-fail if the muxer is already shut down. Without this check,
 	// Register on a closed muxer creates an orphaned stream in the channels
 	// map that will never be cleaned up by shutdown (which already ran).
@@ -244,7 +257,7 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 	default:
 	}
 
-	sendFn := func(payload []byte) error { return m.sendData(storeID, channelID, payload) }
+	sendFn := func(payload []byte) error { return m.sendDataWithTrace(ctx, storeID, channelID, payload) }
 
 	cleanup := func() {
 		m.channelsMu.Lock()
@@ -262,10 +275,19 @@ func (m *WebSocketMuxer) register(storeID, channelID uuid.UUID) *MuxerBidiStream
 	return bidi
 }
 
+// sendDataWithTrace injects trace context from ctx into the message and sends a data frame.
+func (m *WebSocketMuxer) sendDataWithTrace(ctx context.Context, storeID, channelID uuid.UUID, payload []byte) error {
+	var traceContext map[string]string
+	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+		traceContext = make(map[string]string)
+		otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(traceContext))
+	}
+	return m.sendData(storeID, channelID, payload, traceContext)
+}
+
 // sendData sends a data control frame for the given store/channel and handles
-// error reporting and shutdown logic. It mirrors the behavior previously
-// embedded inline within register.
-func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte) error {
+// error reporting and shutdown logic. traceContext is optional and used for distributed tracing.
+func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte, traceContext map[string]string) error {
 	// fast-fail if muxer is closed
 	select {
 	case <-m.done:
@@ -277,13 +299,15 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte) 
 	pooled := m.msgPool.Get()
 	if pooled == nil || m.writeQueue == nil {
 		// synchronous fallback when pool or queue not initialized - shutdown on error
-		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
+		msg := &MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload, TraceContext: traceContext}
+		return m.sendJSONWithLock(msg, true)
 	}
 
 	msg := pooled.(*MuxerMsg)
 	msg.ControlType = ControlTypeData
 	msg.StoreID = storeID
 	msg.ChannelID = channelID
+	msg.TraceContext = traceContext
 	if len(payload) > 0 {
 		// try to reuse buffer from pool when possible
 		bp := m.bufPool.Get()
@@ -314,7 +338,7 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte) 
 		// queue full; return msg to pool and perform synchronous send under lock
 		m.msgPool.Put(msg)
 		// perform synchronous send under lock (shutdown on error)
-		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
+		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload, TraceContext: traceContext}, true)
 	}
 }
 
@@ -379,8 +403,12 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 
 // processMessage handles a single decoded MuxerMsg. It contains the large
 // control-type switch extracted from readLoop so the loop itself stays concise.
+// For data messages, trace context is extracted from the frame and attached to context.
 func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 	ctx := server.WithChannelID(m.Context, msg.ChannelID)
+	if msg.TraceContext != nil && len(msg.TraceContext) > 0 {
+		ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(msg.TraceContext))
+	}
 	switch msg.ControlType {
 	case ControlTypePing:
 		m.handlePing(ctx)
@@ -490,9 +518,19 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 		return nil, err
 	}
 
-	bidi = m.register(msg.StoreID, msg.ChannelID)
+	bidi = m.register(ctx, msg.StoreID, msg.ChannelID)
 	if bidi != nil {
-		go instance.Handle(ctx, bidi)
+		tracer := telemetry.GetTracer()
+		reqCtx, span := tracer.Start(ctx, "streamkit.transport.server.request",
+			trace.WithAttributes(
+				telemetry.WithStoreID(msg.StoreID),
+				telemetry.WithChannelID(msg.ChannelID),
+				telemetry.WithTransportType("websocket"),
+			))
+		go func() {
+			defer span.End()
+			instance.Handle(reqCtx, bidi)
+		}()
 		return bidi, nil
 	}
 	slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", slog.String("channel_id", msg.ChannelID.String()))

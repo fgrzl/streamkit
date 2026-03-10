@@ -26,7 +26,7 @@ func TestShouldRegisterChannelInMuxer(t *testing.T) {
 	// Act
 	storeID := uuid.New()
 	channelID := uuid.New()
-	bidi := m.register(storeID, channelID)
+	bidi := m.register(context.Background(), storeID, channelID)
 
 	// Assert
 	assert.NotNil(t, bidi)
@@ -54,7 +54,7 @@ func TestShouldRemoveChannelOnOnClose(t *testing.T) {
 	}
 	storeID := uuid.New()
 	channelID := uuid.New()
-	bidi := m.register(storeID, channelID)
+	bidi := m.register(context.Background(), storeID, channelID)
 
 	// Act
 	if bidi.onClose != nil {
@@ -79,8 +79,8 @@ func TestShouldOverwriteExistingRegistration(t *testing.T) {
 	// Act
 	storeID := uuid.New()
 	channelID := uuid.New()
-	first := m.register(storeID, channelID)
-	second := m.register(storeID, channelID)
+	first := m.register(context.Background(), storeID, channelID)
+	second := m.register(context.Background(), storeID, channelID)
 
 	// Assert
 	assert.NotEqual(t, first, second)
@@ -100,7 +100,7 @@ func TestShouldRejectOfferAfterClose(t *testing.T) {
 	storeID := uuid.New()
 	channelID := uuid.New()
 
-	bidi := m.register(storeID, channelID)
+	bidi := m.register(context.Background(), storeID, channelID)
 	// Mark the stream closed without invoking CloseSend (which would use websocket)
 	atomic.StoreUint32(&bidi.closedFlag, 1)
 	select {
@@ -128,7 +128,7 @@ func TestRegisterStoresAndCleanupRemovesChannel(t *testing.T) {
 	channelID := uuid.New()
 
 	// Act: register a channel
-	bidi := m.register(storeID, channelID)
+	bidi := m.register(context.Background(), storeID, channelID)
 
 	// Assert: channel present
 	require.NotNil(t, bidi)
@@ -190,7 +190,7 @@ func TestShouldShutdownOnSendDataError(t *testing.T) {
 	// Act
 	storeID := uuid.New()
 	channelID := uuid.New()
-	err := m.sendData(storeID, channelID, []byte(`"x"`))
+	err := m.sendData(storeID, channelID, []byte(`"x"`), nil)
 
 	// Assert
 	require.Error(t, err)
@@ -275,7 +275,7 @@ func TestMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {
 				// call various send paths; ignore errors
 				_ = m.sendPing()
 				_ = m.sendControl(ControlTypePing, uuid.Nil, uuid.Nil, nil)
-				_ = m.sendData(uuid.Nil, uuid.Nil, []byte("hello"))
+				_ = m.sendData(uuid.Nil, uuid.Nil, []byte("hello"), nil)
 				// small sleep to increase interleaving
 				time.Sleep(time.Millisecond)
 			}

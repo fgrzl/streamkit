@@ -93,8 +93,6 @@ func TestConcurrentCallStreamDuringMuxerReconnect(t *testing.T) {
 // TestRapidMuxerReplacementDuringHighLoad simulates the scenario where
 // the reconnect loop keeps replacing the muxer while operations are in flight.
 func TestRapidMuxerReplacementDuringHighLoad(t *testing.T) {
-	t.Skip("Stress test - enable manually for extended validation")
-
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -128,9 +126,10 @@ func TestRapidMuxerReplacementDuringHighLoad(t *testing.T) {
 		}
 	}
 
+	var dialAttempts int32
 	p.dialFn = func() (*websocket.Conn, error) {
-		// Simulate occasional dial failures
-		if atomic.LoadInt32(&muxerCreationCount)%7 == 0 {
+		// Simulate occasional dial failures (not the first, so we can create at least one muxer)
+		if n := atomic.AddInt32(&dialAttempts, 1); n > 1 && (n-1)%7 == 0 {
 			return nil, assert.AnError
 		}
 		return nil, nil

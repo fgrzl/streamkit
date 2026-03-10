@@ -11,14 +11,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"runtime/debug"
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/messaging"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/storage"
+	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Node represents a request handler that processes streaming operations
@@ -53,8 +54,7 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			slog.ErrorContext(ctx, "handler panic recovered", "panic", r, "stack", stack)
+			slog.ErrorContext(ctx, "handler panic recovered", "panic", r)
 			bidi.Close(fmt.Errorf("panic: %v", r))
 		}
 	}()
@@ -65,26 +65,48 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 		return
 	}
 
+	tracer := telemetry.GetTracer()
+	baseAttrs := []trace.SpanStartOption{trace.WithAttributes(telemetry.WithStoreID(n.storeID))}
+	var spanName string
+	var handler func(context.Context, api.BidiStream)
 	switch args := envelope.Content.(type) {
 	case *api.Consume:
-		n.handleConsume(ctx, args, bidi)
+		spanName = "streamkit.server.consume"
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleConsume(ctx, args, b) }
 	case *api.ConsumeSegment:
-		n.handleConsumeSegment(ctx, args, bidi)
+		spanName = "streamkit.server.consume_segment"
+		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleConsumeSegment(ctx, args, b) }
 	case *api.ConsumeSpace:
-		n.handleConsumeSpace(ctx, args, bidi)
+		spanName = "streamkit.server.consume_space"
+		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space)))
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleConsumeSpace(ctx, args, b) }
 	case *api.GetSegments:
-		n.handleGetSegments(ctx, args, bidi)
+		spanName = "streamkit.server.get_segments"
+		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space)))
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleGetSegments(ctx, args, b) }
 	case *api.GetSpaces:
-		n.handleGetSpaces(ctx, args, bidi)
+		spanName = "streamkit.server.get_spaces"
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleGetSpaces(ctx, args, b) }
 	case *api.Peek:
-		n.handlePeek(ctx, args, bidi)
+		spanName = "streamkit.server.peek"
+		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
+		handler = func(ctx context.Context, b api.BidiStream) { n.handlePeek(ctx, args, b) }
 	case *api.Produce:
-		n.handleProduce(ctx, args, bidi)
+		spanName = "streamkit.server.produce"
+		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleProduce(ctx, args, b) }
 	case *api.SubscribeToSegmentStatus:
-		n.handleSubscribe(ctx, args, bidi)
+		spanName = "streamkit.server.subscribe"
+		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleSubscribe(ctx, args, b) }
 	default:
 		bidi.Close(fmt.Errorf("invalid request msg type: %T", envelope.Content))
+		return
 	}
+	opCtx, span := tracer.Start(ctx, spanName, baseAttrs...)
+	defer span.End()
+	handler(opCtx, bidi)
 }
 
 func (n *defaultNode) handleGetSpaces(ctx context.Context, _ *api.GetSpaces, bidi api.BidiStream) {

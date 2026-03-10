@@ -20,14 +20,8 @@ import (
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
-)
-
-// Issue #24: Use typed context keys instead of strings to avoid collisions
-type contextKey string
-
-const (
-	requestIDKey contextKey = "request_id" // Typed key to prevent collisions with other packages
 )
 
 type (
@@ -131,6 +125,13 @@ func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolic
 // If a handler takes longer than the specified timeout, it is interrupted and execution continues
 // with the next message. The timeout event is logged and tracked in subscription metrics.
 func NewClientWithHandlerTimeout(provider api.BidiStreamProvider, handlerTimeout time.Duration) Client {
+	return NewClientWithMetrics(provider, handlerTimeout, nil)
+}
+
+// NewClientWithMetrics creates a new Client with optional metrics. Pass nil for metrics to disable.
+// Use NewOTelClientMetrics() for OpenTelemetry-backed produce/consume latency and
+// subscription replay/timeout/panic metrics.
+func NewClientWithMetrics(provider api.BidiStreamProvider, handlerTimeout time.Duration, metrics ClientMetrics) Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &client{
 		provider:              provider,
@@ -143,6 +144,7 @@ func NewClientWithHandlerTimeout(provider api.BidiStreamProvider, handlerTimeout
 		reconnectCtx:          ctx,
 		reconnectCancel:       cancel,
 		produceLocks:          make(map[string]*sync.Mutex),
+		metrics:               metrics,
 	}
 
 	c.startReconnectDispatcher()
@@ -241,20 +243,17 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 }
 
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
-	requestID := uuid.New().String()
-	ctx = context.WithValue(ctx, requestIDKey, requestID)
+	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
-	requestID := uuid.New().String()
-	ctx = context.WithValue(ctx, requestIDKey, requestID)
+	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
-	requestID := uuid.New().String()
-	ctx = context.WithValue(ctx, requestIDKey, requestID)
+	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
@@ -791,6 +790,9 @@ func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID 
 		defer func() {
 			if r := recover(); r != nil {
 				sub.handlerPanics.Add(1)
+				if c.metrics != nil {
+					c.metrics.RecordHandlerPanic(subID)
+				}
 				slog.ErrorContext(ctx, "subscription handler panic", "id", subID, "panic", r)
 			}
 		}()
@@ -801,6 +803,9 @@ func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID 
 	case <-done:
 	case <-handlerCtx.Done():
 		sub.handlerTimeouts.Add(1)
+		if c.metrics != nil {
+			c.metrics.RecordHandlerTimeout(subID)
+		}
 		slog.WarnContext(ctx, "subscription handler exceeded timeout", "id", subID, "timeout", c.handlerTimeout)
 	}
 }
@@ -841,6 +846,7 @@ func (c *client) startReconnectDispatcher() {
 					}
 
 					sub := req.sub
+					replayStart := time.Now()
 
 					// Skip if subscription was cancelled while waiting in queue
 					select {
@@ -864,6 +870,9 @@ func (c *client) startReconnectDispatcher() {
 					if err != nil {
 						sub.failureCount.Add(1)
 						sub.lastError.Store(err)
+						if c.metrics != nil {
+							c.metrics.RecordSubscriptionReplay(sub.id, false, time.Since(replayStart))
+						}
 
 						// Deliver nil so the goroutine re-enqueues itself
 						select {
@@ -885,6 +894,9 @@ func (c *client) startReconnectDispatcher() {
 
 					// Success — reset backoff and deliver stream to the subscription goroutine
 					backoff = 0
+					if c.metrics != nil {
+						c.metrics.RecordSubscriptionReplay(sub.id, true, time.Since(replayStart))
+					}
 					select {
 					case sub.streamCh <- stream:
 					case <-sub.ctx.Done():
