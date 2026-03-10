@@ -1410,6 +1410,111 @@ func TestSubscriptionRetriesIndefinitely(t *testing.T) {
 	assert.False(t, stillExists, "subscription should be unregistered after Unsubscribe")
 }
 
+// TestAcquireLeaseSuccessAndRelease verifies that AcquireLease returns a lease when server returns Ok,
+// and that Release() sends LeaseRelease and closes Done().
+func TestAcquireLeaseSuccessAndRelease(t *testing.T) {
+	var releaseCalled atomic.Bool
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				if res, ok := m.(*api.LeaseResult); ok {
+					res.Ok = true
+				}
+				return nil
+			}
+			if _, ok := routeable.(*api.LeaseRelease); ok {
+				releaseCalled.Store(true)
+			}
+			return stream, nil
+		},
+	}
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+
+	lease, err := c.AcquireLease(ctx, storeID, "key1", 30*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+
+	err = lease.Release()
+	require.NoError(t, err)
+	select {
+	case <-lease.Done():
+		// expected
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done() should be closed after Release()")
+	}
+	assert.True(t, releaseCalled.Load(), "Release() should have sent LeaseRelease")
+}
+
+// TestAcquireLeaseNotAcquired verifies that when server returns Ok false, AcquireLease returns an error.
+func TestAcquireLeaseNotAcquired(t *testing.T) {
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				if res, ok := m.(*api.LeaseResult); ok {
+					res.Ok = false
+					res.Message = "held by other"
+				}
+				return nil
+			}
+			return stream, nil
+		},
+	}
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+
+	lease, err := c.AcquireLease(ctx, storeID, "key1", 30*time.Second)
+	require.Error(t, err)
+	require.Nil(t, lease)
+	assert.ErrorIs(t, err, ErrLeaseNotAcquired)
+}
+
+// TestLeaseRenewLoopStopsAfterRelease verifies that the renew loop runs and that Release() stops it and sends LeaseRelease.
+func TestLeaseRenewLoopStopsAfterRelease(t *testing.T) {
+	var acquireCount, renewCount, releaseCount atomic.Int32
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			switch routeable.(type) {
+			case *api.LeaseAcquire:
+				acquireCount.Add(1)
+			case *api.LeaseRenew:
+				renewCount.Add(1)
+			case *api.LeaseRelease:
+				releaseCount.Add(1)
+			}
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				if res, ok := m.(*api.LeaseResult); ok {
+					res.Ok = true
+				}
+				return nil
+			}
+			return stream, nil
+		},
+	}
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+
+	// Min TTL is 1s, renew every ttl/2 = 500ms. Hold for ~1.2s to get at least one renew, then release.
+	lease, err := c.AcquireLease(ctx, storeID, "key1", 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+
+	time.Sleep(1200 * time.Millisecond) // allow at least one renew tick
+	err = lease.Release()
+	require.NoError(t, err)
+	<-lease.Done()
+
+	assert.Equal(t, int32(1), acquireCount.Load(), "should have exactly one LeaseAcquire")
+	assert.GreaterOrEqual(t, renewCount.Load(), int32(1), "should have at least one LeaseRenew")
+	assert.Equal(t, int32(1), releaseCount.Load(), "should have exactly one LeaseRelease")
+}
+
 func TestIsRetryable(t *testing.T) {
 	assert.False(t, IsRetryable(context.Canceled))
 	assert.False(t, IsRetryable(fmt.Errorf("not found")))

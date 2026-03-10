@@ -11,7 +11,7 @@ require (
 	github.com/fgrzl/json v1.0.0-alpha.5
 	github.com/fgrzl/lexkey v0.1.0-alpha.35
 	github.com/fgrzl/messaging v1.0.0-alpha.7
-	github.com/fgrzl/mux v0.0.1-alpha.168
+	github.com/fgrzl/mux v0.0.1-alpha.169
 	github.com/fgrzl/timestamp v1.0.0-alpha.2
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.18.4

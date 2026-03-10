@@ -254,6 +254,26 @@ func (c *tracingClient) GetSubscriptionStatus(id string) *SubscriptionStatus {
 	return c.client.GetSubscriptionStatus(id)
 }
 
+// AcquireLease acquires a lease with tracing.
+func (c *tracingClient) AcquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error) {
+	requestID := generateOrGetRequestID(ctx)
+	ctx, span := c.tracer.Start(ctx, "streamkit.client.acquire_lease",
+		trace.WithAttributes(
+			telemetry.WithStoreID(storeID),
+			attribute.String("streamkit.lease.key", key),
+			attribute.Int64("streamkit.lease.ttl_sec", int64(ttl.Seconds())),
+			telemetry.WithRequestID(requestID),
+		))
+	defer span.End()
+
+	lease, err := c.client.AcquireLease(ctx, storeID, key, ttl)
+	if err != nil {
+		telemetry.RecordError(span, err)
+		return nil, err
+	}
+	return lease, nil
+}
+
 // Close gracefully shuts down the client.
 func (c *tracingClient) Close() error {
 	_, span := c.tracer.Start(context.Background(), "streamkit.client.close")
@@ -271,7 +291,7 @@ func (c *tracingClient) Close() error {
 // Helper functions for enumerator wrapping
 
 // wrapStringEnumerator wraps a string enumerator to emit chunk spans.
-func wrapStringEnumerator(ctx context.Context, enum enumerators.Enumerator[string], parentSpan trace.Span, spanName string) enumerators.Enumerator[string] {
+func wrapStringEnumerator(ctx context.Context, enum enumerators.Enumerator[string], _ trace.Span, spanName string) enumerators.Enumerator[string] {
 	tracer := telemetry.GetTracer()
 	chunkCount := 0
 
@@ -287,7 +307,7 @@ func wrapStringEnumerator(ctx context.Context, enum enumerators.Enumerator[strin
 }
 
 // wrapEntryEnumerator wraps an entry enumerator to emit chunk spans.
-func wrapEntryEnumerator(ctx context.Context, enum enumerators.Enumerator[*Entry], parentSpan trace.Span, spanName string) enumerators.Enumerator[*Entry] {
+func wrapEntryEnumerator(ctx context.Context, enum enumerators.Enumerator[*Entry], _ trace.Span, spanName string) enumerators.Enumerator[*Entry] {
 	tracer := telemetry.GetTracer()
 	chunkCount := 0
 	chunkSize := 0
@@ -310,7 +330,7 @@ func wrapEntryEnumerator(ctx context.Context, enum enumerators.Enumerator[*Entry
 }
 
 // wrapSegmentStatusEnumerator wraps a status enumerator to emit chunk spans.
-func wrapSegmentStatusEnumerator(ctx context.Context, enum enumerators.Enumerator[*SegmentStatus], parentSpan trace.Span, spanName string) enumerators.Enumerator[*SegmentStatus] {
+func wrapSegmentStatusEnumerator(ctx context.Context, enum enumerators.Enumerator[*SegmentStatus], _ trace.Span, spanName string) enumerators.Enumerator[*SegmentStatus] {
 	tracer := telemetry.GetTracer()
 	chunkCount := 0
 

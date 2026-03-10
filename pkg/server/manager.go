@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fgrzl/messaging"
+	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/google/uuid"
 )
@@ -112,7 +113,8 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 	// Success - clear failures
 	delete(m.failures, storeID)
 
-	node := NewNode(storeID, store, m.busFactory)
+	leaseStore := lease.NewStore()
+	node := NewNode(storeID, store, m.busFactory, leaseStore)
 	m.nodes[storeID] = node
 	return node, nil
 }

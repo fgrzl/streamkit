@@ -5,9 +5,11 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/json/polymorphic"
+	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -123,7 +125,7 @@ func (m *mockBidi) Closed() <-chan struct{} { return m.closed }
 func TestGetSpacesStreamsNames(t *testing.T) {
 	// Arrange
 	store := &mockStore{spaces: []string{"one", "two"}}
-	node := NewNode(uuid.New(), store, nil)
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.GetSpaces{}}
 	bidi := newMockBidi(env)
 
@@ -138,7 +140,7 @@ func TestGetSpacesStreamsNames(t *testing.T) {
 func TestPeekReturnsEntryOrEmpty(t *testing.T) {
 	// case: nil entry - should encode empty entry with space/segment
 	store := &mockStore{peekEntry: nil}
-	node := NewNode(uuid.New(), store, nil)
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
 	env := &polymorphic.Envelope{Content: &api.Peek{Space: "s", Segment: "seg"}}
 	bidi := newMockBidi(env)
@@ -152,7 +154,7 @@ func TestPeekReturnsEntryOrEmpty(t *testing.T) {
 	// case: non-nil entry
 	e := &api.Entry{Space: "s", Segment: "seg", Sequence: 1}
 	store2 := &mockStore{peekEntry: e}
-	node2 := NewNode(uuid.New(), store2, nil)
+	node2 := NewNode(uuid.New(), store2, nil, lease.NewStore())
 	env2 := &polymorphic.Envelope{Content: &api.Peek{Space: "s", Segment: "seg"}}
 	bidi2 := newMockBidi(env2)
 	node2.Handle(context.Background(), bidi2)
@@ -163,7 +165,7 @@ func TestPeekReturnsEntryOrEmpty(t *testing.T) {
 func TestProduceNotifiesBus(t *testing.T) {
 	statuses := []*api.SegmentStatus{{Space: "s", Segment: "seg"}}
 	store := &mockStore{statuses: statuses}
-	node := NewNode(uuid.New(), store, nil)
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
 	// For Produce, the decode envelope is the Produce message. The stream
 	// enumerator for records will call Decode into a Record; since our mockBidi
@@ -183,7 +185,7 @@ func TestProduceNotifiesBus(t *testing.T) {
 
 func TestHandleInvalidMsgType(t *testing.T) {
 	store := &mockStore{}
-	node := NewNode(uuid.New(), store, nil)
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
 	env := &polymorphic.Envelope{Content: struct{}{}}
 	bidi := newMockBidi(env)
@@ -192,6 +194,58 @@ func TestHandleInvalidMsgType(t *testing.T) {
 
 	// Assert
 	require.Error(t, bidi.closeErr, "expected Close to be called with error for invalid msg type")
+}
+
+func TestLeaseAcquireReturnsOk(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	env := &polymorphic.Envelope{Content: &api.LeaseAcquire{Key: "k", Holder: "h1", TTLSeconds: 30}}
+	bidi := newMockBidi(env)
+
+	node.Handle(context.Background(), bidi)
+
+	require.Len(t, bidi.encoded, 1)
+	result, ok := bidi.encoded[0].(*api.LeaseResult)
+	require.True(t, ok)
+	require.True(t, result.Ok)
+}
+
+func TestLeaseAcquireConflictReturnsNotOk(t *testing.T) {
+	leaseStore := lease.NewStore()
+	_ = leaseStore.Acquire("k", "h0", 30*time.Second)
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, leaseStore)
+	env := &polymorphic.Envelope{Content: &api.LeaseAcquire{Key: "k", Holder: "h0", TTLSeconds: 30}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	require.Len(t, bidi.encoded, 1)
+	require.True(t, bidi.encoded[0].(*api.LeaseResult).Ok)
+
+	// second holder fails
+	env2 := &polymorphic.Envelope{Content: &api.LeaseAcquire{Key: "k", Holder: "h1", TTLSeconds: 30}}
+	bidi2 := newMockBidi(env2)
+	node.Handle(context.Background(), bidi2)
+	require.Len(t, bidi2.encoded, 1)
+	require.False(t, bidi2.encoded[0].(*api.LeaseResult).Ok)
+}
+
+func TestLeaseRenewAndReleaseReturnOk(t *testing.T) {
+	leaseStore := lease.NewStore()
+	_ = leaseStore.Acquire("k", "h1", 30*time.Second)
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, leaseStore)
+
+	envRenew := &polymorphic.Envelope{Content: &api.LeaseRenew{Key: "k", Holder: "h1", TTLSeconds: 60}}
+	bidiRenew := newMockBidi(envRenew)
+	node.Handle(context.Background(), bidiRenew)
+	require.Len(t, bidiRenew.encoded, 1)
+	require.True(t, bidiRenew.encoded[0].(*api.LeaseResult).Ok)
+
+	envRelease := &polymorphic.Envelope{Content: &api.LeaseRelease{Key: "k", Holder: "h1"}}
+	bidiRelease := newMockBidi(envRelease)
+	node.Handle(context.Background(), bidiRelease)
+	require.Len(t, bidiRelease.encoded, 1)
+	require.True(t, bidiRelease.encoded[0].(*api.LeaseResult).Ok)
 }
 
 type panickingStore struct{}
@@ -215,7 +269,7 @@ func (p *panickingStore) Produce(ctx context.Context, args *api.Produce, entries
 func (p *panickingStore) Close() {}
 
 func TestHandlePanicRecovered(t *testing.T) {
-	node := NewNode(uuid.New(), &panickingStore{}, nil)
+	node := NewNode(uuid.New(), &panickingStore{}, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.GetSpaces{}}
 	bidi := newMockBidi(env)
 
@@ -227,7 +281,7 @@ func TestHandlePanicRecovered(t *testing.T) {
 
 func TestSubscribeNoBusConfigured(t *testing.T) {
 	store := &mockStore{}
-	node := NewNode(uuid.New(), store, nil)
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
 	env := &polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{Space: "s", Segment: "*"}}
 	bidi := newMockBidi(env)
@@ -263,7 +317,7 @@ func TestStreamNamesCurrentError(t *testing.T) {
 		return &errorEnumerator[string]{err: errors.New("bad current")}
 	}
 	bad := &badStore{getter: storeGetter}
-	node := NewNode(uuid.New(), bad, nil)
+	node := NewNode(uuid.New(), bad, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.GetSpaces{}}
 	bidi := newMockBidi(env)
 	node.Handle(context.Background(), bidi)
@@ -365,7 +419,7 @@ func (b *bidiEncodeFail) Encode(m any) error { return b.fail }
 
 func TestStreamEntriesEncodeError(t *testing.T) {
 	store := &mockStore{entries: []*api.Entry{{Space: "s", Segment: "seg"}}}
-	node := NewNode(uuid.New(), store, nil)
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
 	mb := newMockBidi(env)
 	bidi := &bidiEncodeFail{mockBidi: mb, fail: errors.New("encode fail")}
@@ -376,7 +430,7 @@ func TestStreamEntriesEncodeError(t *testing.T) {
 
 func TestHandlePeekWithCanceledContext(t *testing.T) {
 	store := &mockStore{peekEntry: nil}
-	node := NewNode(uuid.New(), store, nil)
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -391,14 +445,14 @@ func TestHandlePeekWithCanceledContext(t *testing.T) {
 func TestHandleDecodeErrorClosesStream(t *testing.T) {
 	mb := &mockBidi{closed: make(chan struct{})}
 	bidi := &badBidi{mockBidi: mb, decErr: errors.New("decode failed")}
-	node := NewNode(uuid.New(), &mockStore{}, nil)
+	node := NewNode(uuid.New(), &mockStore{}, nil, lease.NewStore())
 	node.Handle(context.Background(), bidi)
 	// Assert
 	require.Error(t, bidi.closeErr, "expected Close called with decode error")
 }
 
 func TestStreamEntriesCurrentError(t *testing.T) {
-	node := NewNode(uuid.New(), &badSegStore{}, nil)
+	node := NewNode(uuid.New(), &badSegStore{}, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
 	bidi := newMockBidi(env)
 	node.Handle(context.Background(), bidi)
@@ -410,7 +464,7 @@ func TestNodeCloseAndManagerClose(t *testing.T) {
 	// test Node.Close calls store.Close
 	closed := false
 	s := &closableStore{closed: &closed}
-	n := NewNode(uuid.New(), s, nil)
+	n := NewNode(uuid.New(), s, nil, lease.NewStore())
 	n.Close()
 	// Assert
 	require.True(t, closed, "expected store Close to be called")

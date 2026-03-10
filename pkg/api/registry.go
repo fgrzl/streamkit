@@ -26,4 +26,8 @@ func registerAll() {
 	polymorphic.RegisterType[SegmentNotification]()
 	polymorphic.RegisterType[SegmentStatus]()
 	polymorphic.RegisterType[SubscribeToSegmentStatus]()
+	polymorphic.RegisterType[LeaseAcquire]()
+	polymorphic.RegisterType[LeaseRenew]()
+	polymorphic.RegisterType[LeaseRelease]()
+	polymorphic.RegisterType[LeaseResult]()
 }

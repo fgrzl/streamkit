@@ -11,10 +11,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/messaging"
+	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streamkit/pkg/telemetry"
@@ -31,12 +33,13 @@ type Node interface {
 	Close()
 }
 
-// NewNode creates a new Node instance with the specified store and optional message bus factory.
-func NewNode(storeID uuid.UUID, store storage.Store, busFactory messaging.MessageBusFactory) Node {
+// NewNode creates a new Node instance with the specified store, optional message bus factory, and lease store.
+func NewNode(storeID uuid.UUID, store storage.Store, busFactory messaging.MessageBusFactory, leaseStore *lease.Store) Node {
 	return &defaultNode{
 		storeID:    storeID,
 		store:      store,
 		busFactory: busFactory,
+		leaseStore: leaseStore,
 	}
 }
 
@@ -44,6 +47,7 @@ type defaultNode struct {
 	storeID    uuid.UUID
 	store      storage.Store
 	busFactory messaging.MessageBusFactory
+	leaseStore *lease.Store
 }
 
 func (n *defaultNode) Close() {
@@ -100,6 +104,15 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 		spanName = "streamkit.server.subscribe"
 		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleSubscribe(ctx, args, b) }
+	case *api.LeaseAcquire:
+		spanName = "streamkit.server.lease_acquire"
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleLeaseAcquire(ctx, args, b) }
+	case *api.LeaseRenew:
+		spanName = "streamkit.server.lease_renew"
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleLeaseRenew(ctx, args, b) }
+	case *api.LeaseRelease:
+		spanName = "streamkit.server.lease_release"
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleLeaseRelease(ctx, args, b) }
 	default:
 		bidi.Close(fmt.Errorf("invalid request msg type: %T", envelope.Content))
 		return
@@ -147,6 +160,60 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 	}
 
 	if err := bidi.Encode(entry); err != nil {
+		bidi.CloseSend(err)
+		return
+	}
+	bidi.CloseSend(nil)
+}
+
+func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcquire, bidi api.BidiStream) {
+	if n.leaseStore == nil {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
+		bidi.CloseSend(nil)
+		return
+	}
+	ttl := time.Duration(args.TTLSeconds) * time.Second
+	if ttl <= 0 {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
+		bidi.CloseSend(nil)
+		return
+	}
+	ok := n.leaseStore.Acquire(args.Key, args.Holder, ttl)
+	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
+		bidi.CloseSend(err)
+		return
+	}
+	bidi.CloseSend(nil)
+}
+
+func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew, bidi api.BidiStream) {
+	if n.leaseStore == nil {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
+		bidi.CloseSend(nil)
+		return
+	}
+	ttl := time.Duration(args.TTLSeconds) * time.Second
+	if ttl <= 0 {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
+		bidi.CloseSend(nil)
+		return
+	}
+	ok := n.leaseStore.Renew(args.Key, args.Holder, ttl)
+	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
+		bidi.CloseSend(err)
+		return
+	}
+	bidi.CloseSend(nil)
+}
+
+func (n *defaultNode) handleLeaseRelease(ctx context.Context, args *api.LeaseRelease, bidi api.BidiStream) {
+	if n.leaseStore == nil {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
+		bidi.CloseSend(nil)
+		return
+	}
+	ok := n.leaseStore.Release(args.Key, args.Holder)
+	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
 		bidi.CloseSend(err)
 		return
 	}

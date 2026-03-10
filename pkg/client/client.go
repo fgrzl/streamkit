@@ -87,6 +87,10 @@ type Client interface {
 	// Returns nil if subscription not found. Includes failure count, last sequence, handler timeouts/panics.
 	GetSubscriptionStatus(id string) *SubscriptionStatus
 
+	// AcquireLease acquires a lease for the given key with the given TTL. The returned Lease
+	// auto-renews in the background until Release() is called. Release() is idempotent.
+	AcquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error)
+
 	// Close gracefully shuts down the client, stopping background goroutines and cleaning up resources.
 	// Safe to call multiple times. Should be called when the client is no longer needed.
 	Close() error
@@ -473,6 +477,134 @@ func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment str
 		return nil, err
 	}
 	return entry, nil
+}
+
+// ErrLeaseNotAcquired is returned when AcquireLease could not acquire the lease (e.g. another holder has it).
+var ErrLeaseNotAcquired = errors.New("lease not acquired")
+
+const minLeaseTTL = time.Second
+const leaseRenewIntervalRatio = 2 // renew every ttl/2
+
+func (c *client) AcquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error) {
+	if ttl < minLeaseTTL {
+		ttl = minLeaseTTL
+	}
+	ttlSec := int64(ttl.Seconds())
+	if ttlSec < 1 {
+		ttlSec = 1
+	}
+	holder := uuid.New().String()
+
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, &api.LeaseAcquire{Key: key, Holder: holder, TTLSeconds: ttlSec})
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result api.LeaseResult
+	if err := bidi.Decode(&result); err != nil {
+		bidi.Close(nil)
+		return nil, err
+	}
+	bidi.Close(nil)
+	if !result.Ok {
+		return nil, fmt.Errorf("%w: %s", ErrLeaseNotAcquired, result.Message)
+	}
+
+	leaseCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	l := &leaseImpl{
+		client:  c,
+		storeID: storeID,
+		key:     key,
+		holder:  holder,
+		ttl:     ttl,
+		ttlSec:  ttlSec,
+		ctx:     leaseCtx,
+		cancel:  cancel,
+		done:    done,
+	}
+	go l.renewLoop()
+	return l, nil
+}
+
+// leaseImpl holds lease state and runs a background renew loop until Release() is called.
+type leaseImpl struct {
+	client      *client
+	storeID     uuid.UUID
+	key         string
+	holder      string
+	ttl         time.Duration
+	ttlSec      int64
+	ctx         context.Context
+	cancel      context.CancelFunc
+	releaseOnce sync.Once
+	done        chan struct{}
+}
+
+func (l *leaseImpl) Done() <-chan struct{} { return l.done }
+
+func (l *leaseImpl) Release() error {
+	var releaseErr error
+	l.releaseOnce.Do(func() {
+		l.cancel()
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer releaseCancel()
+		bidi, err := l.client.provider.CallStream(releaseCtx, l.storeID, &api.LeaseRelease{Key: l.key, Holder: l.holder})
+		if err != nil {
+			releaseErr = err
+			slog.Warn("lease release: CallStream failed", "key", l.key, "err", err)
+		} else {
+			var res api.LeaseResult
+			_ = bidi.Decode(&res)
+			bidi.Close(nil)
+		}
+		close(l.done)
+	})
+	return releaseErr
+}
+
+func (l *leaseImpl) renewLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("lease renew loop panic", "key", l.key, "panic", r)
+		}
+	}()
+	interval := l.ttl / leaseRenewIntervalRatio
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-l.ctx.Done():
+			return
+		case <-ticker.C:
+			bidi, err := l.client.provider.CallStream(l.ctx, l.storeID, &api.LeaseRenew{Key: l.key, Holder: l.holder, TTLSeconds: l.ttlSec})
+			if err != nil {
+				if l.ctx.Err() == nil {
+					slog.Warn("lease renew: CallStream failed", "key", l.key, "err", err)
+				}
+				continue
+			}
+			var result api.LeaseResult
+			if err := bidi.Decode(&result); err != nil {
+				bidi.Close(nil)
+				if l.ctx.Err() == nil {
+					slog.Warn("lease renew: Decode failed", "key", l.key, "err", err)
+				}
+				continue
+			}
+			bidi.Close(nil)
+			if !result.Ok && l.ctx.Err() == nil {
+				slog.Warn("lease renew: server returned not ok", "key", l.key, "message", result.Message)
+			}
+		}
+	}
 }
 
 func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
