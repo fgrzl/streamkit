@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 var secret = []byte("top-secret")
@@ -411,4 +416,48 @@ func TestConsumerOperations(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestOtelTraceContinuityOverWskit verifies that a client request over WebSocket
+// produces connected client and server spans (same trace ID).
+func TestOtelTraceContinuityOverWskit(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(
+		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	defer tp.Shutdown(context.Background())
+
+	harness := pebblekitTestHarness(t)
+	storeID := uuid.New()
+	ctx := t.Context()
+	space, segment := "space0", "segment0"
+
+	_, err := harness.Client.Peek(ctx, storeID, space, segment)
+	require.NoError(t, err)
+
+	// Flush and collect spans
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exporter.GetSpans()
+	require.NotEmpty(t, spans, "expected at least one span")
+
+	// We expect client transport and server operation spans; they must share a trace ID
+	var transportSpan, serverSpan *tracetest.SpanStub
+	for i := range spans {
+		s := &spans[i]
+		switch s.Name {
+		case "streamkit.transport.call_stream":
+			transportSpan = s
+		case "streamkit.server.peek":
+			serverSpan = s
+		}
+	}
+	require.NotNil(t, transportSpan, "expected streamkit.transport.call_stream span")
+	require.NotNil(t, serverSpan, "expected streamkit.server.peek span")
+	assert.Equal(t, transportSpan.SpanContext.TraceID(), serverSpan.SpanContext.TraceID(),
+		"client and server spans should share the same trace ID")
 }

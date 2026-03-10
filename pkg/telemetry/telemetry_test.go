@@ -104,3 +104,25 @@ func TestAddTraceContextToLoggerWithoutSpan(t *testing.T) {
 	// Assert
 	assert.Empty(t, attrs)
 }
+
+func TestWithRequestIDContextRoundtrip(t *testing.T) {
+	// Arrange
+	ctx := context.Background()
+	id := uuid.New()
+
+	// Act
+	ctx = telemetry.WithRequestIDContext(ctx, id)
+	got, ok := telemetry.RequestIDFromContext(ctx)
+
+	// Assert
+	assert.True(t, ok)
+	assert.Equal(t, id, got)
+}
+
+func TestGetMeterReturnsNonNil(t *testing.T) {
+	// Act
+	meter := telemetry.GetMeter()
+
+	// Assert
+	require.NotNil(t, meter)
+}

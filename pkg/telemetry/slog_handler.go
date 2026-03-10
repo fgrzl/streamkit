@@ -17,6 +17,12 @@ type TraceContextHandler struct {
 // NewTraceContextHandler wraps an existing handler with trace context enrichment.
 // The returned handler will add trace_id and span_id attributes to all log records
 // that are part of an active trace span.
+//
+// Wire this into your application during bootstrap so that logs correlate with
+// traces. Example after initializing OTel (e.g. internal/telemetry.Initialize):
+//
+//	h := slog.NewJSONHandler(os.Stdout, nil)
+//	slog.SetDefault(slog.New(telemetry.NewTraceContextHandler(h)))
 func NewTraceContextHandler(next slog.Handler) *TraceContextHandler {
 	return &TraceContextHandler{next: next}
 }

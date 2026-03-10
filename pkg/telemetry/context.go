@@ -23,6 +23,14 @@ func RequestIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	return id, ok
 }
 
+// WithRequestIDContext returns a context that carries the given request ID for
+// correlation across spans, logs, and metrics. Prefer this over package-local
+// context keys so telemetry helpers (e.g. RequestIDFromContext, span attributes)
+// see the same value.
+func WithRequestIDContext(ctx context.Context, id uuid.UUID) context.Context {
+	return context.WithValue(ctx, requestIDKey, id)
+}
+
 // WithTraceID returns a new context with the trace ID added.
 // This is typically called internally during span creation for log correlation.
 func WithTraceID(ctx context.Context, traceID string) context.Context {
