@@ -102,10 +102,7 @@ func azurekitTestHarness(t *testing.T) *TestHarness {
 	}
 
 	factory, err := azurekit.NewStoreFactory(t.Context(), options)
-	if err != nil {
-		t.Skipf("skipping azure tests: failed to create store factory: %v", err)
-		return nil
-	}
+	require.NoError(t, err, "azure store factory required for azure configuration")
 
 	return wskitTestHarness(t, factory)
 }
@@ -241,9 +238,6 @@ func TestProduceLargeRecordsChunking(t *testing.T) {
 	for name, h := range configurations() {
 		t.Run("large produce "+name, func(t *testing.T) {
 			harness := h(t)
-			if name == "azure" {
-				t.Skip("skipping azure for large produce test due to entity size limits")
-			}
 			storeID := uuid.New()
 			ctx := t.Context()
 			space, segment := "space-large", "segment-large"
