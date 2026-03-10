@@ -41,22 +41,22 @@ func NewOTelClientMetrics() ClientMetrics {
 		metric.WithDescription("Subscription handler panic count"),
 	)
 	return &otelClientMetrics{
-		produceLatency:       produceLatency,
-		consumeLatency:       consumeLatency,
-		replayTotal:          replayTotal,
-		replaySuccess:        replaySuccess,
-		handlerTimeoutTotal:  handlerTimeoutTotal,
-		handlerPanicTotal:    handlerPanicTotal,
+		produceLatency:      produceLatency,
+		consumeLatency:      consumeLatency,
+		replayTotal:         replayTotal,
+		replaySuccess:       replaySuccess,
+		handlerTimeoutTotal: handlerTimeoutTotal,
+		handlerPanicTotal:   handlerPanicTotal,
 	}
 }
 
 type otelClientMetrics struct {
-	produceLatency       metric.Float64Histogram
-	consumeLatency       metric.Float64Histogram
-	replayTotal          metric.Int64Counter
-	replaySuccess        metric.Int64Counter
-	handlerTimeoutTotal  metric.Int64Counter
-	handlerPanicTotal    metric.Int64Counter
+	produceLatency      metric.Float64Histogram
+	consumeLatency      metric.Float64Histogram
+	replayTotal         metric.Int64Counter
+	replaySuccess       metric.Int64Counter
+	handlerTimeoutTotal metric.Int64Counter
+	handlerPanicTotal   metric.Int64Counter
 }
 
 func (o *otelClientMetrics) RecordProduceLatency(space, segment string, duration time.Duration) {

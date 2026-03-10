@@ -220,6 +220,8 @@ type fakeMuxer struct {
 	bidi   api.BidiStream
 }
 
-func (f *fakeMuxer) Ping() bool                                                         { return f.pingFn() }
-func (f *fakeMuxer) Register(uuid.UUID, uuid.UUID) api.BidiStream                       { return f.bidi }
-func (f *fakeMuxer) RegisterWithContext(context.Context, uuid.UUID, uuid.UUID) api.BidiStream { return f.bidi }
+func (f *fakeMuxer) Ping() bool                                   { return f.pingFn() }
+func (f *fakeMuxer) Register(uuid.UUID, uuid.UUID) api.BidiStream { return f.bidi }
+func (f *fakeMuxer) RegisterWithContext(context.Context, uuid.UUID, uuid.UUID) api.BidiStream {
+	return f.bidi
+}
