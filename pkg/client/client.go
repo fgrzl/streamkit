@@ -489,7 +489,9 @@ func (c *client) AcquireLease(ctx context.Context, storeID uuid.UUID, key string
 	if ttl < minLeaseTTL {
 		ttl = minLeaseTTL
 	}
-	ttlSec := int64(ttl.Seconds())
+	// Round to nearest second so fractional seconds are not silently truncated (e.g. 1.5s -> 2s, not 1s).
+	ttlRounded := ttl.Round(time.Second)
+	ttlSec := int64(ttlRounded.Seconds())
 	if ttlSec < 1 {
 		ttlSec = 1
 	}
@@ -521,7 +523,7 @@ func (c *client) AcquireLease(ctx context.Context, storeID uuid.UUID, key string
 		storeID: storeID,
 		key:     key,
 		holder:  holder,
-		ttl:     ttl,
+		ttl:     ttlRounded, // use rounded TTL so renew interval matches server TTL
 		ttlSec:  ttlSec,
 		ctx:     leaseCtx,
 		cancel:  cancel,

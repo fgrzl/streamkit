@@ -35,7 +35,8 @@ func (s *Store) Acquire(key, holderID string, ttl time.Duration) bool {
 	if state, ok := s.leases[key]; ok && state.Holder != holderID && state.ExpiresAt > now {
 		return false
 	}
-	s.leases[key] = leaseState{Holder: holderID, ExpiresAt: time.Now().Add(ttl).UnixNano()}
+	expiresAt := now + int64(ttl)
+	s.leases[key] = leaseState{Holder: holderID, ExpiresAt: expiresAt}
 	return true
 }
 
@@ -49,7 +50,8 @@ func (s *Store) Renew(key, holderID string, ttl time.Duration) bool {
 	if !ok || state.Holder != holderID || state.ExpiresAt <= now {
 		return false
 	}
-	s.leases[key] = leaseState{Holder: holderID, ExpiresAt: time.Now().Add(ttl).UnixNano()}
+	expiresAt := now + int64(ttl)
+	s.leases[key] = leaseState{Holder: holderID, ExpiresAt: expiresAt}
 	return true
 }
 
