@@ -73,24 +73,30 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 	baseAttrs := []trace.SpanStartOption{trace.WithAttributes(telemetry.WithStoreID(n.storeID))}
 	var spanName string
 	var handler func(context.Context, api.BidiStream)
+	var handlerTracesSelf bool
 	switch args := envelope.Content.(type) {
 	case *api.Consume:
 		spanName = "streamkit.server.consume"
+		handlerTracesSelf = true
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleConsume(ctx, args, b) }
 	case *api.ConsumeSegment:
 		spanName = "streamkit.server.consume_segment"
 		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
+		handlerTracesSelf = true
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleConsumeSegment(ctx, args, b) }
 	case *api.ConsumeSpace:
 		spanName = "streamkit.server.consume_space"
 		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space)))
+		handlerTracesSelf = true
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleConsumeSpace(ctx, args, b) }
 	case *api.GetSegments:
 		spanName = "streamkit.server.get_segments"
 		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space)))
+		handlerTracesSelf = true
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleGetSegments(ctx, args, b) }
 	case *api.GetSpaces:
 		spanName = "streamkit.server.get_spaces"
+		handlerTracesSelf = true
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleGetSpaces(ctx, args, b) }
 	case *api.Peek:
 		spanName = "streamkit.server.peek"
@@ -102,6 +108,7 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleProduce(ctx, args, b) }
 	case *api.SubscribeToSegmentStatus:
 		spanName = "streamkit.server.subscribe"
+		handlerTracesSelf = true
 		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleSubscribe(ctx, args, b) }
 	case *api.LeaseAcquire:
@@ -115,6 +122,10 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleLeaseRelease(ctx, args, b) }
 	default:
 		bidi.Close(fmt.Errorf("invalid request msg type: %T", envelope.Content))
+		return
+	}
+	if handlerTracesSelf {
+		handler(ctx, bidi)
 		return
 	}
 	opCtx, span := tracer.Start(ctx, spanName, baseAttrs...)
@@ -148,6 +159,7 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 	}
 	entry, err := n.store.Peek(ctx, args.Space, args.Segment)
 	if err != nil {
+		telemetry.RecordError(trace.SpanFromContext(ctx), err)
 		bidi.CloseSend(err)
 		return
 	}
@@ -160,6 +172,7 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 	}
 
 	if err := bidi.Encode(entry); err != nil {
+		telemetry.RecordError(trace.SpanFromContext(ctx), err)
 		bidi.CloseSend(err)
 		return
 	}
@@ -180,6 +193,7 @@ func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcq
 	}
 	ok := n.leaseStore.Acquire(args.Key, args.Holder, ttl)
 	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
+		telemetry.RecordError(trace.SpanFromContext(ctx), err)
 		bidi.CloseSend(err)
 		return
 	}
@@ -200,6 +214,7 @@ func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew
 	}
 	ok := n.leaseStore.Renew(args.Key, args.Holder, ttl)
 	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
+		telemetry.RecordError(trace.SpanFromContext(ctx), err)
 		bidi.CloseSend(err)
 		return
 	}
@@ -214,6 +229,7 @@ func (n *defaultNode) handleLeaseRelease(ctx context.Context, args *api.LeaseRel
 	}
 	ok := n.leaseStore.Release(args.Key, args.Holder)
 	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
+		telemetry.RecordError(trace.SpanFromContext(ctx), err)
 		bidi.CloseSend(err)
 		return
 	}
@@ -267,15 +283,26 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 }
 
 func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
+	_, span := telemetry.GetTracer().Start(ctx, "streamkit.server.subscribe",
+		trace.WithAttributes(
+			telemetry.WithStoreID(n.storeID),
+			telemetry.WithSpace(args.Space),
+			telemetry.WithSegment(args.Segment),
+		),
+	)
+	defer span.End()
 
 	if n.busFactory == nil {
+		err := fmt.Errorf("the message bus was not configured")
+		telemetry.RecordError(span, err)
 		slog.WarnContext(ctx, "the message bus factory was not configured")
-		bidi.CloseSend(fmt.Errorf("the message bus was not configured"))
+		bidi.CloseSend(err)
 		return
 	}
 
 	bus, err := n.busFactory.Get(ctx)
 	if err != nil {
+		telemetry.RecordError(span, err)
 		slog.WarnContext(ctx, "failed to connect to the message bus")
 		bidi.CloseSend(fmt.Errorf("failed to connect to the message bus"))
 		return
@@ -283,15 +310,14 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 
 	route := api.GetSegmentNotificationRoute(n.storeID, args.Space)
 	sub, err := messaging.Subscribe(bus, route, func(ctx context.Context, msg *api.SegmentNotification) error {
-
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {
 			return bidi.Encode(msg.SegmentStatus)
 		}
 		return nil
 	})
-
 	if err != nil {
+		telemetry.RecordError(span, err)
 		bidi.CloseSend(err)
 		return
 	}

@@ -32,6 +32,11 @@ func NewOTelClientMetrics() ClientMetrics {
 		"streamkit.client.subscription.replay.success",
 		metric.WithDescription("Subscription replay successes"),
 	)
+	replayDuration, _ := meter.Float64Histogram(
+		"streamkit.client.subscription.replay.duration",
+		metric.WithDescription("Subscription replay duration"),
+		metric.WithUnit("ms"),
+	)
 	handlerTimeoutTotal, _ := meter.Int64Counter(
 		"streamkit.client.subscription.handler.timeout.total",
 		metric.WithDescription("Subscription handler timeout count"),
@@ -45,6 +50,7 @@ func NewOTelClientMetrics() ClientMetrics {
 		consumeLatency:      consumeLatency,
 		replayTotal:         replayTotal,
 		replaySuccess:       replaySuccess,
+		replayDuration:      replayDuration,
 		handlerTimeoutTotal: handlerTimeoutTotal,
 		handlerPanicTotal:   handlerPanicTotal,
 	}
@@ -55,6 +61,7 @@ type otelClientMetrics struct {
 	consumeLatency      metric.Float64Histogram
 	replayTotal         metric.Int64Counter
 	replaySuccess       metric.Int64Counter
+	replayDuration      metric.Float64Histogram
 	handlerTimeoutTotal metric.Int64Counter
 	handlerPanicTotal   metric.Int64Counter
 }
@@ -80,23 +87,28 @@ func (o *otelClientMetrics) RecordConsumeLatency(space, segment string, duration
 }
 
 func (o *otelClientMetrics) RecordSubscriptionReplay(id string, success bool, duration time.Duration) {
-	attrs := metric.WithAttributes(attribute.String("streamkit.subscription_id", id))
+	// Low-cardinality attributes only (no subscription_id) for production backends.
+	successAttr := attribute.Bool("streamkit.replay.success", success)
 	if o.replayTotal != nil {
-		o.replayTotal.Add(context.Background(), 1, attrs)
+		o.replayTotal.Add(context.Background(), 1, metric.WithAttributes(successAttr))
 	}
 	if success && o.replaySuccess != nil {
-		o.replaySuccess.Add(context.Background(), 1, attrs)
+		o.replaySuccess.Add(context.Background(), 1, metric.WithAttributes(successAttr))
+	}
+	if o.replayDuration != nil {
+		o.replayDuration.Record(context.Background(), float64(duration.Milliseconds()),
+			metric.WithAttributes(successAttr))
 	}
 }
 
 func (o *otelClientMetrics) RecordHandlerTimeout(id string) {
 	if o.handlerTimeoutTotal != nil {
-		o.handlerTimeoutTotal.Add(context.Background(), 1, metric.WithAttributes(attribute.String("streamkit.subscription_id", id)))
+		o.handlerTimeoutTotal.Add(context.Background(), 1)
 	}
 }
 
 func (o *otelClientMetrics) RecordHandlerPanic(id string) {
 	if o.handlerPanicTotal != nil {
-		o.handlerPanicTotal.Add(context.Background(), 1, metric.WithAttributes(attribute.String("streamkit.subscription_id", id)))
+		o.handlerPanicTotal.Add(context.Background(), 1)
 	}
 }

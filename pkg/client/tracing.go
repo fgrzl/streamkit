@@ -34,7 +34,7 @@ type tracingClient struct {
 	tracer trace.Tracer
 }
 
-// GetSpaces returns an enumerator of space names with tracing.
+// GetSpaces returns an enumerator of space names with tracing (stream setup span only).
 func (c *tracingClient) GetSpaces(ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[string] {
 	requestID := generateOrGetRequestID(ctx)
 	ctx, span := c.tracer.Start(ctx, "streamkit.client.get_spaces",
@@ -43,13 +43,10 @@ func (c *tracingClient) GetSpaces(ctx context.Context, storeID uuid.UUID) enumer
 			telemetry.WithRequestID(requestID),
 		))
 	defer span.End()
-
-	result := c.client.GetSpaces(ctx, storeID)
-
-	return wrapStringEnumerator(ctx, result, span, "streamkit.client.enumerator_chunk")
+	return c.client.GetSpaces(ctx, storeID)
 }
 
-// GetSegments returns an enumerator of segment names with tracing.
+// GetSegments returns an enumerator of segment names with tracing (stream setup span only).
 func (c *tracingClient) GetSegments(ctx context.Context, storeID uuid.UUID, space string) enumerators.Enumerator[string] {
 	requestID := generateOrGetRequestID(ctx)
 	ctx, span := c.tracer.Start(ctx, "streamkit.client.get_segments",
@@ -59,10 +56,7 @@ func (c *tracingClient) GetSegments(ctx context.Context, storeID uuid.UUID, spac
 			telemetry.WithRequestID(requestID),
 		))
 	defer span.End()
-
-	result := c.client.GetSegments(ctx, storeID, space)
-
-	return wrapStringEnumerator(ctx, result, span, "streamkit.client.enumerator_chunk")
+	return c.client.GetSegments(ctx, storeID, space)
 }
 
 // Peek returns the latest entry with tracing.
@@ -93,7 +87,7 @@ func (c *tracingClient) Peek(ctx context.Context, storeID uuid.UUID, space, segm
 	return entry, nil
 }
 
-// Consume reads entries from multiple spaces with tracing.
+// Consume reads entries from multiple spaces with tracing (stream setup span only).
 func (c *tracingClient) Consume(ctx context.Context, storeID uuid.UUID, args *Consume) enumerators.Enumerator[*Entry] {
 	requestID := generateOrGetRequestID(ctx)
 	ctx, span := c.tracer.Start(ctx, "streamkit.client.consume",
@@ -102,13 +96,10 @@ func (c *tracingClient) Consume(ctx context.Context, storeID uuid.UUID, args *Co
 			telemetry.WithRequestID(requestID),
 		))
 	defer span.End()
-
-	result := c.client.Consume(ctx, storeID, args)
-
-	return wrapEntryEnumerator(ctx, result, span, "streamkit.client.enumerator_chunk")
+	return c.client.Consume(ctx, storeID, args)
 }
 
-// ConsumeSpace reads entries from all segments with tracing.
+// ConsumeSpace reads entries from all segments with tracing (stream setup span only).
 func (c *tracingClient) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *ConsumeSpace) enumerators.Enumerator[*Entry] {
 	requestID := generateOrGetRequestID(ctx)
 	ctx, span := c.tracer.Start(ctx, "streamkit.client.consume_space",
@@ -118,13 +109,10 @@ func (c *tracingClient) ConsumeSpace(ctx context.Context, storeID uuid.UUID, arg
 			telemetry.WithRequestID(requestID),
 		))
 	defer span.End()
-
-	result := c.client.ConsumeSpace(ctx, storeID, args)
-
-	return wrapEntryEnumerator(ctx, result, span, "streamkit.client.enumerator_chunk")
+	return c.client.ConsumeSpace(ctx, storeID, args)
 }
 
-// ConsumeSegment reads entries from a specific segment with tracing.
+// ConsumeSegment reads entries from a specific segment with tracing (stream setup span only).
 func (c *tracingClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *ConsumeSegment) enumerators.Enumerator[*Entry] {
 	requestID := generateOrGetRequestID(ctx)
 	baseAttrs := []attribute.KeyValue{
@@ -139,13 +127,10 @@ func (c *tracingClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, a
 		trace.WithAttributes(allAttrs...),
 	)
 	defer span.End()
-
-	result := c.client.ConsumeSegment(ctx, storeID, args)
-
-	return wrapEntryEnumerator(ctx, result, span, "streamkit.client.enumerator_chunk")
+	return c.client.ConsumeSegment(ctx, storeID, args)
 }
 
-// Produce writes records to a segment with tracing.
+// Produce writes records to a segment with tracing (stream setup span only).
 func (c *tracingClient) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
 	requestID := generateOrGetRequestID(ctx)
 	ctx, span := c.tracer.Start(ctx, "streamkit.client.produce",
@@ -156,10 +141,7 @@ func (c *tracingClient) Produce(ctx context.Context, storeID uuid.UUID, space, s
 			telemetry.WithRequestID(requestID),
 		))
 	defer span.End()
-
-	result := c.client.Produce(ctx, storeID, space, segment, entries)
-
-	return wrapSegmentStatusEnumerator(ctx, result, span, "streamkit.client.enumerator_chunk")
+	return c.client.Produce(ctx, storeID, space, segment, entries)
 }
 
 // Publish writes a single record with tracing.
@@ -184,7 +166,7 @@ func (c *tracingClient) Publish(ctx context.Context, storeID uuid.UUID, space, s
 	return nil
 }
 
-// SubscribeToSegment subscribes to segment status updates with tracing.
+// SubscribeToSegment subscribes to segment status updates with tracing (setup span only).
 func (c *tracingClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error) {
 	requestID := generateOrGetRequestID(ctx)
 	ctx, span := c.tracer.Start(ctx, "streamkit.client.subscribe_segment",
@@ -195,21 +177,7 @@ func (c *tracingClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUI
 			telemetry.WithRequestID(requestID),
 		))
 	defer span.End()
-
-	// Wrap handler to trace invocations
-	tracedHandler := func(status *SegmentStatus) {
-		_, hSpan := c.tracer.Start(ctx, "streamkit.client.handler_invoke",
-			trace.WithAttributes(
-				telemetry.WithStoreID(storeID),
-				telemetry.WithSpace(space),
-				telemetry.WithSegment(segment),
-			))
-		defer hSpan.End()
-
-		handler(status)
-	}
-
-	sub, err := c.client.SubscribeToSegment(ctx, storeID, space, segment, tracedHandler)
+	sub, err := c.client.SubscribeToSegment(ctx, storeID, space, segment, handler)
 	if err != nil {
 		telemetry.RecordError(span, err)
 		return nil, err
@@ -217,7 +185,7 @@ func (c *tracingClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUI
 	return sub, nil
 }
 
-// SubscribeToSpace subscribes to space status updates with tracing.
+// SubscribeToSpace subscribes to space status updates with tracing (setup span only).
 func (c *tracingClient) SubscribeToSpace(ctx context.Context, storeID uuid.UUID, space string, handler func(*SegmentStatus)) (api.Subscription, error) {
 	requestID := generateOrGetRequestID(ctx)
 	ctx, span := c.tracer.Start(ctx, "streamkit.client.subscribe_space",
@@ -227,25 +195,11 @@ func (c *tracingClient) SubscribeToSpace(ctx context.Context, storeID uuid.UUID,
 			telemetry.WithRequestID(requestID),
 		))
 	defer span.End()
-
-	// Wrap handler to trace invocations
-	tracedHandler := func(status *SegmentStatus) {
-		_, hSpan := c.tracer.Start(ctx, "streamkit.client.handler_invoke",
-			trace.WithAttributes(
-				telemetry.WithStoreID(storeID),
-				telemetry.WithSpace(space),
-			))
-		defer hSpan.End()
-
-		handler(status)
-	}
-
-	sub, err := c.client.SubscribeToSpace(ctx, storeID, space, tracedHandler)
+	sub, err := c.client.SubscribeToSpace(ctx, storeID, space, handler)
 	if err != nil {
 		telemetry.RecordError(span, err)
 		return nil, err
 	}
-
 	return sub, nil
 }
 
@@ -286,70 +240,6 @@ func (c *tracingClient) Close() error {
 	}
 
 	return nil
-}
-
-// Helper functions for enumerator wrapping
-
-// wrapStringEnumerator wraps a string enumerator to emit chunk spans.
-func wrapStringEnumerator(ctx context.Context, enum enumerators.Enumerator[string], _ trace.Span, spanName string) enumerators.Enumerator[string] {
-	tracer := telemetry.GetTracer()
-	chunkCount := 0
-
-	return enumerators.Map(enum, func(s string) (string, error) {
-		chunkCount++
-		_, span := tracer.Start(ctx, spanName,
-			trace.WithAttributes(
-				attribute.Int("streamkit.chunk_num", chunkCount),
-			))
-		defer span.End()
-		return s, nil
-	})
-}
-
-// wrapEntryEnumerator wraps an entry enumerator to emit chunk spans.
-func wrapEntryEnumerator(ctx context.Context, enum enumerators.Enumerator[*Entry], _ trace.Span, spanName string) enumerators.Enumerator[*Entry] {
-	tracer := telemetry.GetTracer()
-	chunkCount := 0
-	chunkSize := 0
-
-	return enumerators.Map(enum, func(e *Entry) (*Entry, error) {
-		chunkCount++
-		chunkSize += len(e.Payload)
-
-		_, span := tracer.Start(ctx, spanName,
-			trace.WithAttributes(
-				attribute.Int("streamkit.chunk_num", chunkCount),
-				attribute.Int("streamkit.entry_count", 1),
-				attribute.Int("streamkit.chunk_size_bytes", chunkSize),
-				attribute.Int64("streamkit.sequence", int64(e.Sequence)),
-			))
-		defer span.End()
-
-		return e, nil
-	})
-}
-
-// wrapSegmentStatusEnumerator wraps a status enumerator to emit chunk spans.
-func wrapSegmentStatusEnumerator(ctx context.Context, enum enumerators.Enumerator[*SegmentStatus], _ trace.Span, spanName string) enumerators.Enumerator[*SegmentStatus] {
-	tracer := telemetry.GetTracer()
-	chunkCount := 0
-
-	return enumerators.Map(enum, func(s *SegmentStatus) (*SegmentStatus, error) {
-		chunkCount++
-
-		baseAttrs := []attribute.KeyValue{
-			attribute.Int("streamkit.chunk_num", chunkCount),
-			attribute.Int64("streamkit.first_timestamp", s.FirstTimestamp),
-			attribute.Int64("streamkit.last_timestamp", s.LastTimestamp),
-		}
-		seqAttrs := telemetry.WithSequenceRange(s.FirstSequence, s.LastSequence)
-		allAttrs := append(baseAttrs, seqAttrs...)
-		_, span := tracer.Start(ctx, spanName,
-			trace.WithAttributes(allAttrs...))
-		defer span.End()
-
-		return s, nil
-	})
 }
 
 // generateOrGetRequestID extracts or generates a request ID for context.

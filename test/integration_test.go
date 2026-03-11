@@ -462,3 +462,51 @@ func TestOtelTraceContinuityOverWskit(t *testing.T) {
 	assert.Equal(t, transportSpan.SpanContext.TraceID(), serverSpan.SpanContext.TraceID(),
 		"client and server spans should share the same trace ID")
 }
+
+// TestOtelNoEnumeratorChunkSpans verifies that streaming operations do not emit
+// per-item enumerator_chunk spans (pruned as noisy).
+func TestOtelNoEnumeratorChunkSpans(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(
+		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	defer tp.Shutdown(context.Background())
+
+	options := &pebblekit.PebbleStoreOptions{Path: t.TempDir()}
+	factory, err := pebblekit.NewStoreFactory(options)
+	require.NoError(t, err)
+	nodeManager := server.NewNodeManager(server.WithStoreFactory(factory))
+	provider := inprockit.NewInProcBidiStreamProvider(t.Context(), nodeManager)
+	tracingClient := client.NewClientWithTracing(provider)
+	t.Cleanup(func() {
+		tracingClient.Close()
+		nodeManager.Close()
+	})
+
+	ctx := t.Context()
+	storeID := uuid.New()
+	enum := tracingClient.GetSpaces(ctx, storeID)
+	for enum.MoveNext() {
+		_, _ = enum.Current()
+	}
+	enum.Dispose()
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exporter.GetSpans()
+	for i := range spans {
+		assert.NotEqual(t, "streamkit.client.enumerator_chunk", spans[i].Name,
+			"per-item enumerator_chunk spans should be pruned")
+	}
+}

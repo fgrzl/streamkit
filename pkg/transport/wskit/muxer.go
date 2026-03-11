@@ -406,7 +406,7 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 // For data messages, trace context is extracted from the frame and attached to context.
 func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 	ctx := server.WithChannelID(m.Context, msg.ChannelID)
-	if msg.TraceContext != nil && len(msg.TraceContext) > 0 {
+	if len(msg.TraceContext) > 0 {
 		ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(msg.TraceContext))
 	}
 	switch msg.ControlType {
@@ -527,8 +527,8 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 				telemetry.WithChannelID(msg.ChannelID),
 				telemetry.WithTransportType("websocket"),
 			))
+		span.End()
 		go func() {
-			defer span.End()
 			instance.Handle(reqCtx, bidi)
 		}()
 		return bidi, nil
