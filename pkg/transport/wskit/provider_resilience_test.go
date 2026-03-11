@@ -413,7 +413,7 @@ func TestBackgroundReconnectNotifiesListeners(t *testing.T) {
 
 // TestGetOrCreateMuxerUsesProviderContext verifies that the muxer is created with
 // reconnectCtx (long-lived) rather than the caller's request context (short-lived).
-// A cancelled request context must not kill the muxer that subsequent requests will use.
+// A canceled request context must not kill the muxer that subsequent requests will use.
 func TestGetOrCreateMuxerUsesProviderContext(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
@@ -446,7 +446,7 @@ func TestGetOrCreateMuxerUsesProviderContext(t *testing.T) {
 	ctx := capturedCtx
 	mu.Unlock()
 
-	// The request context is cancelled, but the muxer's context should still be alive
+	// The request context is canceled, but the muxer's context should still be alive
 	assert.NoError(t, ctx.Err(), "muxer should be created with provider's reconnectCtx, not the caller's request context")
-	assert.ErrorIs(t, reqCtx.Err(), context.Canceled, "request context should be cancelled")
+	assert.ErrorIs(t, reqCtx.Err(), context.Canceled, "request context should be canceled")
 }

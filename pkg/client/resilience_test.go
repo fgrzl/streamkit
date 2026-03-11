@@ -122,7 +122,7 @@ func TestShouldStopImmediatelyWhenFnReturnsNonRetryableError(t *testing.T) {
 	assert.Equal(t, 1, calls)
 }
 
-func TestShouldReturnContextErrorWhenContextCancelledDuringRetry(t *testing.T) {
+func TestShouldReturnContextErrorWhenContextCanceledDuringRetry(t *testing.T) {
 	// Arrange
 	ctx, cancel := context.WithCancel(context.Background())
 	policy := RetryPolicy{MaxAttempts: 10, InitialBackoff: 50 * time.Millisecond, MaxBackoff: time.Second, BackoffMultiplier: 2}
@@ -173,7 +173,7 @@ func TestShouldReturnFalseWhenErrorIsContextCanceledOrDeadlineExceeded(t *testin
 	assert.False(t, deadlineOK)
 }
 
-func TestShouldReturnContextErrorImmediatelyWhenContextAlreadyCancelled(t *testing.T) {
+func TestShouldReturnContextErrorImmediatelyWhenContextAlreadyCanceled(t *testing.T) {
 	// Arrange
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

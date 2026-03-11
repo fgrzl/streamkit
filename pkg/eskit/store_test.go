@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -128,33 +127,11 @@ func (f *fakeClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, 
 func (f *fakeClient) GetSubscriptionStatus(id string) *client.SubscriptionStatus {
 	return &client.SubscriptionStatus{}
 }
-func (f *fakeClient) AcquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error) {
-	return &fakeLease{}, nil
+func (f *fakeClient) WithLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration, fn func(context.Context) error) error {
+	return fn(ctx)
 }
 func (f *fakeClient) Close() error {
 	return nil
-}
-
-// fakeLease is a no-op lease for tests that do not exercise leasing.
-type fakeLease struct {
-	done chan struct{}
-	once sync.Once
-}
-
-func (f *fakeLease) Release() error {
-	f.once.Do(func() {
-		if f.done == nil {
-			f.done = make(chan struct{})
-		}
-		close(f.done)
-	})
-	return nil
-}
-func (f *fakeLease) Done() <-chan struct{} {
-	if f.done == nil {
-		f.done = make(chan struct{})
-	}
-	return f.done
 }
 
 func TestLoadEventsShouldUnmarshalDomainEvents(t *testing.T) {

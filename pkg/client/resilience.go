@@ -106,7 +106,7 @@ func IsRetryable(err error) bool {
 }
 
 // RetryWithBackoff executes fn with exponential backoff retry on failure.
-// Returns immediately on success or if ctx is cancelled.
+// Returns immediately on success or if ctx is canceled.
 func RetryWithBackoff(ctx context.Context, policy RetryPolicy, fn func(context.Context) error) error {
 	if policy.MaxAttempts < 1 {
 		policy.MaxAttempts = 1

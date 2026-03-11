@@ -428,7 +428,7 @@ func TestNoDuplicateReplayOnRapidReconnect(t *testing.T) {
 					status.Segment = "test-segment"
 					status.LastSequence = 1
 				}
-				// Block until context cancelled — stable stream
+				// Block until context canceled — stable stream
 				<-ctx.Done()
 				return ctx.Err()
 			}
@@ -572,12 +572,12 @@ func TestContextCancellationOnUnsubscribe(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Assert: After unsubscribe, decode should have been called and blocked,
-	// then context cancelled when Unsubscribe() was called
+	// then context canceled when Unsubscribe() was called
 	decodecallsMu.Lock()
 	calls := decodeCalls
 	decodecallsMu.Unlock()
 
-	// Should have attempted at least one decode before context was cancelled
+	// Should have attempted at least one decode before context was canceled
 	assert.Greater(t, calls, 0, "subscription should have connected and attempted decode")
 }
 
@@ -1410,46 +1410,8 @@ func TestSubscriptionRetriesIndefinitely(t *testing.T) {
 	assert.False(t, stillExists, "subscription should be unregistered after Unsubscribe")
 }
 
-// TestAcquireLeaseSuccessAndRelease verifies that AcquireLease returns a lease when server returns Ok,
-// and that Release() sends LeaseRelease and closes Done().
-func TestAcquireLeaseSuccessAndRelease(t *testing.T) {
-	var releaseCalled atomic.Bool
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			stream.decodeFn = func(m any) error {
-				if res, ok := m.(*api.LeaseResult); ok {
-					res.Ok = true
-				}
-				return nil
-			}
-			if _, ok := routeable.(*api.LeaseRelease); ok {
-				releaseCalled.Store(true)
-			}
-			return stream, nil
-		},
-	}
-	c := NewClient(provider)
-	ctx := context.Background()
-	storeID := uuid.New()
-
-	lease, err := c.AcquireLease(ctx, storeID, "key1", 30*time.Second)
-	require.NoError(t, err)
-	require.NotNil(t, lease)
-
-	err = lease.Release()
-	require.NoError(t, err)
-	select {
-	case <-lease.Done():
-		// expected
-	case <-time.After(2 * time.Second):
-		t.Fatal("Done() should be closed after Release()")
-	}
-	assert.True(t, releaseCalled.Load(), "Release() should have sent LeaseRelease")
-}
-
-// TestAcquireLeaseNotAcquired verifies that when server returns Ok false, AcquireLease returns an error.
-func TestAcquireLeaseNotAcquired(t *testing.T) {
+// TestWithLeaseNotAcquired verifies that when server returns Ok false on acquire, WithLease returns ErrLeaseNotAcquired.
+func TestWithLeaseNotAcquired(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
@@ -1467,14 +1429,13 @@ func TestAcquireLeaseNotAcquired(t *testing.T) {
 	ctx := context.Background()
 	storeID := uuid.New()
 
-	lease, err := c.AcquireLease(ctx, storeID, "key1", 30*time.Second)
+	err := c.WithLease(ctx, storeID, "key1", 30*time.Second, func(context.Context) error { return nil })
 	require.Error(t, err)
-	require.Nil(t, lease)
 	assert.ErrorIs(t, err, ErrLeaseNotAcquired)
 }
 
-// TestLeaseRenewLoopStopsAfterRelease verifies that the renew loop runs and that Release() stops it and sends LeaseRelease.
-func TestLeaseRenewLoopStopsAfterRelease(t *testing.T) {
+// TestWithLeaseRenewAndRelease verifies that WithLease runs the renew loop and sends LeaseRelease when the callback returns.
+func TestWithLeaseRenewAndRelease(t *testing.T) {
 	var acquireCount, renewCount, releaseCount atomic.Int32
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -1500,19 +1461,95 @@ func TestLeaseRenewLoopStopsAfterRelease(t *testing.T) {
 	ctx := context.Background()
 	storeID := uuid.New()
 
-	// Min TTL is 1s, renew every ttl/2 = 500ms. Hold for ~1.2s to get at least one renew, then release.
-	lease, err := c.AcquireLease(ctx, storeID, "key1", 2*time.Second)
+	// Min TTL is 1s, renew every ttl/2 = 500ms. Hold for ~1.2s to get at least one renew, then return (release).
+	err := c.WithLease(ctx, storeID, "key1", 2*time.Second, func(leaseCtx context.Context) error {
+		time.Sleep(1200 * time.Millisecond)
+		return nil
+	})
 	require.NoError(t, err)
-	require.NotNil(t, lease)
-
-	time.Sleep(1200 * time.Millisecond) // allow at least one renew tick
-	err = lease.Release()
-	require.NoError(t, err)
-	<-lease.Done()
-
 	assert.Equal(t, int32(1), acquireCount.Load(), "should have exactly one LeaseAcquire")
 	assert.GreaterOrEqual(t, renewCount.Load(), int32(1), "should have at least one LeaseRenew")
 	assert.Equal(t, int32(1), releaseCount.Load(), "should have exactly one LeaseRelease")
+}
+
+// TestWithLeaseRunsCallbackThenReleases verifies that WithLease acquires, runs fn with a context, then releases.
+func TestWithLeaseRunsCallbackThenReleases(t *testing.T) {
+	var acquireCount, releaseCount atomic.Int32
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			switch routeable.(type) {
+			case *api.LeaseAcquire:
+				acquireCount.Add(1)
+			case *api.LeaseRelease:
+				releaseCount.Add(1)
+			}
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				if res, ok := m.(*api.LeaseResult); ok {
+					res.Ok = true
+				}
+				return nil
+			}
+			return stream, nil
+		},
+	}
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+
+	ran := false
+	err := c.WithLease(ctx, storeID, "key1", 30*time.Second, func(leaseCtx context.Context) error {
+		ran = true
+		select {
+		case <-leaseCtx.Done():
+			t.Fatal("lease context should not be done yet")
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	assert.True(t, ran)
+	assert.Equal(t, int32(1), acquireCount.Load())
+	assert.Equal(t, int32(1), releaseCount.Load())
+}
+
+// TestWithLeaseContextCanceledWhenParentCanceled verifies that when the parent context is canceled, fn's context is canceled.
+func TestWithLeaseContextCanceledWhenParentCanceled(t *testing.T) {
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				if res, ok := m.(*api.LeaseResult); ok {
+					res.Ok = true
+				}
+				return nil
+			}
+			return stream, nil
+		},
+	}
+	c := NewClient(provider)
+	storeID := uuid.New()
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	callbackStarted := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_ = c.WithLease(parentCtx, storeID, "key1", 30*time.Second, func(leaseCtx context.Context) error {
+			close(callbackStarted)
+			<-leaseCtx.Done()
+			close(done)
+			return nil
+		})
+	}()
+	<-callbackStarted
+	cancelParent()
+	select {
+	case <-done:
+		// fn saw context canceled and returned
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback context should have been canceled when parent was canceled")
+	}
 }
 
 func TestIsRetryable(t *testing.T) {

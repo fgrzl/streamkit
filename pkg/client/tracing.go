@@ -254,10 +254,10 @@ func (c *tracingClient) GetSubscriptionStatus(id string) *SubscriptionStatus {
 	return c.client.GetSubscriptionStatus(id)
 }
 
-// AcquireLease acquires a lease with tracing.
-func (c *tracingClient) AcquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error) {
+// WithLease runs the callback with a lease-held context, with tracing.
+func (c *tracingClient) WithLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration, fn func(context.Context) error) error {
 	requestID := generateOrGetRequestID(ctx)
-	ctx, span := c.tracer.Start(ctx, "streamkit.client.acquire_lease",
+	ctx, span := c.tracer.Start(ctx, "streamkit.client.with_lease",
 		trace.WithAttributes(
 			telemetry.WithStoreID(storeID),
 			attribute.String("streamkit.lease.key", key),
@@ -266,12 +266,12 @@ func (c *tracingClient) AcquireLease(ctx context.Context, storeID uuid.UUID, key
 		))
 	defer span.End()
 
-	lease, err := c.client.AcquireLease(ctx, storeID, key, ttl)
+	err := c.client.WithLease(ctx, storeID, key, ttl, fn)
 	if err != nil {
 		telemetry.RecordError(span, err)
-		return nil, err
+		return err
 	}
-	return lease, nil
+	return nil
 }
 
 // Close gracefully shuts down the client.

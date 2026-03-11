@@ -87,9 +87,11 @@ type Client interface {
 	// Returns nil if subscription not found. Includes failure count, last sequence, handler timeouts/panics.
 	GetSubscriptionStatus(id string) *SubscriptionStatus
 
-	// AcquireLease acquires a lease for the given key with the given TTL. The returned Lease
-	// auto-renews in the background until Release() is called. Release() is idempotent.
-	AcquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error)
+	// WithLease acquires a lease for the key, runs fn with a context that is canceled when the lease
+	// is released or lost (e.g. renew failed) or when ctx is canceled. The lease is released when fn
+	// returns (or on panic). Best-effort: if the lease is lost, fn's context is canceled—fn should
+	// respect that context (e.g. pass it to operations or select on it) so work stops when the lease is gone.
+	WithLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration, fn func(context.Context) error) error
 
 	// Close gracefully shuts down the client, stopping background goroutines and cleaning up resources.
 	// Safe to call multiple times. Should be called when the client is no longer needed.
@@ -158,7 +160,7 @@ func NewClientWithMetrics(provider api.BidiStreamProvider, handlerTimeout time.D
 }
 
 // activeSubscription represents a subscription managed by a single goroutine.
-// The goroutine retries indefinitely with exponential backoff until cancelled.
+// The goroutine retries indefinitely with exponential backoff until canceled.
 type activeSubscription struct {
 	id              string               // unique subscription ID
 	storeID         uuid.UUID            // store being subscribed to
@@ -479,13 +481,13 @@ func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment str
 	return entry, nil
 }
 
-// ErrLeaseNotAcquired is returned when AcquireLease could not acquire the lease (e.g. another holder has it).
+// ErrLeaseNotAcquired is returned when WithLease could not acquire the lease (e.g. another holder has it).
 var ErrLeaseNotAcquired = errors.New("lease not acquired")
 
 const minLeaseTTL = time.Second
 const leaseRenewIntervalRatio = 2 // renew every ttl/2
 
-func (c *client) AcquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error) {
+func (c *client) acquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error) {
 	if ttl < minLeaseTTL {
 		ttl = minLeaseTTL
 	}
@@ -533,6 +535,27 @@ func (c *client) AcquireLease(ctx context.Context, storeID uuid.UUID, key string
 	return l, nil
 }
 
+// WithLease acquires a lease, runs fn with a context canceled on lease loss or ctx cancellation, then releases.
+func (c *client) WithLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration, fn func(context.Context) error) error {
+	lease, err := c.acquireLease(ctx, storeID, key, ttl)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() {
+		select {
+		case <-ctx.Done():
+			runCancel()
+		case <-lease.Context().Done():
+			runCancel()
+		}
+	}()
+	return fn(runCtx)
+}
+
 // leaseImpl holds lease state and runs a background renew loop until Release() is called.
 type leaseImpl struct {
 	client      *client
@@ -548,6 +571,8 @@ type leaseImpl struct {
 }
 
 func (l *leaseImpl) Done() <-chan struct{} { return l.done }
+
+func (l *leaseImpl) Context() context.Context { return l.ctx }
 
 func (l *leaseImpl) Release() error {
 	var releaseErr error
@@ -604,6 +629,7 @@ func (l *leaseImpl) renewLoop() {
 			bidi.Close(nil)
 			if !result.Ok && l.ctx.Err() == nil {
 				slog.Warn("lease renew: server returned not ok", "key", l.key, "message", result.Message)
+				l.cancel() // cancel lease context so WithLease callback sees lease lost
 			}
 		}
 	}
@@ -873,7 +899,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			activeSub.failureCount.Store(0)
 			activeSub.status.Store("active")
 
-			// Read from stream until it fails, context is cancelled, or retry requested
+			// Read from stream until it fails, context is canceled, or retry requested
 			for {
 				if activeSub.retryRequested.Swap(false) {
 					stream.Close(nil)
@@ -982,7 +1008,7 @@ func (c *client) startReconnectDispatcher() {
 					sub := req.sub
 					replayStart := time.Now()
 
-					// Skip if subscription was cancelled while waiting in queue
+					// Skip if subscription was canceled while waiting in queue
 					select {
 					case <-sub.ctx.Done():
 						continue
@@ -1137,7 +1163,7 @@ type SubscriptionStatus struct {
 // The returned status contains the subscription's current state: "active"
 // (stream connected and delivering) or "reconnecting" (stream failed, retrying
 // with exponential backoff). Subscriptions never permanently fail — they keep
-// retrying until explicitly cancelled via Unsubscribe().
+// retrying until explicitly canceled via Unsubscribe().
 //
 // Failure counts and last errors are tracked for observability. The failure
 // count resets to zero on each successful reconnection. Returns nil if the
