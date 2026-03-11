@@ -11,7 +11,7 @@ require (
 	github.com/fgrzl/json v1.0.0-alpha.5
 	github.com/fgrzl/lexkey v0.1.0-alpha.35
 	github.com/fgrzl/messaging v1.0.0-alpha.7
-	github.com/fgrzl/mux v0.0.1-alpha.168
+	github.com/fgrzl/mux v0.0.1-alpha.169
 	github.com/fgrzl/timestamp v1.0.0-alpha.2
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.18.4
@@ -70,7 +70,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
 	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260226221140-a57be14db171 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	google.golang.org/grpc v1.79.2 // indirect

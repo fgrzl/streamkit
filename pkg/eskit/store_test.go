@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/es"
@@ -125,6 +126,9 @@ func (f *fakeClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, 
 }
 func (f *fakeClient) GetSubscriptionStatus(id string) *client.SubscriptionStatus {
 	return &client.SubscriptionStatus{}
+}
+func (f *fakeClient) WithLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration, fn func(context.Context) error) error {
+	return fn(ctx)
 }
 func (f *fakeClient) Close() error {
 	return nil

@@ -87,6 +87,12 @@ type Client interface {
 	// Returns nil if subscription not found. Includes failure count, last sequence, handler timeouts/panics.
 	GetSubscriptionStatus(id string) *SubscriptionStatus
 
+	// WithLease acquires a lease for the key, runs fn with a context that is canceled when the lease
+	// is released or lost (e.g. renew failed) or when ctx is canceled. The lease is released when fn
+	// returns (or on panic). Best-effort: if the lease is lost, fn's context is canceled—fn should
+	// respect that context (e.g. pass it to operations or select on it) so work stops when the lease is gone.
+	WithLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration, fn func(context.Context) error) error
+
 	// Close gracefully shuts down the client, stopping background goroutines and cleaning up resources.
 	// Safe to call multiple times. Should be called when the client is no longer needed.
 	Close() error
@@ -154,7 +160,7 @@ func NewClientWithMetrics(provider api.BidiStreamProvider, handlerTimeout time.D
 }
 
 // activeSubscription represents a subscription managed by a single goroutine.
-// The goroutine retries indefinitely with exponential backoff until cancelled.
+// The goroutine retries indefinitely with exponential backoff until canceled.
 type activeSubscription struct {
 	id              string               // unique subscription ID
 	storeID         uuid.UUID            // store being subscribed to
@@ -475,6 +481,160 @@ func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment str
 	return entry, nil
 }
 
+// ErrLeaseNotAcquired is returned when WithLease could not acquire the lease (e.g. another holder has it).
+var ErrLeaseNotAcquired = errors.New("lease not acquired")
+
+const minLeaseTTL = time.Second
+const leaseRenewIntervalRatio = 2 // renew every ttl/2
+
+func (c *client) acquireLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration) (api.Lease, error) {
+	if ttl < minLeaseTTL {
+		ttl = minLeaseTTL
+	}
+	// Round to nearest second so fractional seconds are not silently truncated (e.g. 1.5s -> 2s, not 1s).
+	ttlRounded := ttl.Round(time.Second)
+	ttlSec := int64(ttlRounded.Seconds())
+	if ttlSec < 1 {
+		ttlSec = 1
+	}
+	holder := uuid.New().String()
+
+	var bidi api.BidiStream
+	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		bidi, err = c.provider.CallStream(retryCtx, storeID, &api.LeaseAcquire{Key: key, Holder: holder, TTLSeconds: ttlSec})
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result api.LeaseResult
+	if err := bidi.Decode(&result); err != nil {
+		bidi.Close(nil)
+		return nil, err
+	}
+	bidi.Close(nil)
+	if !result.Ok {
+		return nil, fmt.Errorf("%w: %s", ErrLeaseNotAcquired, result.Message)
+	}
+
+	leaseCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	l := &leaseImpl{
+		client:  c,
+		storeID: storeID,
+		key:     key,
+		holder:  holder,
+		ttl:     ttlRounded, // use rounded TTL so renew interval matches server TTL
+		ttlSec:  ttlSec,
+		ctx:     leaseCtx,
+		cancel:  cancel,
+		done:    done,
+	}
+	go l.renewLoop()
+	return l, nil
+}
+
+// WithLease acquires a lease, runs fn with a context canceled on lease loss or ctx cancellation, then releases.
+func (c *client) WithLease(ctx context.Context, storeID uuid.UUID, key string, ttl time.Duration, fn func(context.Context) error) error {
+	lease, err := c.acquireLease(ctx, storeID, key, ttl)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() {
+		select {
+		case <-ctx.Done():
+			runCancel()
+		case <-lease.Context().Done():
+			runCancel()
+		}
+	}()
+	return fn(runCtx)
+}
+
+// leaseImpl holds lease state and runs a background renew loop until Release() is called.
+type leaseImpl struct {
+	client      *client
+	storeID     uuid.UUID
+	key         string
+	holder      string
+	ttl         time.Duration
+	ttlSec      int64
+	ctx         context.Context
+	cancel      context.CancelFunc
+	releaseOnce sync.Once
+	done        chan struct{}
+}
+
+func (l *leaseImpl) Done() <-chan struct{} { return l.done }
+
+func (l *leaseImpl) Context() context.Context { return l.ctx }
+
+func (l *leaseImpl) Release() error {
+	var releaseErr error
+	l.releaseOnce.Do(func() {
+		l.cancel()
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer releaseCancel()
+		bidi, err := l.client.provider.CallStream(releaseCtx, l.storeID, &api.LeaseRelease{Key: l.key, Holder: l.holder})
+		if err != nil {
+			releaseErr = err
+			slog.Warn("lease release: CallStream failed", "key", l.key, "err", err)
+		} else {
+			var res api.LeaseResult
+			_ = bidi.Decode(&res)
+			bidi.Close(nil)
+		}
+		close(l.done)
+	})
+	return releaseErr
+}
+
+func (l *leaseImpl) renewLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("lease renew loop panic", "key", l.key, "panic", r)
+		}
+	}()
+	interval := l.ttl / leaseRenewIntervalRatio
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-l.ctx.Done():
+			return
+		case <-ticker.C:
+			bidi, err := l.client.provider.CallStream(l.ctx, l.storeID, &api.LeaseRenew{Key: l.key, Holder: l.holder, TTLSeconds: l.ttlSec})
+			if err != nil {
+				if l.ctx.Err() == nil {
+					slog.Warn("lease renew: CallStream failed", "key", l.key, "err", err)
+				}
+				continue
+			}
+			var result api.LeaseResult
+			if err := bidi.Decode(&result); err != nil {
+				bidi.Close(nil)
+				if l.ctx.Err() == nil {
+					slog.Warn("lease renew: Decode failed", "key", l.key, "err", err)
+				}
+				continue
+			}
+			bidi.Close(nil)
+			if !result.Ok && l.ctx.Err() == nil {
+				slog.Warn("lease renew: server returned not ok", "key", l.key, "message", result.Message)
+				l.cancel() // cancel lease context so WithLease callback sees lease lost
+			}
+		}
+	}
+}
+
 func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*Record]) enumerators.Enumerator[*SegmentStatus] {
 	var bidi api.BidiStream
 	err := RetryWithBackoff(ctx, c.policy, func(retryCtx context.Context) error {
@@ -739,7 +899,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			activeSub.failureCount.Store(0)
 			activeSub.status.Store("active")
 
-			// Read from stream until it fails, context is cancelled, or retry requested
+			// Read from stream until it fails, context is canceled, or retry requested
 			for {
 				if activeSub.retryRequested.Swap(false) {
 					stream.Close(nil)
@@ -848,7 +1008,7 @@ func (c *client) startReconnectDispatcher() {
 					sub := req.sub
 					replayStart := time.Now()
 
-					// Skip if subscription was cancelled while waiting in queue
+					// Skip if subscription was canceled while waiting in queue
 					select {
 					case <-sub.ctx.Done():
 						continue
@@ -1003,7 +1163,7 @@ type SubscriptionStatus struct {
 // The returned status contains the subscription's current state: "active"
 // (stream connected and delivering) or "reconnecting" (stream failed, retrying
 // with exponential backoff). Subscriptions never permanently fail — they keep
-// retrying until explicitly cancelled via Unsubscribe().
+// retrying until explicitly canceled via Unsubscribe().
 //
 // Failure counts and last errors are tracked for observability. The failure
 // count resets to zero on each successful reconnection. Returns nil if the

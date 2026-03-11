@@ -179,6 +179,52 @@ func (m *GetStatus) GetDiscriminator() string {
 	return "streamkit://api/v1/get_status"
 }
 
+// LeaseAcquire represents a request to acquire a lease for a key with a TTL.
+type LeaseAcquire struct {
+	Key        string `json:"key"`
+	Holder     string `json:"holder"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+}
+
+// GetDiscriminator returns the unique message type identifier for LeaseAcquire.
+func (m *LeaseAcquire) GetDiscriminator() string {
+	return "streamkit://api/v1/lease_acquire"
+}
+
+// LeaseRenew represents a request to renew an existing lease, extending its TTL.
+type LeaseRenew struct {
+	Key        string `json:"key"`
+	Holder     string `json:"holder"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+}
+
+// GetDiscriminator returns the unique message type identifier for LeaseRenew.
+func (m *LeaseRenew) GetDiscriminator() string {
+	return "streamkit://api/v1/lease_renew"
+}
+
+// LeaseRelease represents a request to release a lease.
+type LeaseRelease struct {
+	Key    string `json:"key"`
+	Holder string `json:"holder"`
+}
+
+// GetDiscriminator returns the unique message type identifier for LeaseRelease.
+func (m *LeaseRelease) GetDiscriminator() string {
+	return "streamkit://api/v1/lease_release"
+}
+
+// LeaseResult is the response for acquire, renew, and release operations.
+type LeaseResult struct {
+	Ok      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+}
+
+// GetDiscriminator returns the unique message type identifier for LeaseResult.
+func (m *LeaseResult) GetDiscriminator() string {
+	return "streamkit://api/v1/lease_result"
+}
+
 // TRX represents transaction metadata associated with an entry.
 type TRX struct {
 	ID     uuid.UUID `json:"id"`
