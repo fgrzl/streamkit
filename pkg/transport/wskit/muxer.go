@@ -257,7 +257,15 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 	default:
 	}
 
-	sendFn := func(payload []byte) error { return m.sendDataWithTrace(ctx, storeID, channelID, payload) }
+	sendFn := func(payload []byte) error {
+		// Only client-originated data frames should inherit the request trace.
+		// Server-side streams can live for hours (subscriptions/streaming responses),
+		// so reusing the registration-time trace context would grow one trace forever.
+		if m.name == "client" {
+			return m.sendDataWithTrace(ctx, storeID, channelID, payload)
+		}
+		return m.sendData(storeID, channelID, payload, nil)
+	}
 
 	cleanup := func() {
 		m.channelsMu.Lock()

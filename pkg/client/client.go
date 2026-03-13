@@ -272,12 +272,21 @@ type resilienceEnumerator struct {
 	storeID   uuid.UUID
 	args      api.Routeable // ConsumeSegment or ConsumeSpace request
 	ctx       context.Context
+	cancel    context.CancelFunc
 	innerEnum enumerators.Enumerator[*Entry]
 
 	lastEntry      *Entry
 	attemptCount   int
 	maxAttempts    int
 	disconnectedAt time.Time
+}
+
+func detachLongLivedContext(ctx context.Context) context.Context {
+	detached := context.Background()
+	if requestID, ok := telemetry.RequestIDFromContext(ctx); ok {
+		detached = telemetry.WithRequestIDContext(detached, requestID)
+	}
+	return detached
 }
 
 func (e *resilienceEnumerator) MoveNext() bool {
@@ -364,6 +373,9 @@ func (e *resilienceEnumerator) Current() (*Entry, error) {
 }
 
 func (e *resilienceEnumerator) Dispose() {
+	if e.cancel != nil {
+		e.cancel()
+	}
 	if e.innerEnum != nil {
 		e.innerEnum.Dispose()
 		e.innerEnum = nil
@@ -452,11 +464,20 @@ func (e *resilienceEnumerator) Err() error {
 
 // newResilienceEnumerator creates a resilience-wrapped enumerator (Issue 8)
 func newResilienceEnumerator(client *client, ctx context.Context, storeID uuid.UUID, args api.Routeable) enumerators.Enumerator[*Entry] {
+	enumCtx, cancel := context.WithCancel(detachLongLivedContext(ctx))
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-enumCtx.Done():
+		}
+	}()
 	return &resilienceEnumerator{
 		client:       client,
 		storeID:      storeID,
 		args:         args,
-		ctx:          ctx,
+		ctx:          enumCtx,
+		cancel:       cancel,
 		maxAttempts:  7, // Same as subscription retry logic
 		attemptCount: 0,
 	}
@@ -543,7 +564,7 @@ func (c *client) WithLease(ctx context.Context, storeID uuid.UUID, key string, t
 	}
 	defer lease.Release()
 
-	runCtx, runCancel := context.WithCancel(ctx)
+	runCtx, runCancel := context.WithCancel(detachLongLivedContext(ctx))
 	defer runCancel()
 	go func() {
 		select {
@@ -806,11 +827,14 @@ func (c *client) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, spac
 }
 
 func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg api.Routeable, handler func(*SegmentStatus)) (api.Subscription, error) {
-	subCtx, cancel := context.WithCancel(ctx)
+	subCtx, cancel := context.WithCancel(detachLongLivedContext(ctx))
 	// Tie subscription lifecycle to client shutdown so subscription goroutines exit before
-	// Close() closes reconnectQueue (avoids send on closed channel panic).
+	// Close() closes reconnectQueue (avoids send on closed channel panic), and
+	// parent ctx still controls cancellation without propagating its trace forever.
 	go func() {
 		select {
+		case <-ctx.Done():
+			cancel()
 		case <-subCtx.Done():
 			return
 		case <-c.reconnectCtx.Done():
