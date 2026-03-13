@@ -27,6 +27,10 @@ type Config struct {
 	OTLPEndpoint string
 	// Insecure, when true, disables TLS for the OTLP endpoint.
 	Insecure bool
+	// TraceSampleRatio is the fraction of root traces to sample (0 to 1). When the
+	// incoming context has a parent span, the parent's sampling decision is followed.
+	// Zero means use default 0.1. Use 1.0 for always-on (100%) sampling.
+	TraceSampleRatio float64
 }
 
 // ShutdownFunc shuts down tracer and meter providers. Safe to call multiple times.
@@ -70,9 +74,11 @@ func Initialize(ctx context.Context, cfg Config) (ShutdownFunc, error) {
 		if err != nil {
 			return nil, fmt.Errorf("otlp trace exporter: %w", err)
 		}
+		sampler := samplerFromRatio(cfg.TraceSampleRatio)
 		tp := sdktrace.NewTracerProvider(
 			sdktrace.WithResource(res),
 			sdktrace.WithBatcher(traceExp),
+			sdktrace.WithSampler(sampler),
 		)
 		otel.SetTracerProvider(tp)
 		shutdowns = append(shutdowns, func(c context.Context) error { return tp.Shutdown(c) })
@@ -137,6 +143,18 @@ func NewInMemoryTracerProvider() (*sdktrace.TracerProvider, *tracetest.InMemoryE
 		sdktrace.WithResource(res),
 	)
 	return tp, exporter, nil
+}
+
+// samplerFromRatio returns a ParentBased sampler that uses TraceIDRatioBased for
+// root spans; ratio 0 uses default 0.1, 1.0 uses AlwaysOn.
+func samplerFromRatio(ratio float64) sdktrace.Sampler {
+	if ratio == 0 {
+		ratio = 0.1
+	}
+	if ratio >= 1.0 {
+		return sdktrace.AlwaysSample()
+	}
+	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))
 }
 
 // newResource builds a resource with service name and optional version.

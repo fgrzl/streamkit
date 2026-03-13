@@ -520,17 +520,25 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 
 	bidi = m.register(ctx, msg.StoreID, msg.ChannelID)
 	if bidi != nil {
-		tracer := telemetry.GetTracer()
-		reqCtx, span := tracer.Start(ctx, "streamkit.transport.server.request",
-			trace.WithAttributes(
-				telemetry.WithStoreID(msg.StoreID),
-				telemetry.WithChannelID(msg.ChannelID),
-				telemetry.WithTransportType("websocket"),
-			))
-		span.End()
-		go func() {
-			instance.Handle(reqCtx, bidi)
-		}()
+		handleCtx := ctx
+		if trace.SpanFromContext(ctx).SpanContext().IsValid() {
+			tracer := telemetry.GetTracer()
+			reqCtx, span := tracer.Start(ctx, "streamkit.transport.server.request",
+				trace.WithAttributes(
+					telemetry.WithStoreID(msg.StoreID),
+					telemetry.WithChannelID(msg.ChannelID),
+					telemetry.WithTransportType("websocket"),
+				))
+			span.End() // short-lived: stream accepted; avoid long-lived span for Handle()
+			handleCtx = reqCtx
+			go func() {
+				instance.Handle(handleCtx, bidi)
+			}()
+		} else {
+			go func() {
+				instance.Handle(handleCtx, bidi)
+			}()
+		}
 		return bidi, nil
 	}
 	slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", slog.String("channel_id", msg.ChannelID.String()))
