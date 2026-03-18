@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fgrzl/messaging"
 	"github.com/fgrzl/streamkit/internal/lease"
+	"github.com/fgrzl/streamkit/pkg/bus"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/google/uuid"
 )
@@ -26,7 +26,7 @@ type NodeManager interface {
 type NodeManagerOption func(*nodeManager)
 
 // WithMessageBusFactory configures the NodeManager to use the specified message bus factory.
-func WithMessageBusFactory(busFactory messaging.MessageBusFactory) NodeManagerOption {
+func WithMessageBusFactory(busFactory bus.MessageBusFactory) NodeManagerOption {
 	return func(n *nodeManager) {
 		n.busFactory = busFactory
 	}
@@ -46,7 +46,7 @@ type storeFailure struct {
 
 type nodeManager struct {
 	mu            sync.RWMutex
-	busFactory    messaging.MessageBusFactory
+	busFactory    bus.MessageBusFactory
 	storeFactory  storage.StoreFactory
 	nodes         map[uuid.UUID]Node
 	failures      map[uuid.UUID]*storeFailure

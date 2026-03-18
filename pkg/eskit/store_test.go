@@ -10,7 +10,6 @@ import (
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/es"
 	"github.com/fgrzl/json/polymorphic"
-	"github.com/fgrzl/messaging"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/client"
 	"github.com/google/uuid"
@@ -54,7 +53,6 @@ func (f *fakeDomainEvent) SetMetadata(metadata es.EventMetadata) {
 		f.seq = metadata.Sequence
 	}
 }
-func (f *fakeDomainEvent) GetRoute() messaging.Route { return messaging.NewGlobalRoute("es", "fake") }
 
 // MarshalJSON ensures the embedded metadata contains the sequence
 // so that polymorphic.NewEnvelope can marshal/unmarshal the event

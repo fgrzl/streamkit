@@ -9,7 +9,7 @@ package api
 
 import (
 	"github.com/fgrzl/lexkey"
-	"github.com/fgrzl/messaging"
+	"github.com/fgrzl/streamkit/pkg/bus"
 	"github.com/google/uuid"
 )
 
@@ -51,13 +51,13 @@ func (obj *SegmentNotification) GetDiscriminator() string {
 	return "streamkit://api/v1/segment_notification"
 }
 
-func (obj *SegmentNotification) GetRoute() messaging.Route {
+func (obj *SegmentNotification) GetRoute() bus.Route {
 	return GetSegmentNotificationRoute(obj.StoreID, obj.SegmentStatus.Space)
 }
 
-func GetSegmentNotificationRoute(storeID uuid.UUID, space string) messaging.Route {
+func GetSegmentNotificationRoute(storeID uuid.UUID, space string) bus.Route {
 	inboxID := uuid.NewSHA1(storeID, []byte(space))
-	return messaging.NewInboxRoute("streamkit", "segment_notification", &inboxID)
+	return bus.NewInboxRoute("streamkit", "segment_notification", &inboxID)
 }
 
 // ─── API Messages ──────────────────────────────────────────────────────────────

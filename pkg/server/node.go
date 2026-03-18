@@ -15,9 +15,9 @@ import (
 
 	"github.com/fgrzl/enumerators"
 	"github.com/fgrzl/json/polymorphic"
-	"github.com/fgrzl/messaging"
 	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/bus"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
@@ -34,7 +34,7 @@ type Node interface {
 }
 
 // NewNode creates a new Node instance with the specified store, optional message bus factory, and lease store.
-func NewNode(storeID uuid.UUID, store storage.Store, busFactory messaging.MessageBusFactory, leaseStore *lease.Store) Node {
+func NewNode(storeID uuid.UUID, store storage.Store, busFactory bus.MessageBusFactory, leaseStore *lease.Store) Node {
 	return &defaultNode{
 		storeID:    storeID,
 		store:      store,
@@ -46,7 +46,7 @@ func NewNode(storeID uuid.UUID, store storage.Store, busFactory messaging.Messag
 type defaultNode struct {
 	storeID    uuid.UUID
 	store      storage.Store
-	busFactory messaging.MessageBusFactory
+	busFactory bus.MessageBusFactory
 	leaseStore *lease.Store
 }
 
@@ -282,7 +282,7 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
-	bus, err := n.busFactory.Get(ctx)
+	messageBus, err := n.busFactory.Get(ctx)
 	if err != nil {
 		telemetry.RecordError(span, err)
 		slog.WarnContext(ctx, "failed to connect to the message bus")
@@ -291,7 +291,7 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	}
 
 	route := api.GetSegmentNotificationRoute(n.storeID, args.Space)
-	sub, err := messaging.Subscribe(bus, route, func(ctx context.Context, msg *api.SegmentNotification) error {
+	sub, err := bus.Subscribe(messageBus, route, func(ctx context.Context, msg *api.SegmentNotification) error {
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {
 			return bidi.Encode(msg.SegmentStatus)
@@ -322,16 +322,16 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	}()
 }
 
-func (n *defaultNode) getBus(ctx context.Context) messaging.MessageBus {
+func (n *defaultNode) getBus(ctx context.Context) bus.MessageBus {
 	if n.busFactory == nil {
 		return nil
 	}
-	bus, err := n.busFactory.Get(ctx)
+	messageBus, err := n.busFactory.Get(ctx)
 	if err != nil {
 		slog.WarnContext(ctx, "the message bus factory was not configured")
 		return nil
 	}
-	return bus
+	return messageBus
 }
 
 func streamNames(ctx context.Context, enumerator enumerators.Enumerator[string], bidi api.BidiStream) {
