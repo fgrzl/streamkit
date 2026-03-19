@@ -49,8 +49,8 @@ github.com/fgrzl/enumerators v1.0.0-alpha.3 h1:HsAlKt+DHFKZaO0Lq7wnhPgtrGdYmWFMB
 github.com/fgrzl/enumerators v1.0.0-alpha.3/go.mod h1:feeP9+rknaUYQ8TQwycW1lLX9JdOrWRgr22pu1j5lP4=
 github.com/fgrzl/es v1.0.0-alpha.4 h1:7mYmK3BApbO1DR1TNHf25xkFQwiDg8vA7oHhqJUUZLk=
 github.com/fgrzl/es v1.0.0-alpha.4/go.mod h1:z8E+4GzHEH64Svu2kCJunP9Ly0rm5f8WBfz4IX2pasg=
-github.com/fgrzl/json v1.0.0-alpha.7 h1:9x4b5314cCLLp/h7wF9btyfl8nNKeYzNSFKymyPbtbs=
-github.com/fgrzl/json v1.0.0-alpha.7/go.mod h1:8ZdkBL2YZJ2w96e9GHs70TG7omuJLPVclgj/uQSTgq8=
+github.com/fgrzl/json v1.0.0-alpha.8 h1:ZEUDmfoZ7vVFTWxSGl/HihIw1oJLucwLe0EF08v7cns=
+github.com/fgrzl/json v1.0.0-alpha.8/go.mod h1:8ZdkBL2YZJ2w96e9GHs70TG7omuJLPVclgj/uQSTgq8=
 github.com/fgrzl/lexkey v0.1.0-alpha.35 h1:EILZ+R0bAhXqg2xbOmOueeWJ8YTs+kkX3730Kx2fDoU=
 github.com/fgrzl/lexkey v0.1.0-alpha.35/go.mod h1:hfwt8FsLiFD4s43ntKLgPXJBk114bF4AOWXQSEzO6BI=
 github.com/fgrzl/mux v0.0.1-alpha.171 h1:RI5/KNF83dAUneb+4FaSLMQlULZDfhy9yV2icPORl6Q=
@@ -247,10 +247,10 @@ golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8T
 golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
 gonum.org/v1/gonum v0.16.0 h1:5+ul4Swaf3ESvrOnidPp4GZbzf0mxVQpDCYUQE7OJfk=
 gonum.org/v1/gonum v0.16.0/go.mod h1:fef3am4MQ93R2HHpKnLk4/Tbh/s0+wqD5nfa6Pnwy4E=
-google.golang.org/genproto/googleapis/api v0.0.0-20260316180232-0b37fe3546d5 h1:CogIeEXn4qWYzzQU0QqvYBM8yDF9cFYzDq9ojSpv0Js=
-google.golang.org/genproto/googleapis/api v0.0.0-20260316180232-0b37fe3546d5/go.mod h1:EIQZ5bFCfRQDV4MhRle7+OgjNtZ6P1PiZBgAKuxXu/Y=
-google.golang.org/genproto/googleapis/rpc v0.0.0-20260316180232-0b37fe3546d5 h1:aJmi6DVGGIStN9Mobk/tZOOQUBbj0BPjZjjnOdoZKts=
-google.golang.org/genproto/googleapis/rpc v0.0.0-20260316180232-0b37fe3546d5/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
+google.golang.org/genproto/googleapis/api v0.0.0-20260319171110-e3a33c96fb44 h1:3r0atjZtaSjEuUu8NNhKvvnFh8ad9PHWsN9VRotabFU=
+google.golang.org/genproto/googleapis/api v0.0.0-20260319171110-e3a33c96fb44/go.mod h1:EIQZ5bFCfRQDV4MhRle7+OgjNtZ6P1PiZBgAKuxXu/Y=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260319171110-e3a33c96fb44 h1:sRy++txmErSjyVWlIgQB5nB+U75+Di+AH7eEZ002B/s=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260319171110-e3a33c96fb44/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
 google.golang.org/grpc v1.79.3 h1:sybAEdRIEtvcD68Gx7dmnwjZKlyfuc61Dyo9pGXXkKE=
 google.golang.org/grpc v1.79.3/go.mod h1:KmT0Kjez+0dde/v2j9vzwoAScgEPx/Bw1CYChhHLrHQ=
 google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
