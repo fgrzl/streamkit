@@ -2,6 +2,7 @@ package wskit
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -47,7 +48,9 @@ func (c *MuxerBidiStream) Encode(m any) error {
 		return err
 	}
 	if err := c.encode(payload); err != nil {
-		slog.Error("bidi: encode send failed", "err", err, slog.String("channel_id", c.channelID.String()), slog.Int("bytes", len(payload)))
+		// Send failures are almost always disconnect/teardown; callers get err for handling.
+		// Avoid Error/Warn here — it dominated logs during normal reconnect flows.
+		slog.Debug("bidi: encode send failed", "err", err, slog.String("channel_id", c.channelID.String()), slog.Int("bytes", len(payload)))
 		return err
 	}
 	return nil
@@ -111,7 +114,12 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 	switch errMsg.Type {
 	case "close":
 		if errMsg.Err != "" {
-			slog.Warn("bidi: remote closed stream with error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
+			remoteErr := errors.New(errMsg.Err)
+			if benignDisconnect(remoteErr) {
+				slog.Debug("bidi: remote closed stream", slog.String("channel_id", c.channelID.String()), slog.String("detail", errMsg.Err))
+			} else {
+				slog.Warn("bidi: remote closed stream with error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
+			}
 			return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
 		}
 		return true, io.EOF
@@ -133,7 +141,6 @@ func (c *MuxerBidiStream) CloseSend(err error) error {
 		msg.Err = err.Error()
 	}
 	if encErr := c.Encode(msg); encErr != nil {
-		slog.Warn("bidi: failed to send close", slog.String("channel_id", c.channelID.String()), "err", encErr)
 		return encErr
 	}
 	return nil

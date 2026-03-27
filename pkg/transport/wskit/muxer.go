@@ -375,9 +375,9 @@ func (m *WebSocketMuxer) readLoop() {
 
 // handleReceiveError centralizes logging and shutdown behavior when websocket.Receive fails.
 func (m *WebSocketMuxer) handleReceiveError(err error) {
-	// Treat EOF as a normal, peer-initiated close
-	if err == io.EOF {
-		slog.InfoContext(m.Context, "muxer: websocket closed by peer")
+	// Normal disconnect: clean close, RST, or abrupt hangup — not an application fault.
+	if benignDisconnect(err) {
+		slog.InfoContext(m.Context, "muxer: websocket disconnected", slog.String("detail", err.Error()))
 		m.shutdown(nil)
 		return
 	}
@@ -683,11 +683,7 @@ func (m *WebSocketMuxer) sendPing() error {
 	pooled := m.msgPool.Get()
 	if pooled == nil || m.writeQueue == nil {
 		// synchronous fallback - increment writeErrors and warn on failure
-		err := m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypePing}, false)
-		if err != nil {
-			slog.WarnContext(m.Context, "muxer: ping send failed", slog.String("error", err.Error()))
-		}
-		return err
+		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypePing}, false)
 	}
 
 	msg := pooled.(*MuxerMsg)
@@ -705,7 +701,11 @@ func (m *WebSocketMuxer) sendPing() error {
 		defer m.writeMu.Unlock()
 		if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypePing}); err != nil {
 			atomic.AddInt64(&m.writeErrors, 1)
-			slog.WarnContext(m.Context, "muxer: ping send failed", slog.String("error", err.Error()))
+			if benignDisconnect(err) {
+				slog.DebugContext(m.Context, "muxer: ping send skipped (disconnected)", slog.String("error", err.Error()))
+			} else {
+				slog.WarnContext(m.Context, "muxer: ping send failed", slog.String("error", err.Error()))
+			}
 			return err
 		}
 		return nil
@@ -731,7 +731,11 @@ func (m *WebSocketMuxer) sendJSONWithLock(msg *MuxerMsg, shutdownOnErr bool) err
 	if err != nil {
 		atomic.AddInt64(&m.writeErrors, 1)
 		fields := m.buildSendErrorFields(err, msg)
-		slog.ErrorContext(m.Context, "muxer: write/send failed", fields...)
+		if benignDisconnect(err) {
+			slog.DebugContext(m.Context, "muxer: write/send stopped (disconnected)", fields...)
+		} else {
+			slog.ErrorContext(m.Context, "muxer: write/send failed", fields...)
+		}
 		if shutdownOnErr {
 			// Do not call shutdown while holding writeMu: shutdown locks writeMu and would deadlock.
 			go m.shutdown(err)
@@ -883,11 +887,19 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 			// Without this lock, if a goroutine is still writing, the frame gets corrupted.
 			m.writeMu.Lock()
 			if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypeClose}); err != nil {
-				slog.WarnContext(m.Context, "muxer: shutdown close frame send failed", "err", err)
+				if benignDisconnect(err) {
+					slog.DebugContext(m.Context, "muxer: shutdown close frame not sent (already disconnected)", "err", err)
+				} else {
+					slog.WarnContext(m.Context, "muxer: shutdown close frame send failed", "err", err)
+				}
 			}
 			m.writeMu.Unlock()
 			if err := m.conn.Close(); err != nil {
-				slog.WarnContext(m.Context, "muxer: shutdown conn close failed", "err", err)
+				if benignDisconnect(err) {
+					slog.DebugContext(m.Context, "muxer: shutdown conn close skipped", "err", err)
+				} else {
+					slog.WarnContext(m.Context, "muxer: shutdown conn close failed", "err", err)
+				}
 			}
 		}
 		if m.cancelFunc != nil {
