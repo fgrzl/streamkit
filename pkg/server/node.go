@@ -125,22 +125,30 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 
 func (n *defaultNode) handleGetSpaces(ctx context.Context, _ *api.GetSpaces, bidi api.BidiStream) {
 	enumerator := n.store.GetSpaces(ctx)
-	streamNames(ctx, enumerator, bidi)
+	runAsyncStream(ctx, bidi, func() {
+		streamNames(ctx, enumerator, bidi)
+	})
 }
 
 func (n *defaultNode) handleConsumeSpace(ctx context.Context, args *api.ConsumeSpace, bidi api.BidiStream) {
 	enumerator := n.store.ConsumeSpace(ctx, args)
-	streamEntries(ctx, enumerator, bidi)
+	runAsyncStream(ctx, bidi, func() {
+		streamEntries(ctx, enumerator, bidi)
+	})
 }
 
 func (n *defaultNode) handleGetSegments(ctx context.Context, args *api.GetSegments, bidi api.BidiStream) {
 	enumerator := n.store.GetSegments(ctx, args.Space)
-	streamNames(ctx, enumerator, bidi)
+	runAsyncStream(ctx, bidi, func() {
+		streamNames(ctx, enumerator, bidi)
+	})
 }
 
 func (n *defaultNode) handleConsumeSegment(ctx context.Context, args *api.ConsumeSegment, bidi api.BidiStream) {
 	enumerator := n.store.ConsumeSegment(ctx, args)
-	streamEntries(ctx, enumerator, bidi)
+	runAsyncStream(ctx, bidi, func() {
+		streamEntries(ctx, enumerator, bidi)
+	})
 }
 
 func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.BidiStream) {
@@ -232,30 +240,32 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 
 	bus := n.getBus(ctx)
 
-	count := 0
-	err := enumerators.ForEach(results, func(result *api.SegmentStatus) error {
-		count++
-		if err := bidi.Encode(result); err != nil {
-			return err
-		}
-		if bus != nil {
-			notification := &api.SegmentNotification{
-				StoreID:       n.storeID,
-				SegmentStatus: result,
+	runAsyncStream(ctx, bidi, func() {
+		count := 0
+		err := enumerators.ForEach(results, func(result *api.SegmentStatus) error {
+			count++
+			if err := bidi.Encode(result); err != nil {
+				return err
 			}
-			if err := bus.Notify(notification); err != nil {
-				slog.WarnContext(ctx, err.Error())
+			if bus != nil {
+				notification := &api.SegmentNotification{
+					StoreID:       n.storeID,
+					SegmentStatus: result,
+				}
+				if err := bus.Notify(notification); err != nil {
+					slog.WarnContext(ctx, err.Error())
+				}
 			}
+			return nil
+		})
+		if err != nil {
+			slog.ErrorContext(ctx, "produce failed", "err", err)
+			bidi.CloseSend(err)
+			return
 		}
-		return nil
-	})
-	if err != nil {
-		slog.ErrorContext(ctx, "produce failed", "err", err)
-		bidi.CloseSend(err)
-		return
-	}
 
-	bidi.CloseSend(nil)
+		bidi.CloseSend(nil)
+	})
 }
 
 func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi api.BidiStream) {
@@ -269,7 +279,9 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 		}))
 	}
 	enumerator := enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
-	streamEntries(ctx, enumerator, bidi)
+	runAsyncStream(ctx, bidi, func() {
+		streamEntries(ctx, enumerator, bidi)
+	})
 }
 
 func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
@@ -332,6 +344,18 @@ func (n *defaultNode) getBus(ctx context.Context) bus.MessageBus {
 		return nil
 	}
 	return messageBus
+}
+
+func runAsyncStream(ctx context.Context, bidi api.BidiStream, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(ctx, "async stream handler panic", "panic", r)
+				bidi.Close(fmt.Errorf("panic: %v", r))
+			}
+		}()
+		fn()
+	}()
 }
 
 func streamNames(ctx context.Context, enumerator enumerators.Enumerator[string], bidi api.BidiStream) {

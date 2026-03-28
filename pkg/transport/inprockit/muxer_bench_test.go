@@ -37,7 +37,7 @@ func BenchmarkMuxerRegister(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := m.Register(uuid.New())
+		_, err := m.Register(context.Background(), uuid.New())
 		if err != nil {
 			b.Fatalf("register failed: %v", err)
 		}
