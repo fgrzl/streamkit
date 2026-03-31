@@ -529,7 +529,10 @@ func (s *AzureStore) walMonitorLoop(ctx context.Context) {
 			// This ensures WAL recovery respects server shutdown
 			recoveryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			if err := s.recoverWAL(recoveryCtx); err != nil {
-				slog.WarnContext(ctx, "WAL monitor: recovery failed", "err", err)
+				slog.WarnContext(ctx, "WAL monitor: recovery failed",
+					slog.Duration("recovery_timeout", 30*time.Second),
+					slog.Duration("monitor_interval", WALMonitorInterval),
+					"err", err)
 				// Don't crash, retry next interval
 			}
 			cancel()
@@ -567,7 +570,10 @@ func (s *AzureStore) walMonitorLoopWithRestarts(ctx context.Context, restartCoun
 		case <-ticker.C:
 			recoveryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			if err := s.recoverWAL(recoveryCtx); err != nil {
-				slog.WarnContext(ctx, "WAL monitor: recovery failed", "err", err)
+				slog.WarnContext(ctx, "WAL monitor: recovery failed",
+					slog.Duration("recovery_timeout", 30*time.Second),
+					slog.Duration("monitor_interval", WALMonitorInterval),
+					"err", err)
 			}
 			cancel()
 		}

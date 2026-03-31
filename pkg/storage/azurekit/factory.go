@@ -105,7 +105,16 @@ func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage
 			httpClient, err = client.NewHTTPTableClient(f.options.AccountName, f.options.AccountKey, tableName, f.options.AllowInsecureHTTP, f.options.Endpoint)
 		}
 		if err != nil {
-			slog.ErrorContext(ctx, "azure store: failed to create HTTP client", slog.String("err", err.Error()))
+			authMethod := "SharedKey"
+			if f.options.UseManagedIdentity {
+				authMethod = "ManagedIdentity"
+			}
+			slog.ErrorContext(ctx, "azure store: failed to create HTTP client",
+				slog.String("account", f.options.AccountName),
+				slog.String("table", tableName),
+				slog.String("auth", authMethod),
+				slog.String("endpoint", f.options.Endpoint),
+				slog.String("err", err.Error()))
 			return nil, err
 		}
 	}

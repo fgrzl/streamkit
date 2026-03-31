@@ -3,6 +3,7 @@ package wskit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -601,7 +602,11 @@ func (p *WebSocketBidiStreamProvider) notifyReconnected(ctx context.Context, sto
 
 	for _, listener := range listeners {
 		if err := listener.OnReconnected(ctx, storeID); err != nil {
-			slog.WarnContext(ctx, "reconnect listener failed", "err", err)
+			slog.WarnContext(ctx, "reconnect listener failed",
+				slog.String("listener_type", fmt.Sprintf("%T", listener)),
+				slog.String("store_id", storeID.String()),
+				slog.String("error_type", classifyTransportError(err)),
+				"err", err)
 		}
 	}
 }

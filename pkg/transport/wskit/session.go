@@ -30,7 +30,10 @@ func NewServerMuxerSession(principal claims.Principal) (MuxerSession, error) {
 			raw := strings.TrimPrefix(scope, ScopePrefix)
 			id, err := uuid.Parse(raw)
 			if err != nil {
-				slog.Warn("ignoring invalid store scope", "scope", scope, "error", err)
+				slog.Warn("ignoring invalid store scope",
+					slog.String("scope", scope),
+					slog.String("error_type", "scope_parse"),
+					"error", err)
 				continue
 			}
 			allowedStores[id] = struct{}{}
