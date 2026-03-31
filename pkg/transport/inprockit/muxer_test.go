@@ -44,7 +44,7 @@ func TestShouldRegisterStreamAndCleanupOnClose(t *testing.T) {
 	storeID := uuid.New()
 
 	// Act
-	client, err := muxer.Register(storeID)
+	client, err := muxer.Register(context.Background(), storeID)
 
 	// Assert
 	require.NoError(t, err)
@@ -81,7 +81,7 @@ func TestShouldReturnServerStreamWhenRegistered(t *testing.T) {
 	storeID := uuid.New()
 
 	// Act
-	client, err := muxer.Register(storeID)
+	client, err := muxer.Register(context.Background(), storeID)
 
 	// Assert
 	require.NoError(t, err)
@@ -119,7 +119,7 @@ func TestShouldReturnErrorWhenNodeManagerFails(t *testing.T) {
 	storeID := uuid.New()
 
 	// Act
-	client, err := muxer.Register(storeID)
+	client, err := muxer.Register(context.Background(), storeID)
 
 	// Assert
 	require.Error(t, err)

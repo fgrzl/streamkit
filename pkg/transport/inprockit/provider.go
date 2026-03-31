@@ -38,7 +38,7 @@ func (p *InProcBidiStreamProvider) CallStream(
 	storeID uuid.UUID,
 	routeable api.Routeable,
 ) (api.BidiStream, error) {
-	client, err := p.muxer.Register(storeID)
+	client, err := p.muxer.Register(ctx, storeID)
 	if err != nil {
 		return nil, err
 	}

@@ -35,10 +35,62 @@ type tracingClient struct {
 	tracer trace.Tracer
 }
 
+type tracedEnumerator[T any] struct {
+	inner      enumerators.Enumerator[T]
+	cancel     context.CancelFunc
+	cancelOnce sync.Once
+}
+
+func (e *tracedEnumerator[T]) MoveNext() bool {
+	if e.inner == nil {
+		e.cancelOnce.Do(e.cancel)
+		return false
+	}
+	ok := e.inner.MoveNext()
+	if !ok {
+		e.cancelOnce.Do(e.cancel)
+	}
+	return ok
+}
+
+func (e *tracedEnumerator[T]) Current() (T, error) {
+	return e.inner.Current()
+}
+
+func (e *tracedEnumerator[T]) Err() error {
+	if e.inner == nil {
+		return nil
+	}
+	return e.inner.Err()
+}
+
+func (e *tracedEnumerator[T]) Dispose() {
+	if e.inner != nil {
+		e.inner.Dispose()
+	}
+	e.cancelOnce.Do(e.cancel)
+}
+
+type tracedSubscription struct {
+	inner      api.Subscription
+	cancel     context.CancelFunc
+	cancelOnce sync.Once
+}
+
+func (s *tracedSubscription) Unsubscribe() {
+	s.cancelOnce.Do(s.cancel)
+	if s.inner != nil {
+		s.inner.Unsubscribe()
+	}
+}
+
 // operationContext starts a new root span (new trace) for this operation so each call gets its own
 // trace and does not grow unbounded span chains when the same ctx is reused for many operations.
 // The returned context is cancelled when parent ctx is cancelled. Caller must defer cancel() and span.End().
 func (c *tracingClient) operationContext(ctx context.Context, spanName string, opts ...trace.SpanStartOption) (context.Context, trace.Span, context.CancelFunc) {
+	if callerSpanContext := trace.SpanContextFromContext(ctx); callerSpanContext.IsValid() {
+		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: callerSpanContext}))
+	}
 	opCtx, span := c.tracer.Start(context.Background(), spanName, opts...)
 	bound, cancelBound := context.WithCancel(opCtx)
 	if requestID, ok := telemetry.RequestIDFromContext(ctx); ok {
@@ -70,8 +122,8 @@ func (c *tracingClient) GetSpaces(ctx context.Context, storeID uuid.UUID) enumer
 			telemetry.WithStoreID(storeID),
 			telemetry.WithRequestID(requestID),
 		))
-	defer func() { cancel(); span.End() }()
-	return c.client.GetSpaces(opCtx, storeID)
+	inner := c.client.GetSpaces(opCtx, storeID)
+	return finishEnumeratorSetup(inner, span, cancel)
 }
 
 // GetSegments returns an enumerator of segment names with tracing (stream setup span only).
@@ -83,8 +135,8 @@ func (c *tracingClient) GetSegments(ctx context.Context, storeID uuid.UUID, spac
 			telemetry.WithSpace(space),
 			telemetry.WithRequestID(requestID),
 		))
-	defer func() { cancel(); span.End() }()
-	return c.client.GetSegments(opCtx, storeID, space)
+	inner := c.client.GetSegments(opCtx, storeID, space)
+	return finishEnumeratorSetup(inner, span, cancel)
 }
 
 // Peek returns the latest entry with tracing.
@@ -123,8 +175,8 @@ func (c *tracingClient) Consume(ctx context.Context, storeID uuid.UUID, args *Co
 			telemetry.WithStoreID(storeID),
 			telemetry.WithRequestID(requestID),
 		))
-	defer func() { cancel(); span.End() }()
-	return c.client.Consume(opCtx, storeID, args)
+	inner := c.client.Consume(opCtx, storeID, args)
+	return finishEnumeratorSetup(inner, span, cancel)
 }
 
 // ConsumeSpace reads entries from all segments with tracing (stream setup span only).
@@ -136,8 +188,8 @@ func (c *tracingClient) ConsumeSpace(ctx context.Context, storeID uuid.UUID, arg
 			telemetry.WithSpace(args.Space),
 			telemetry.WithRequestID(requestID),
 		))
-	defer func() { cancel(); span.End() }()
-	return c.client.ConsumeSpace(opCtx, storeID, args)
+	inner := c.client.ConsumeSpace(opCtx, storeID, args)
+	return finishEnumeratorSetup(inner, span, cancel)
 }
 
 // ConsumeSegment reads entries from a specific segment with tracing (stream setup span only).
@@ -153,8 +205,8 @@ func (c *tracingClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, a
 	allAttrs := append(baseAttrs, seqAttrs...)
 	opCtx, span, cancel := c.operationContext(ctx, "streamkit.client.consume_segment",
 		trace.WithAttributes(allAttrs...))
-	defer func() { cancel(); span.End() }()
-	return c.client.ConsumeSegment(opCtx, storeID, args)
+	inner := c.client.ConsumeSegment(opCtx, storeID, args)
+	return finishEnumeratorSetup(inner, span, cancel)
 }
 
 // Produce writes records to a segment with tracing (stream setup span only).
@@ -167,8 +219,8 @@ func (c *tracingClient) Produce(ctx context.Context, storeID uuid.UUID, space, s
 			telemetry.WithSegment(segment),
 			telemetry.WithRequestID(requestID),
 		))
-	defer func() { cancel(); span.End() }()
-	return c.client.Produce(opCtx, storeID, space, segment, entries)
+	inner := c.client.Produce(opCtx, storeID, space, segment, entries)
+	return finishEnumeratorSetup(inner, span, cancel)
 }
 
 // Publish writes a single record with tracing.
@@ -203,13 +255,15 @@ func (c *tracingClient) SubscribeToSegment(ctx context.Context, storeID uuid.UUI
 			telemetry.WithSegment(segment),
 			telemetry.WithRequestID(requestID),
 		))
-	defer func() { cancel(); span.End() }()
 	sub, err := c.client.SubscribeToSegment(opCtx, storeID, space, segment, handler)
 	if err != nil {
 		telemetry.RecordError(span, err)
+		cancel()
+		span.End()
 		return nil, err
 	}
-	return sub, nil
+	span.End()
+	return &tracedSubscription{inner: sub, cancel: cancel}, nil
 }
 
 // SubscribeToSpace subscribes to space status updates with tracing (setup span only).
@@ -221,13 +275,15 @@ func (c *tracingClient) SubscribeToSpace(ctx context.Context, storeID uuid.UUID,
 			telemetry.WithSpace(space),
 			telemetry.WithRequestID(requestID),
 		))
-	defer func() { cancel(); span.End() }()
 	sub, err := c.client.SubscribeToSpace(opCtx, storeID, space, handler)
 	if err != nil {
 		telemetry.RecordError(span, err)
+		cancel()
+		span.End()
 		return nil, err
 	}
-	return sub, nil
+	span.End()
+	return &tracedSubscription{inner: sub, cancel: cancel}, nil
 }
 
 // GetSubscriptionStatus returns subscription status.
@@ -275,4 +331,14 @@ func generateOrGetRequestID(ctx context.Context) uuid.UUID {
 		return id
 	}
 	return uuid.New()
+}
+
+func finishEnumeratorSetup[T any](inner enumerators.Enumerator[T], span trace.Span, cancel context.CancelFunc) enumerators.Enumerator[T] {
+	if inner != nil {
+		if err := inner.Err(); err != nil {
+			telemetry.RecordError(span, err)
+		}
+	}
+	span.End()
+	return &tracedEnumerator[T]{inner: inner, cancel: cancel}
 }

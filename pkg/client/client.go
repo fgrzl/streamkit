@@ -22,6 +22,7 @@ import (
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type (
@@ -249,17 +250,17 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 }
 
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
-	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
+	ctx = ensureRequestIDContext(ctx)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
-	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
+	ctx = ensureRequestIDContext(ctx)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
-	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
+	ctx = ensureRequestIDContext(ctx)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
@@ -285,6 +286,9 @@ func detachLongLivedContext(ctx context.Context) context.Context {
 	detached := context.Background()
 	if requestID, ok := telemetry.RequestIDFromContext(ctx); ok {
 		detached = telemetry.WithRequestIDContext(detached, requestID)
+	}
+	if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
+		detached = trace.ContextWithSpanContext(detached, spanContext)
 	}
 	return detached
 }
@@ -372,6 +376,13 @@ func produceLogFields(storeID uuid.UUID, space, segment string) []any {
 		slog.String("space", space),
 		slog.String("segment", segment),
 	}
+}
+
+func ensureRequestIDContext(ctx context.Context) context.Context {
+	if _, ok := telemetry.RequestIDFromContext(ctx); ok {
+		return ctx
+	}
+	return telemetry.WithRequestIDContext(ctx, uuid.New())
 }
 
 func (e *resilienceEnumerator) MoveNext() bool {
@@ -939,7 +950,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 	subCtx, cancel := context.WithCancel(detachLongLivedContext(ctx))
 	// Tie subscription lifecycle to client shutdown so subscription goroutines exit before
 	// Close() closes reconnectQueue (avoids send on closed channel panic), and
-	// parent ctx still controls cancellation without propagating its trace forever.
+	// parent ctx still controls cancellation without retaining a live recording span forever.
 	go func() {
 		select {
 		case <-ctx.Done():

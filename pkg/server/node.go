@@ -130,27 +130,36 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 
 func (n *defaultNode) handleGetSpaces(ctx context.Context, _ *api.GetSpaces, bidi api.BidiStream) {
 	enumerator := n.store.GetSpaces(ctx)
-	streamNames(ctx, "get spaces", enumerator, bidi, logContextFields(ctx, n.storeID)...)
+	fields := logContextFields(ctx, n.storeID)
+	runAsyncStream(ctx, bidi, fields, func() {
+		streamNames(ctx, "get spaces", enumerator, bidi, fields...)
+	})
 }
 
 func (n *defaultNode) handleConsumeSpace(ctx context.Context, args *api.ConsumeSpace, bidi api.BidiStream) {
 	enumerator := n.store.ConsumeSpace(ctx, args)
-	streamEntries(ctx, "consume space", enumerator, bidi,
-		logContextFields(ctx, n.storeID, slog.String("space", args.Space))...)
+	fields := logContextFields(ctx, n.storeID, slog.String("space", args.Space))
+	runAsyncStream(ctx, bidi, fields, func() {
+		streamEntries(ctx, "consume space", enumerator, bidi, fields...)
+	})
 }
 
 func (n *defaultNode) handleGetSegments(ctx context.Context, args *api.GetSegments, bidi api.BidiStream) {
 	enumerator := n.store.GetSegments(ctx, args.Space)
-	streamNames(ctx, "get segments", enumerator, bidi,
-		logContextFields(ctx, n.storeID, slog.String("space", args.Space))...)
+	fields := logContextFields(ctx, n.storeID, slog.String("space", args.Space))
+	runAsyncStream(ctx, bidi, fields, func() {
+		streamNames(ctx, "get segments", enumerator, bidi, fields...)
+	})
 }
 
 func (n *defaultNode) handleConsumeSegment(ctx context.Context, args *api.ConsumeSegment, bidi api.BidiStream) {
 	enumerator := n.store.ConsumeSegment(ctx, args)
-	streamEntries(ctx, "consume segment", enumerator, bidi,
-		logContextFields(ctx, n.storeID,
-			slog.String("space", args.Space),
-			slog.String("segment", args.Segment))...)
+	fields := logContextFields(ctx, n.storeID,
+		slog.String("space", args.Space),
+		slog.String("segment", args.Segment))
+	runAsyncStream(ctx, bidi, fields, func() {
+		streamEntries(ctx, "consume segment", enumerator, bidi, fields...)
+	})
 }
 
 func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.BidiStream) {
@@ -251,41 +260,44 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 	results := n.store.Produce(ctx, args, entries)
 
 	bus := n.getBus(ctx)
+	fields := logContextFields(ctx, n.storeID,
+		slog.String("space", args.Space),
+		slog.String("segment", args.Segment))
 
-	count := 0
-	err := enumerators.ForEach(results, func(result *api.SegmentStatus) error {
-		count++
-		if err := bidi.Encode(result); err != nil {
-			return err
-		}
-		if bus != nil {
-			notification := &api.SegmentNotification{
-				StoreID:       n.storeID,
-				SegmentStatus: result,
+	runAsyncStream(ctx, bidi, fields, func() {
+		count := 0
+		err := enumerators.ForEach(results, func(result *api.SegmentStatus) error {
+			count++
+			if err := bidi.Encode(result); err != nil {
+				return err
 			}
-			if err := bus.Notify(notification); err != nil {
-				slog.WarnContext(ctx, "server: failed to publish segment notification",
-					logContextFields(ctx, n.storeID,
-						slog.String("space", result.Space),
-						slog.String("segment", result.Segment),
-						slog.Uint64("last_sequence", result.LastSequence),
-						"err", err)...)
+			if bus != nil {
+				notification := &api.SegmentNotification{
+					StoreID:       n.storeID,
+					SegmentStatus: result,
+				}
+				if err := bus.Notify(notification); err != nil {
+					slog.WarnContext(ctx, "server: failed to publish segment notification",
+						logContextFields(ctx, n.storeID,
+							slog.String("space", result.Space),
+							slog.String("segment", result.Segment),
+							slog.Uint64("last_sequence", result.LastSequence),
+							"err", err)...)
+				}
 			}
+			return nil
+		})
+		if err != nil {
+			slog.ErrorContext(ctx, "server: produce failed",
+				appendLogFields(fields,
+					slog.Int("status_count", count),
+					"err", err)...)
+			bidi.CloseSend(err)
+			return
 		}
-		return nil
+
+		bidi.CloseSend(nil)
 	})
-	if err != nil {
-		slog.ErrorContext(ctx, "server: produce failed",
-			logContextFields(ctx, n.storeID,
-				slog.String("space", args.Space),
-				slog.String("segment", args.Segment),
-				slog.Int("status_count", count),
-				"err", err)...)
-		bidi.CloseSend(err)
-		return
-	}
-
-	bidi.CloseSend(nil)
 }
 
 func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi api.BidiStream) {
@@ -299,8 +311,10 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 		}))
 	}
 	enumerator := enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
-	streamEntries(ctx, "consume", enumerator, bidi,
-		logContextFields(ctx, n.storeID, slog.Int("space_count", len(args.Offsets)))...)
+	fields := logContextFields(ctx, n.storeID, slog.Int("space_count", len(args.Offsets)))
+	runAsyncStream(ctx, bidi, fields, func() {
+		streamEntries(ctx, "consume", enumerator, bidi, fields...)
+	})
 }
 
 func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
@@ -375,6 +389,19 @@ func (n *defaultNode) getBus(ctx context.Context) bus.MessageBus {
 		return nil
 	}
 	return messageBus
+}
+
+func runAsyncStream(ctx context.Context, bidi api.BidiStream, fields []any, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(ctx, "server: async stream handler panic",
+					appendLogFields(fields, slog.Any("panic", r))...)
+				bidi.Close(fmt.Errorf("panic: %v", r))
+			}
+		}()
+		fn()
+	}()
 }
 
 func streamNames(ctx context.Context, operation string, enumerator enumerators.Enumerator[string], bidi api.BidiStream, fields ...any) {

@@ -27,7 +27,11 @@ func NewInProcMuxer(ctx context.Context, nodeManager server.NodeManager) *InProc
 }
 
 // Register creates a new bidirectional stream, wires it to a node, and returns the client side.
-func (m *InProcMuxer) Register(storeID uuid.UUID) (api.BidiStream, error) {
+func (m *InProcMuxer) Register(ctx context.Context, storeID uuid.UUID) (api.BidiStream, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	channelID := uuid.New()
 	client := NewInProcBidiStream()
 	serverStream := NewInProcBidiStream()
@@ -37,17 +41,26 @@ func (m *InProcMuxer) Register(storeID uuid.UUID) (api.BidiStream, error) {
 	m.streams[channelID] = serverStream
 	m.mu.Unlock()
 
-	ctx := server.WithChannelID(m.ctx, channelID)
+	streamCtx, cancel := context.WithCancel(ctx)
+	stopBaseCancel := context.AfterFunc(m.ctx, cancel)
+	streamCtx = server.WithChannelID(streamCtx, channelID)
 
-	instance, err := m.nodeManager.GetOrCreate(ctx, storeID)
+	instance, err := m.nodeManager.GetOrCreate(streamCtx, storeID)
 	if err != nil {
+		stopBaseCancel()
+		cancel()
+		m.mu.Lock()
+		delete(m.streams, channelID)
+		m.mu.Unlock()
 		return nil, err
 	}
 
 	go func() {
-		instance.Handle(ctx, serverStream)
+		instance.Handle(streamCtx, serverStream)
 		// Optional: cleanup after stream closes
 		<-serverStream.Closed()
+		stopBaseCancel()
+		cancel()
 		m.mu.Lock()
 		delete(m.streams, channelID)
 		m.mu.Unlock()
