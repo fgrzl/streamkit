@@ -510,3 +510,68 @@ func TestOtelNoEnumeratorChunkSpans(t *testing.T) {
 			"per-item enumerator_chunk spans should be pruned")
 	}
 }
+
+func TestOtelConsumeTraceContinuityOverInproc(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(
+		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	defer tp.Shutdown(context.Background())
+
+	options := &pebblekit.PebbleStoreOptions{Path: t.TempDir()}
+	factory, err := pebblekit.NewStoreFactory(options)
+	require.NoError(t, err)
+
+	nodeManager := server.NewNodeManager(server.WithStoreFactory(factory))
+	provider := inprockit.NewInProcBidiStreamProvider(t.Context(), nodeManager)
+	baseClient := client.NewClient(provider)
+	tracingClient := client.NewClientWithTracing(provider)
+	t.Cleanup(func() {
+		tracingClient.Close()
+		baseClient.Close()
+		nodeManager.Close()
+	})
+
+	ctx := t.Context()
+	storeID := uuid.New()
+	statuses, err := enumerators.ToSlice(baseClient.Produce(ctx, storeID, "space0", "segment0", generateRange(0, 1)))
+	require.NoError(t, err)
+	require.NotEmpty(t, statuses)
+
+	enum := tracingClient.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{Space: "space0", Segment: "segment0", MinSequence: 1})
+	entries, err := enumerators.ToSlice(enum)
+	enum.Dispose()
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exporter.GetSpans()
+
+	var clientSpan, serverSpan *tracetest.SpanStub
+	for i := range spans {
+		s := &spans[i]
+		switch s.Name {
+		case "streamkit.client.consume_segment":
+			clientSpan = s
+		case "streamkit.server.consume_segment":
+			serverSpan = s
+		}
+	}
+
+	require.NotNil(t, clientSpan, "expected streamkit.client.consume_segment span")
+	require.NotNil(t, serverSpan, "expected streamkit.server.consume_segment span")
+	assert.Equal(t, clientSpan.SpanContext.TraceID(), serverSpan.SpanContext.TraceID(),
+		"client and server spans should share the same trace ID for detached consume contexts")
+}

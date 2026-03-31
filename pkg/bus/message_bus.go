@@ -41,9 +41,10 @@ func Subscribe[T Message](bus MessageBus, route Route, handler func(ctx context.
 		tMsg, ok := msg.(T)
 		if !ok {
 			slog.WarnContext(ctx,
-				"Subscribe: unexpected message type",
-				"expected", fmt.Sprintf("%T", *new(T)),
-				"actual", fmt.Sprintf("%T", msg),
+				"message bus: unexpected message type",
+				"route", route.String(),
+				"expected_type", fmt.Sprintf("%T", *new(T)),
+				"actual_type", fmt.Sprintf("%T", msg),
 			)
 			return fmt.Errorf("unexpected message type: %T", msg)
 		}

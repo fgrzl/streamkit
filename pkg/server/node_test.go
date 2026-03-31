@@ -13,6 +13,9 @@ import (
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // sliceEnumerator is a tiny enumerator used in tests.
@@ -84,6 +87,16 @@ type mockBidi struct {
 func newMockBidi(env *polymorphic.Envelope) *mockBidi {
 	return &mockBidi{decodeEnvelope: env, closed: make(chan struct{})}
 }
+
+func waitForClosed(t *testing.T, bidi api.BidiStream) {
+	t.Helper()
+	select {
+	case <-bidi.Closed():
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for bidi stream to close")
+	}
+}
+
 func (m *mockBidi) Encode(msg any) error {
 	m.encoded = append(m.encoded, msg)
 	return nil
@@ -131,6 +144,7 @@ func TestGetSpacesStreamsNames(t *testing.T) {
 
 	// Act
 	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
 
 	// Assert: Expect two encoded names then CloseSend(nil)
 	require.Len(t, bidi.encoded, 2, "expected 2 encoded messages")
@@ -158,6 +172,7 @@ func TestPeekReturnsEntryOrEmpty(t *testing.T) {
 	env2 := &polymorphic.Envelope{Content: &api.Peek{Space: "s", Segment: "seg"}}
 	bidi2 := newMockBidi(env2)
 	node2.Handle(context.Background(), bidi2)
+	waitForClosed(t, bidi2)
 	// Assert
 	require.Len(t, bidi2.encoded, 1, "expected 1 encoded message")
 }
@@ -175,6 +190,7 @@ func TestProduceNotifiesBus(t *testing.T) {
 	bidi := newMockBidi(env)
 
 	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
 
 	// encoded should contain one status
 	// Assert
@@ -321,6 +337,7 @@ func TestStreamNamesCurrentError(t *testing.T) {
 	env := &polymorphic.Envelope{Content: &api.GetSpaces{}}
 	bidi := newMockBidi(env)
 	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
 	// Assert
 	require.Error(t, bidi.closeSendErr, "expected CloseSend with error from enumerator.Current")
 }
@@ -424,6 +441,7 @@ func TestStreamEntriesEncodeError(t *testing.T) {
 	mb := newMockBidi(env)
 	bidi := &bidiEncodeFail{mockBidi: mb, fail: errors.New("encode fail")}
 	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
 	// Assert
 	require.Error(t, bidi.closeSendErr, "expected CloseSend with encode error")
 }
@@ -456,8 +474,87 @@ func TestStreamEntriesCurrentError(t *testing.T) {
 	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
 	bidi := newMockBidi(env)
 	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
 	// Assert
 	require.Error(t, bidi.closeSendErr, "expected CloseSend with error from entry current")
+}
+
+type blockingEntryEnumerator struct {
+	release <-chan struct{}
+	once    bool
+}
+
+func (e *blockingEntryEnumerator) MoveNext() bool {
+	if e.once {
+		return false
+	}
+	e.once = true
+	<-e.release
+	return false
+}
+
+func (e *blockingEntryEnumerator) Current() (*api.Entry, error) { return nil, nil }
+func (e *blockingEntryEnumerator) Dispose()                     {}
+func (e *blockingEntryEnumerator) Err() error                   { return nil }
+
+type blockingConsumeStore struct {
+	release <-chan struct{}
+}
+
+func (b *blockingConsumeStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
+	return &sliceEnumerator[string]{}
+}
+func (b *blockingConsumeStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
+	return &sliceEnumerator[*api.Entry]{}
+}
+func (b *blockingConsumeStore) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
+	return &sliceEnumerator[string]{}
+}
+func (b *blockingConsumeStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry] {
+	return &blockingEntryEnumerator{release: b.release}
+}
+func (b *blockingConsumeStore) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
+	return nil, nil
+}
+func (b *blockingConsumeStore) Produce(ctx context.Context, args *api.Produce, entries enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
+	return &sliceEnumerator[*api.SegmentStatus]{}
+}
+func (b *blockingConsumeStore) Close() {}
+
+func TestShouldEndConsumeSegmentSpanBeforeStreamingCompletes(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+	})
+
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporter)),
+	)
+	otel.SetTracerProvider(tp)
+	defer tp.Shutdown(context.Background())
+
+	release := make(chan struct{})
+	store := &blockingConsumeStore{release: release}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
+	bidi := newMockBidi(env)
+
+	node.Handle(context.Background(), bidi)
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exporter.GetSpans()
+	found := false
+	for i := range spans {
+		if spans[i].Name == "streamkit.server.consume_segment" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "expected consume segment span to end before streaming completes")
+
+	close(release)
+	waitForClosed(t, bidi)
 }
 
 func TestNodeCloseAndManagerClose(t *testing.T) {

@@ -44,13 +44,20 @@ func NewMuxerBidiStream(
 func (c *MuxerBidiStream) Encode(m any) error {
 	payload, err := json.Marshal(m)
 	if err != nil {
-		slog.Error("bidi: encode marshal failed", "err", err, slog.String("channel_id", c.channelID.String()))
+		slog.Error("bidi: encode marshal failed",
+			slog.String("channel_id", c.channelID.String()),
+			slog.String("error_type", "marshal"),
+			"err", err)
 		return err
 	}
 	if err := c.encode(payload); err != nil {
 		// Send failures are almost always disconnect/teardown; callers get err for handling.
 		// Avoid Error/Warn here — it dominated logs during normal reconnect flows.
-		slog.Debug("bidi: encode send failed", "err", err, slog.String("channel_id", c.channelID.String()), slog.Int("bytes", len(payload)))
+		slog.Debug("bidi: encode send failed",
+			slog.String("channel_id", c.channelID.String()),
+			slog.String("error_type", classifyTransportError(err)),
+			slog.Int("bytes", len(payload)),
+			"err", err)
 		return err
 	}
 	return nil
@@ -78,7 +85,11 @@ func (c *MuxerBidiStream) Decode(v any) error {
 
 		// Normal decode
 		if err := json.Unmarshal(payload, v); err != nil {
-			slog.Warn("bidi: decode unmarshal failed", slog.String("channel_id", c.channelID.String()), "err", err)
+			slog.Warn("bidi: decode unmarshal failed",
+				slog.String("channel_id", c.channelID.String()),
+				slog.String("error_type", "decode"),
+				slog.Int("bytes", len(payload)),
+				"err", err)
 			return err
 		}
 		return nil
@@ -116,18 +127,32 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 		if errMsg.Err != "" {
 			remoteErr := errors.New(errMsg.Err)
 			if benignDisconnect(remoteErr) {
-				slog.Debug("bidi: remote closed stream", slog.String("channel_id", c.channelID.String()), slog.String("detail", errMsg.Err))
+				slog.Debug("bidi: remote closed stream",
+					slog.String("channel_id", c.channelID.String()),
+					slog.String("error_type", classifyTransportError(remoteErr)),
+					slog.String("detail", errMsg.Err))
 			} else {
-				slog.Warn("bidi: remote closed stream with error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
+				slog.Warn("bidi: remote closed stream with error",
+					slog.String("channel_id", c.channelID.String()),
+					slog.String("error_type", classifyTransportError(remoteErr)),
+					slog.String("err", errMsg.Err))
 			}
 			return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
 		}
 		return true, io.EOF
 	case "error":
-		slog.Warn("bidi: remote error", slog.String("channel_id", c.channelID.String()), slog.String("err", errMsg.Err))
+		remoteErr := errors.New(errMsg.Err)
+		slog.Warn("bidi: remote error",
+			slog.String("channel_id", c.channelID.String()),
+			slog.String("error_type", classifyTransportError(remoteErr)),
+			slog.String("err", errMsg.Err))
 		return true, fmt.Errorf("remote error: %s", errMsg.Err)
 	default:
-		slog.Warn("bidi: unknown error type", slog.String("channel_id", c.channelID.String()), slog.String("type", errMsg.Type), slog.String("err", errMsg.Err))
+		slog.Warn("bidi: unknown error type",
+			slog.String("channel_id", c.channelID.String()),
+			slog.String("error_type", "protocol"),
+			slog.String("type", errMsg.Type),
+			slog.String("err", errMsg.Err))
 		return true, fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err)
 	}
 }

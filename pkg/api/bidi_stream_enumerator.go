@@ -29,7 +29,7 @@ func (e *BidiStreamEnumerator[T]) MoveNext() bool {
 	}
 
 	if err != nil {
-		slog.Warn("BidiStreamEnumerator: decode error - will propagate", "err", err)
+		slog.Debug("stream enumerator: decode error propagated", "err", err)
 		e.err = err
 		return false
 	}

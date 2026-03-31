@@ -11,6 +11,22 @@ import (
 	"time"
 )
 
+func classifyRetryError(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if IsRetryable(err) {
+		return "retryable"
+	}
+	return "non_retryable"
+}
+
 // RetryPolicy defines backoff and attempt configuration for retryable operations.
 type RetryPolicy struct {
 	// MaxAttempts is the maximum number of attempts (including initial attempt).
@@ -140,21 +156,25 @@ func RetryWithBackoff(ctx context.Context, policy RetryPolicy, fn func(context.C
 
 		// Check if error is retryable
 		if !IsRetryable(err) {
-			slog.WarnContext(ctx, "non-retryable error, aborting retries", slog.String("error", err.Error()))
+			slog.WarnContext(ctx, "non-retryable error, aborting retries",
+				slog.String("error_type", classifyRetryError(err)),
+				slog.String("error", err.Error()))
 			return err
 		}
 
 		if attempt == policy.MaxAttempts {
 			slog.ErrorContext(ctx, "exhausted retry attempts",
-				slog.Int("maxAttempts", policy.MaxAttempts),
-				slog.String("lastError", err.Error()))
+				slog.Int("max_attempts", policy.MaxAttempts),
+				slog.String("error_type", classifyRetryError(err)),
+				slog.String("last_error", err.Error()))
 			return err
 		}
 
 		slog.WarnContext(ctx, "operation failed, retrying",
 			slog.Int("attempt", attempt),
-			slog.Int("maxAttempts", policy.MaxAttempts),
+			slog.Int("max_attempts", policy.MaxAttempts),
 			slog.Duration("backoff", backoff),
+			slog.String("error_type", classifyRetryError(err)),
 			slog.String("error", err.Error()))
 
 		// Wait with backoff

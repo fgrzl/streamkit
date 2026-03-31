@@ -22,6 +22,7 @@ import (
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type (
@@ -249,17 +250,17 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 }
 
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
-	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
+	ctx = ensureRequestIDContext(ctx)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
-	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
+	ctx = ensureRequestIDContext(ctx)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
-	ctx = telemetry.WithRequestIDContext(ctx, uuid.New())
+	ctx = ensureRequestIDContext(ctx)
 	return newResilienceEnumerator(c, ctx, storeID, args)
 }
 
@@ -286,7 +287,102 @@ func detachLongLivedContext(ctx context.Context) context.Context {
 	if requestID, ok := telemetry.RequestIDFromContext(ctx); ok {
 		detached = telemetry.WithRequestIDContext(detached, requestID)
 	}
+	if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
+		detached = trace.ContextWithSpanContext(detached, spanContext)
+	}
 	return detached
+}
+
+func appendClientLogFields(fields []any, extras ...any) []any {
+	out := make([]any, 0, len(fields)+len(extras))
+	out = append(out, fields...)
+	out = append(out, extras...)
+	return out
+}
+
+func routeLogFields(storeID uuid.UUID, msg api.Routeable) []any {
+	fields := []any{slog.String("store_id", storeID.String())}
+	if msg == nil {
+		return fields
+	}
+
+	fields = append(fields, slog.String("message_type", msg.GetDiscriminator()))
+	switch args := msg.(type) {
+	case *api.ConsumeSegment:
+		fields = append(fields,
+			slog.String("space", args.Space),
+			slog.String("segment", args.Segment))
+	case *api.ConsumeSpace:
+		fields = append(fields, slog.String("space", args.Space))
+	case *api.Consume:
+		fields = append(fields, slog.Int("space_count", len(args.Offsets)))
+	case *api.SubscribeToSegmentStatus:
+		fields = append(fields,
+			slog.String("space", args.Space),
+			slog.String("segment", args.Segment))
+	case *api.Produce:
+		fields = append(fields,
+			slog.String("space", args.Space),
+			slog.String("segment", args.Segment))
+	}
+
+	return fields
+}
+
+func subscriptionLogFields(sub *activeSubscription) []any {
+	fields := []any{
+		slog.String("subscription_id", sub.id),
+		slog.String("store_id", sub.storeID.String()),
+	}
+	if sub.initMsg == nil {
+		return fields
+	}
+
+	fields = append(fields, slog.String("message_type", sub.initMsg.GetDiscriminator()))
+	if args, ok := sub.initMsg.(*api.SubscribeToSegmentStatus); ok {
+		fields = append(fields,
+			slog.String("space", args.Space),
+			slog.String("segment", args.Segment))
+	}
+	return fields
+}
+
+func subscriptionStatusLogFields(sub *activeSubscription, status *SegmentStatus) []any {
+	fields := subscriptionLogFields(sub)
+	if status != nil {
+		fields = append(fields,
+			slog.String("space", status.Space),
+			slog.String("segment", status.Segment),
+			slog.Uint64("last_sequence", status.LastSequence))
+	}
+	if lastDelivered := sub.lastDelivered.Load(); lastDelivered > 0 {
+		fields = append(fields, slog.Int64("last_delivered_sequence", lastDelivered))
+	}
+	return fields
+}
+
+func leaseLogFields(l *leaseImpl) []any {
+	return []any{
+		slog.String("store_id", l.storeID.String()),
+		slog.String("key", l.key),
+		slog.String("holder", l.holder),
+		slog.Duration("ttl", l.ttl),
+	}
+}
+
+func produceLogFields(storeID uuid.UUID, space, segment string) []any {
+	return []any{
+		slog.String("store_id", storeID.String()),
+		slog.String("space", space),
+		slog.String("segment", segment),
+	}
+}
+
+func ensureRequestIDContext(ctx context.Context) context.Context {
+	if _, ok := telemetry.RequestIDFromContext(ctx); ok {
+		return ctx
+	}
+	return telemetry.WithRequestIDContext(ctx, uuid.New())
 }
 
 func (e *resilienceEnumerator) MoveNext() bool {
@@ -296,7 +392,11 @@ func (e *resilienceEnumerator) MoveNext() bool {
 		if e.innerEnum == nil {
 			bidi, err := e.createStream()
 			if err != nil {
-				slog.WarnContext(e.ctx, "resilience enumerator: failed to create stream", "err", err, "attempt", e.attemptCount)
+				slog.WarnContext(e.ctx, "resilience enumerator: failed to create stream",
+					appendClientLogFields(routeLogFields(e.storeID, e.args),
+						slog.Int("attempt", e.attemptCount+1),
+						slog.Int("max_attempts", e.maxAttempts),
+						"err", err)...)
 				e.attemptCount++
 				if e.attemptCount >= e.maxAttempts {
 					return false
@@ -322,7 +422,15 @@ func (e *resilienceEnumerator) MoveNext() bool {
 		if e.innerEnum.MoveNext() {
 			entry, err := e.innerEnum.Current()
 			if err != nil {
-				slog.WarnContext(e.ctx, "resilience enumerator: failed to get current entry", "err", err)
+				fields := routeLogFields(e.storeID, e.args)
+				if e.lastEntry != nil {
+					fields = append(fields,
+						slog.String("space", e.lastEntry.Space),
+						slog.String("segment", e.lastEntry.Segment),
+						slog.Uint64("last_sequence", e.lastEntry.Sequence))
+				}
+				slog.WarnContext(e.ctx, "resilience enumerator: failed to get current entry",
+					appendClientLogFields(fields, "err", err)...)
 				// Close this enumerator and retry
 				if e.innerEnum != nil {
 					e.innerEnum.Dispose()
@@ -604,7 +712,8 @@ func (l *leaseImpl) Release() error {
 		bidi, err := l.client.provider.CallStream(releaseCtx, l.storeID, &api.LeaseRelease{Key: l.key, Holder: l.holder})
 		if err != nil {
 			releaseErr = err
-			slog.Warn("lease release: CallStream failed", "key", l.key, "err", err)
+			slog.Warn("lease release: call stream failed",
+				appendClientLogFields(leaseLogFields(l), "err", err)...)
 		} else {
 			var res api.LeaseResult
 			_ = bidi.Decode(&res)
@@ -618,7 +727,8 @@ func (l *leaseImpl) Release() error {
 func (l *leaseImpl) renewLoop() {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("lease renew loop panic", "key", l.key, "panic", r)
+			slog.Error("lease renew loop panic",
+				appendClientLogFields(leaseLogFields(l), slog.Any("panic", r))...)
 		}
 	}()
 	interval := l.ttl / leaseRenewIntervalRatio
@@ -635,7 +745,8 @@ func (l *leaseImpl) renewLoop() {
 			bidi, err := l.client.provider.CallStream(l.ctx, l.storeID, &api.LeaseRenew{Key: l.key, Holder: l.holder, TTLSeconds: l.ttlSec})
 			if err != nil {
 				if l.ctx.Err() == nil {
-					slog.Warn("lease renew: CallStream failed", "key", l.key, "err", err)
+					slog.Warn("lease renew: call stream failed",
+						appendClientLogFields(leaseLogFields(l), "err", err)...)
 				}
 				continue
 			}
@@ -643,13 +754,15 @@ func (l *leaseImpl) renewLoop() {
 			if err := bidi.Decode(&result); err != nil {
 				bidi.Close(nil)
 				if l.ctx.Err() == nil {
-					slog.Warn("lease renew: Decode failed", "key", l.key, "err", err)
+					slog.Warn("lease renew: decode failed",
+						appendClientLogFields(leaseLogFields(l), "err", err)...)
 				}
 				continue
 			}
 			bidi.Close(nil)
 			if !result.Ok && l.ctx.Err() == nil {
-				slog.Warn("lease renew: server returned not ok", "key", l.key, "message", result.Message)
+				slog.Warn("lease renew: server returned not ok",
+					appendClientLogFields(leaseLogFields(l), slog.String("message", result.Message))...)
 				l.cancel() // cancel lease context so WithLease callback sees lease lost
 			}
 		}
@@ -671,7 +784,8 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 	go func(bidi api.BidiStream, entries enumerators.Enumerator[*Record]) {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("produce goroutine panic", "err", r)
+				slog.Error("produce goroutine panic",
+					appendClientLogFields(produceLogFields(storeID, space, segment), slog.Any("panic", r))...)
 				bidi.Close(fmt.Errorf("panic in produce: %v", r))
 			}
 		}()
@@ -680,12 +794,18 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 		for entries.MoveNext() {
 			entry, err := entries.Current()
 			if err != nil {
-				slog.Error("produce: failed to get current entry", "err", err, "count", count)
+				slog.Error("produce: failed to get current entry",
+					appendClientLogFields(produceLogFields(storeID, space, segment),
+						slog.Int("count", count),
+						"err", err)...)
 				bidi.CloseSend(err)
 				return
 			}
 			if err := bidi.Encode(entry); err != nil {
-				slog.Error("produce: failed to encode entry", "err", err, "count", count)
+				slog.Error("produce: failed to encode entry",
+					appendClientLogFields(produceLogFields(storeID, space, segment),
+						slog.Int("count", count),
+						"err", err)...)
 				bidi.CloseSend(err)
 				return
 			}
@@ -830,7 +950,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 	subCtx, cancel := context.WithCancel(detachLongLivedContext(ctx))
 	// Tie subscription lifecycle to client shutdown so subscription goroutines exit before
 	// Close() closes reconnectQueue (avoids send on closed channel panic), and
-	// parent ctx still controls cancellation without propagating its trace forever.
+	// parent ctx still controls cancellation without retaining a live recording span forever.
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -871,7 +991,8 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 		defer c.unregisterSubscription(subID)
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(subCtx, "subscription goroutine panic (cleanup completed)", "id", subID, "panic", r)
+				slog.ErrorContext(subCtx, "subscription goroutine panic (cleanup completed)",
+					appendClientLogFields(subscriptionLogFields(activeSub), slog.Any("panic", r))...)
 			}
 		}()
 
@@ -920,6 +1041,11 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			}
 
 			// Connected successfully — reset failure state
+			if activeSub.failureCount.Load() > 0 {
+				slog.DebugContext(subCtx, "client: subscription stream reconnected",
+					appendClientLogFields(subscriptionLogFields(activeSub),
+						slog.Int("previous_failure_count", int(activeSub.failureCount.Load())))...)
+			}
 			activeSub.failureCount.Store(0)
 			activeSub.status.Store("active")
 
@@ -940,6 +1066,10 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				if err := stream.Decode(&status); err != nil {
 					activeSub.failureCount.Add(1)
 					activeSub.lastError.Store(err)
+					slog.WarnContext(subCtx, "client: subscription stream decode failed",
+						appendClientLogFields(subscriptionLogFields(activeSub),
+							slog.Int("failure_count", int(activeSub.failureCount.Load())),
+							"err", err)...)
 					stream.Close(err)
 					break // inner loop → re-enqueue for reconnection
 				}
@@ -977,7 +1107,8 @@ func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID 
 				if c.metrics != nil {
 					c.metrics.RecordHandlerPanic(subID)
 				}
-				slog.ErrorContext(ctx, "subscription handler panic", "id", subID, "panic", r)
+				slog.ErrorContext(ctx, "subscription handler panic",
+					appendClientLogFields(subscriptionStatusLogFields(sub, status), slog.Any("panic", r))...)
 			}
 		}()
 		handler(status)
@@ -990,7 +1121,10 @@ func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID 
 		if c.metrics != nil {
 			c.metrics.RecordHandlerTimeout(subID)
 		}
-		slog.WarnContext(ctx, "subscription handler exceeded timeout", "id", subID, "timeout", c.handlerTimeout)
+		slog.WarnContext(ctx, "subscription handler exceeded timeout",
+			appendClientLogFields(subscriptionStatusLogFields(sub, status),
+				slog.Duration("timeout", c.handlerTimeout),
+				slog.Int("timeout_count", int(sub.handlerTimeouts.Load())))...)
 	}
 }
 
@@ -1013,7 +1147,7 @@ func (c *client) startReconnectDispatcher() {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Error("reconnect dispatcher panic", "err", r)
+					slog.Error("reconnect dispatcher panic", slog.Any("panic", r))
 				}
 			}()
 
@@ -1054,6 +1188,10 @@ func (c *client) startReconnectDispatcher() {
 					if err != nil {
 						sub.failureCount.Add(1)
 						sub.lastError.Store(err)
+						slog.WarnContext(sub.ctx, "client: subscription reconnect failed",
+							appendClientLogFields(subscriptionLogFields(sub),
+								slog.Int("failure_count", int(sub.failureCount.Load())),
+								"err", err)...)
 						if c.metrics != nil {
 							c.metrics.RecordSubscriptionReplay(sub.id, false, time.Since(replayStart))
 						}

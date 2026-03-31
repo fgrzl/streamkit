@@ -3,6 +3,7 @@ package wskit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -126,8 +127,10 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 		if err != nil {
 			lastErr = err
 			slog.WarnContext(ctx, "provider: failed to get or create muxer, retrying",
+				slog.String("store_id", storeID.String()),
 				slog.Int("attempt", attempt),
-				slog.Int("maxAttempts", maxEncodeAttempts),
+				slog.Int("max_attempts", maxEncodeAttempts),
+				slog.String("error_type", classifyTransportError(err)),
 				slog.String("error", err.Error()))
 
 			// Check context before backoff
@@ -170,9 +173,11 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 			// If muxer was closed, attempt reconnect and retry
 			if errors.Is(err, ErrMuxerClosed) || err == ErrMuxerClosed {
 				slog.WarnContext(ctx, "provider: muxer closed during encode, retrying",
+					slog.String("store_id", storeID.String()),
 					slog.Int("attempt", attempt),
-					slog.Int("maxAttempts", maxEncodeAttempts),
-					slog.String("channelID", channelID.String()))
+					slog.Int("max_attempts", maxEncodeAttempts),
+					slog.String("channel_id", channelID.String()),
+					slog.String("error_type", classifyTransportError(err)))
 
 				// Force invalidate the current muxer to ensure next attempt creates fresh connection
 				p.invalidateMuxer()
@@ -204,8 +209,11 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 			// Non-muxer errors are fatal (context cancellation, auth errors, etc.)
 			telemetry.RecordError(span, err)
 			slog.WarnContext(ctx, "provider: encode failed with non-transient error",
+				slog.String("store_id", storeID.String()),
+				slog.String("channel_id", channelID.String()),
+				slog.String("error_type", classifyTransportError(err)),
 				slog.String("error", err.Error()),
-				slog.String("channelID", channelID.String()))
+			)
 			return nil, err
 		}
 		return bidi, nil
@@ -214,7 +222,9 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 	if lastErr != nil {
 		telemetry.RecordError(span, lastErr)
 		slog.ErrorContext(ctx, "provider: exhausted all retry attempts",
-			slog.Int("maxAttempts", maxEncodeAttempts),
+			slog.String("store_id", storeID.String()),
+			slog.Int("max_attempts", maxEncodeAttempts),
+			slog.String("error_type", classifyTransportError(lastErr)),
 			slog.String("lastError", lastErr.Error()))
 		return nil, lastErr
 	}
@@ -316,7 +326,7 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					if m2 != nil {
 						isReconnect := p.hasConnected.Swap(true)
 						p.replaceMuxer(m2)
-						slog.Info("provider: reconnect successful")
+						slog.Debug("provider: reconnect successful")
 						success = true
 
 						if isReconnect {
@@ -328,7 +338,10 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 						p.OnDialFailure(err)
 					}
 					permanentErr = p.isPermanentDialError(err)
-					slog.Warn("provider: reconnect dial failed", slog.String("error", err.Error()))
+					slog.Warn("provider: reconnect dial failed",
+						slog.String("error", err.Error()),
+						slog.String("error_type", classifyTransportError(err)),
+						slog.Bool("permanent", permanentErr))
 					if permanentErr {
 						// Don't hammer the server: use a single longer backoff before next attempt.
 						backoff = 30 * time.Second
@@ -388,10 +401,10 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 			p.dialing.Store(false)
 
 			if isReconnect {
-				slog.InfoContext(ctx, "provider: muxer recreated after reconnection")
+				slog.DebugContext(ctx, "provider: muxer recreated after reconnection")
 				go p.notifyReconnected(p.reconnectCtx, uuid.Nil)
 			} else {
-				slog.InfoContext(ctx, "provider: initial muxer created")
+				slog.DebugContext(ctx, "provider: initial muxer created")
 			}
 			return m, nil
 		}
@@ -589,7 +602,11 @@ func (p *WebSocketBidiStreamProvider) notifyReconnected(ctx context.Context, sto
 
 	for _, listener := range listeners {
 		if err := listener.OnReconnected(ctx, storeID); err != nil {
-			slog.WarnContext(ctx, "reconnect listener failed", "err", err)
+			slog.WarnContext(ctx, "reconnect listener failed",
+				slog.String("listener_type", fmt.Sprintf("%T", listener)),
+				slog.String("store_id", storeID.String()),
+				slog.String("error_type", classifyTransportError(err)),
+				"err", err)
 		}
 	}
 }
