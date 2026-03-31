@@ -14,8 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fgrzl/timestamp"
 	"sync/atomic"
+
+	"github.com/fgrzl/timestamp"
 
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/server"
@@ -377,7 +378,10 @@ func (m *WebSocketMuxer) readLoop() {
 func (m *WebSocketMuxer) handleReceiveError(err error) {
 	// Normal disconnect: clean close, RST, or abrupt hangup — not an application fault.
 	if benignDisconnect(err) {
-		slog.InfoContext(m.Context, "muxer: websocket disconnected", slog.String("detail", err.Error()))
+		slog.DebugContext(m.Context, "muxer: websocket disconnected",
+			slog.String("muxer", m.name),
+			slog.String("error_type", classifyTransportError(err)),
+			slog.String("detail", err.Error()))
 		m.shutdown(nil)
 		return
 	}
@@ -386,7 +390,10 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 		netErr net.Error
 		opErr  *net.OpError
 	)
-	fields := []any{}
+	fields := []any{
+		slog.String("muxer", m.name),
+		slog.String("error_type", classifyTransportError(err)),
+	}
 	if errors.As(err, &netErr) {
 		fields = append(fields, slog.String("net_err", netErr.Error()), slog.Bool("temporary", netErr.Temporary()))
 	}
@@ -407,6 +414,27 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 	fields = append(fields, slog.String("err", err.Error()))
 	slog.WarnContext(m.Context, "muxer: websocket receive error", fields...)
 	m.shutdown(err)
+}
+
+func (m *WebSocketMuxer) logFields(ctx context.Context, extras ...any) []any {
+	fields := []any{slog.String("muxer", m.name)}
+	if channelID, ok := server.ChannelIDFromContext(ctx); ok {
+		fields = append(fields, slog.String("channel_id", channelID.String()))
+	}
+	fields = append(fields, extras...)
+	return fields
+}
+
+func (m *WebSocketMuxer) msgLogFields(msg *MuxerMsg, extras ...any) []any {
+	fields := []any{slog.String("muxer", m.name)}
+	if msg != nil {
+		if msg.StoreID != uuid.Nil {
+			fields = append(fields, slog.String("store_id", msg.StoreID.String()))
+		}
+		fields = append(fields, slog.String("channel_id", msg.ChannelID.String()))
+	}
+	fields = append(fields, extras...)
+	return fields
 }
 
 // processMessage handles a single decoded MuxerMsg. It contains the large
@@ -431,14 +459,17 @@ func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 		m.handleDataMessage(ctx, msg)
 	default:
 		slog.WarnContext(ctx, "muxer: unrecognized control type",
-			slog.String("type", string(msg.ControlType)))
+			m.logFields(ctx, slog.String("type", string(msg.ControlType)))...)
 	}
 }
 
 func (m *WebSocketMuxer) handlePing(_ context.Context) {
 	atomic.AddInt64(&m.pingsReceived, 1)
 	if err := m.sendControl(ControlTypePong, uuid.Nil, uuid.Nil, nil); err != nil {
-		slog.WarnContext(m.Context, "muxer: pong send failed", "err", err)
+		slog.WarnContext(m.Context, "muxer: pong send failed",
+			m.logFields(m.Context,
+				slog.String("error_type", classifyTransportError(err)),
+				"err", err)...)
 	}
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 }
@@ -450,15 +481,14 @@ func (m *WebSocketMuxer) handlePong(_ context.Context) {
 }
 
 func (m *WebSocketMuxer) handleClose(ctx context.Context) {
-	slog.InfoContext(ctx, "muxer: received close")
+	slog.DebugContext(ctx, "muxer: received close", slog.String("muxer", m.name))
 	m.shutdown(nil)
 }
 
 func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) {
 	slog.WarnContext(ctx, "muxer: received error control message",
-		slog.String("store_id", msg.StoreID.String()),
-		slog.String("channel_id", msg.ChannelID.String()),
-		slog.String("payload", string(msg.Payload)),
+		m.msgLogFields(msg,
+			slog.String("payload", string(msg.Payload)))...,
 	)
 }
 
@@ -483,11 +513,17 @@ func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, chan
 	}
 	payload, err := json.Marshal(&ErrorMessage{Type: "err", Err: "access denied"})
 	if err != nil {
-		slog.WarnContext(ctx, "muxer: marshal access-denied error failed", "err", err)
+		slog.WarnContext(ctx, "muxer: marshal access-denied error failed",
+			m.logFields(ctx, slog.String("store_id", storeID.String()), "err", err)...)
 		return false
 	}
 	if err := m.sendControl(ControlTypeError, storeID, channelID, payload); err != nil {
-		slog.WarnContext(ctx, "muxer: send error control failed", "err", err)
+		slog.WarnContext(ctx, "muxer: send error control failed",
+			m.logFields(ctx,
+				slog.String("store_id", storeID.String()),
+				slog.String("channel_id", channelID.String()),
+				slog.String("error_type", classifyTransportError(err)),
+				"err", err)...)
 	}
 	return false
 }
@@ -506,7 +542,7 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 
 	if m.nodeManager == nil {
 		if m.name == "server" {
-			slog.ErrorContext(ctx, "muxer: node manager is nil on server side")
+			slog.ErrorContext(ctx, "muxer: node manager is nil on server side", m.msgLogFields(msg)...)
 			return nil, errors.New("node manager nil")
 		}
 		return nil, errors.New("node manager nil")
@@ -515,13 +551,17 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 	instance, err := m.nodeManager.GetOrCreate(ctx, msg.StoreID)
 	if err != nil {
 		slog.ErrorContext(ctx, "muxer: failed to get or create node",
-			slog.String("store_id", msg.StoreID.String()),
-			slog.String("err", err.Error()))
+			m.msgLogFields(msg,
+				slog.String("err", err.Error()))...)
 		payload, marshalErr := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
 		if marshalErr != nil {
-			slog.WarnContext(ctx, "muxer: marshal store-unavailable error failed", "err", marshalErr)
+			slog.WarnContext(ctx, "muxer: marshal store-unavailable error failed",
+				m.msgLogFields(msg, "err", marshalErr)...)
 		} else if sendErr := m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload); sendErr != nil {
-			slog.WarnContext(ctx, "muxer: send error control failed", "err", sendErr)
+			slog.WarnContext(ctx, "muxer: send error control failed",
+				m.msgLogFields(msg,
+					slog.String("error_type", classifyTransportError(sendErr)),
+					"err", sendErr)...)
 		}
 		return nil, err
 	}
@@ -549,14 +589,14 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 		}
 		return bidi, nil
 	}
-	slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", slog.String("channel_id", msg.ChannelID.String()))
+	slog.WarnContext(ctx, "muxer: stream registration returned nil bidi", m.msgLogFields(msg)...)
 	return nil, errors.New("registration returned nil")
 }
 
 // deliverToStream offers the payload to the bidi stream and logs delivery or drop.
 func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Context, msg *MuxerMsg) {
 	if bidi == nil {
-		slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", slog.String("channel_id", msg.ChannelID.String()))
+		slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", m.msgLogFields(msg)...)
 		return
 	}
 	bidi.Offer(msg.Payload)
@@ -616,7 +656,10 @@ func (m *WebSocketMuxer) checkHeartbeatTimeout() bool {
 	idleMs := ts - last
 	if idleMs > pongTimeoutMs {
 		atomic.AddInt64(&m.missedPongs, 1)
-		slog.WarnContext(m.Context, "muxer: heartbeat timed out; closing connection", slog.Int64("idle_ms", idleMs))
+		slog.WarnContext(m.Context, "muxer: heartbeat timed out; closing connection",
+			m.logFields(m.Context,
+				slog.Int64("idle_ms", idleMs),
+				slog.String("error_type", classifyTransportError(ErrHeartbeatTimeout)))...)
 		// Reuse shutdown to avoid duplicating close semantics. Provide a specific
 		// ErrHeartbeatTimeout so streams receive the appropriate error.
 		m.shutdown(ErrHeartbeatTimeout)
@@ -702,9 +745,15 @@ func (m *WebSocketMuxer) sendPing() error {
 		if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypePing}); err != nil {
 			atomic.AddInt64(&m.writeErrors, 1)
 			if benignDisconnect(err) {
-				slog.DebugContext(m.Context, "muxer: ping send skipped (disconnected)", slog.String("error", err.Error()))
+				slog.DebugContext(m.Context, "muxer: ping send skipped (disconnected)",
+					m.logFields(m.Context,
+						slog.String("error_type", classifyTransportError(err)),
+						slog.String("error", err.Error()))...)
 			} else {
-				slog.WarnContext(m.Context, "muxer: ping send failed", slog.String("error", err.Error()))
+				slog.WarnContext(m.Context, "muxer: ping send failed",
+					m.logFields(m.Context,
+						slog.String("error_type", classifyTransportError(err)),
+						slog.String("error", err.Error()))...)
 			}
 			return err
 		}
@@ -754,7 +803,10 @@ func (m *WebSocketMuxer) buildSendErrorFields(err error, msg *MuxerMsg) []any {
 		netErr net.Error
 		opErr  *net.OpError
 	)
-	fields := []any{}
+	fields := []any{
+		slog.String("muxer", m.name),
+		slog.String("error_type", classifyTransportError(err)),
+	}
 	if msg != nil {
 		fields = append(fields, slog.String("channel_id", msg.ChannelID.String()))
 		fields = append(fields, slog.Int("bytes", len(msg.Payload)))
@@ -888,17 +940,29 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 			m.writeMu.Lock()
 			if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypeClose}); err != nil {
 				if benignDisconnect(err) {
-					slog.DebugContext(m.Context, "muxer: shutdown close frame not sent (already disconnected)", "err", err)
+					slog.DebugContext(m.Context, "muxer: shutdown close frame not sent (already disconnected)",
+						m.logFields(m.Context,
+							slog.String("error_type", classifyTransportError(err)),
+							"err", err)...)
 				} else {
-					slog.WarnContext(m.Context, "muxer: shutdown close frame send failed", "err", err)
+					slog.WarnContext(m.Context, "muxer: shutdown close frame send failed",
+						m.logFields(m.Context,
+							slog.String("error_type", classifyTransportError(err)),
+							"err", err)...)
 				}
 			}
 			m.writeMu.Unlock()
 			if err := m.conn.Close(); err != nil {
 				if benignDisconnect(err) {
-					slog.DebugContext(m.Context, "muxer: shutdown conn close skipped", "err", err)
+					slog.DebugContext(m.Context, "muxer: shutdown conn close skipped",
+						m.logFields(m.Context,
+							slog.String("error_type", classifyTransportError(err)),
+							"err", err)...)
 				} else {
-					slog.WarnContext(m.Context, "muxer: shutdown conn close failed", "err", err)
+					slog.WarnContext(m.Context, "muxer: shutdown conn close failed",
+						m.logFields(m.Context,
+							slog.String("error_type", classifyTransportError(err)),
+							"err", err)...)
 				}
 			}
 		}

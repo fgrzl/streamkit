@@ -2,6 +2,7 @@ package telemetry_test
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 
 	"github.com/fgrzl/streamkit/pkg/telemetry"
@@ -12,6 +13,38 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
+
+type captureHandler struct {
+	record slog.Record
+	seen   bool
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *captureHandler) Handle(_ context.Context, record slog.Record) error {
+	h.record = record.Clone()
+	h.seen = true
+	return nil
+}
+
+func (h *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler {
+	return h
+}
+
+func (h *captureHandler) WithGroup(_ string) slog.Handler {
+	return h
+}
+
+func recordAttrs(record slog.Record) map[string]string {
+	attrs := make(map[string]string)
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.String()
+		return true
+	})
+	return attrs
+}
 
 func TestGetTracerReturnsGlobalTracer(t *testing.T) {
 	// Arrange
@@ -105,6 +138,22 @@ func TestAddTraceContextToLoggerWithoutSpan(t *testing.T) {
 	assert.Empty(t, attrs)
 }
 
+func TestAddTraceContextToLoggerIncludesRequestIDWithoutSpan(t *testing.T) {
+	// Arrange
+	id := uuid.New()
+	ctx := telemetry.WithRequestIDContext(context.Background(), id)
+
+	// Act
+	attrs := telemetry.AddTraceContextToLogger(ctx)
+
+	// Assert
+	require.Len(t, attrs, 1)
+	requestIDAttr, ok := attrs[0].(slog.Attr)
+	require.True(t, ok)
+	assert.Equal(t, "request_id", requestIDAttr.Key)
+	assert.Equal(t, id.String(), requestIDAttr.Value.String())
+}
+
 func TestWithRequestIDContextRoundtrip(t *testing.T) {
 	// Arrange
 	ctx := context.Background()
@@ -117,6 +166,35 @@ func TestWithRequestIDContextRoundtrip(t *testing.T) {
 	// Assert
 	assert.True(t, ok)
 	assert.Equal(t, id, got)
+}
+
+func TestTraceContextHandlerAddsTraceAndRequestID(t *testing.T) {
+	// Arrange
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(
+		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
+	)
+	defer tp.Shutdown(context.Background())
+
+	requestID := uuid.New()
+	tracer := tp.Tracer("test")
+	ctx := telemetry.WithRequestIDContext(context.Background(), requestID)
+	ctx, span := tracer.Start(ctx, "test_span")
+	defer span.End()
+
+	sink := &captureHandler{}
+	logger := slog.New(telemetry.NewTraceContextHandler(sink))
+
+	// Act
+	logger.InfoContext(ctx, "test")
+
+	// Assert
+	require.True(t, sink.seen)
+	attrs := recordAttrs(sink.record)
+	assert.Equal(t, requestID.String(), attrs["request_id"])
+	assert.Equal(t, span.SpanContext().TraceID().String(), attrs["trace_id"])
+	assert.Equal(t, span.SpanContext().SpanID().String(), attrs["span_id"])
+	assert.Equal(t, "true", attrs["traced"])
 }
 
 func TestGetMeterReturnsNonNil(t *testing.T) {

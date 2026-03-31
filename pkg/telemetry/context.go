@@ -54,17 +54,22 @@ func TraceIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// AddTraceContextToLogger returns a new slog value slice with trace context attributes.
-// Used to add trace_id and span_id to slog records for correlation.
-// Returns empty slice if span context is not valid.
+// AddTraceContextToLogger returns slog attributes for correlation fields found in ctx.
+// It includes request_id when present, plus trace_id and span_id when an active
+// span exists.
 func AddTraceContextToLogger(ctx context.Context) []any {
-	span := trace.SpanFromContext(ctx)
-	if span == nil || !span.SpanContext().IsValid() {
-		return []any{}
+	attrs := make([]any, 0, 3)
+	if requestID, ok := RequestIDFromContext(ctx); ok {
+		attrs = append(attrs, slog.String("request_id", requestID.String()))
 	}
 
-	return []any{
+	span := trace.SpanFromContext(ctx)
+	if span == nil || !span.SpanContext().IsValid() {
+		return attrs
+	}
+
+	return append(attrs,
 		slog.String("trace_id", span.SpanContext().TraceID().String()),
 		slog.String("span_id", span.SpanContext().SpanID().String()),
-	}
+	)
 }

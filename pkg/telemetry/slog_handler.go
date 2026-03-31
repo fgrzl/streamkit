@@ -7,16 +7,16 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// TraceContextHandler is a log handler that enriches log records with trace context.
-// It wraps an existing slog.Handler and adds trace_id and span_id attributes
-// extracted from the span context, enabling correlation between logs and traces.
+// TraceContextHandler is a log handler that enriches log records with correlation context.
+// It wraps an existing slog.Handler and adds request_id, trace_id, and span_id
+// attributes extracted from the context, enabling correlation between logs and traces.
 type TraceContextHandler struct {
 	next slog.Handler
 }
 
-// NewTraceContextHandler wraps an existing handler with trace context enrichment.
-// The returned handler will add trace_id and span_id attributes to all log records
-// that are part of an active trace span.
+// NewTraceContextHandler wraps an existing handler with context enrichment.
+// The returned handler will add request_id when present, and trace_id/span_id
+// attributes to log records that are part of an active trace span.
 //
 // Wire this into your application during bootstrap so that logs correlate with
 // traces. Example after initializing OTel (e.g. internal/telemetry.Initialize):
@@ -36,6 +36,10 @@ func (h *TraceContextHandler) Enabled(ctx context.Context, level slog.Level) boo
 // Handle implements slog.Handler.
 // It enriches the record with trace context before passing to the wrapped handler.
 func (h *TraceContextHandler) Handle(ctx context.Context, record slog.Record) error {
+	if requestID, ok := RequestIDFromContext(ctx); ok {
+		record.AddAttrs(slog.String("request_id", requestID.String()))
+	}
+
 	// Extract trace context from the span
 	span := trace.SpanFromContext(ctx)
 	if span != nil && span.SpanContext().IsValid() {

@@ -41,12 +41,23 @@ func (s *streamStore) LoadEvents(ctx context.Context, entity es.Entity, minSeque
 		func(entry *client.Entry) (es.DomainEvent, error) {
 			envelope := &polymorphic.Envelope{}
 			if err := json.Unmarshal(entry.Payload, envelope); err != nil {
-				slog.ErrorContext(ctx, "Failed to unmarshal envelope", "err", err)
+				slog.ErrorContext(ctx, "eskit: failed to unmarshal event envelope",
+					slog.String("store_id", entity.TenantID.String()),
+					slog.String("space", entity.Area),
+					slog.String("segment", entity.ID.String()),
+					slog.Uint64("entry_sequence", entry.Sequence),
+					slog.Int("payload_bytes", len(entry.Payload)),
+					"err", err)
 				return nil, err
 			}
 			domainEvent, ok := envelope.Content.(es.DomainEvent)
 			if !ok {
-				slog.ErrorContext(ctx, "Invalid DomainEvent type", "actualType", fmt.Sprintf("%T", envelope.Content))
+				slog.ErrorContext(ctx, "eskit: invalid domain event type",
+					slog.String("store_id", entity.TenantID.String()),
+					slog.String("space", entity.Area),
+					slog.String("segment", entity.ID.String()),
+					slog.Uint64("entry_sequence", entry.Sequence),
+					slog.String("actual_type", fmt.Sprintf("%T", envelope.Content)))
 				return nil, fmt.Errorf("failed to cast to DomainEvent: %T", envelope.Content)
 			}
 			return domainEvent, nil
@@ -114,11 +125,25 @@ func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events [
 	})
 
 	if err != nil {
+		slog.ErrorContext(ctx, "eskit: failed to save events",
+			slog.String("store_id", entity.TenantID.String()),
+			slog.String("space", space),
+			slog.String("segment", segment),
+			slog.Int("event_count", len(events)),
+			slog.Uint64("expected_sequence", expectedSequence),
+			slog.Int("status_count", statusCount),
+			"err", err)
 		return err
 	}
 
 	// Validate that we received at least one status update
 	if statusCount == 0 {
+		slog.ErrorContext(ctx, "eskit: producer returned no status updates",
+			slog.String("store_id", entity.TenantID.String()),
+			slog.String("space", space),
+			slog.String("segment", segment),
+			slog.Int("event_count", len(events)),
+			slog.Uint64("expected_sequence", expectedSequence))
 		return fmt.Errorf("no status updates received from producer")
 	}
 

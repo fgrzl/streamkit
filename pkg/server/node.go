@@ -58,13 +58,16 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			slog.ErrorContext(ctx, "handler panic recovered", "panic", r)
+			slog.ErrorContext(ctx, "server: handler panic recovered",
+				logContextFields(ctx, n.storeID, slog.Any("panic", r))...)
 			bidi.Close(fmt.Errorf("panic: %v", r))
 		}
 	}()
 
 	envelope := &polymorphic.Envelope{}
 	if err := bidi.Decode(envelope); err != nil {
+		slog.WarnContext(ctx, "server: failed to decode request envelope",
+			logContextFields(ctx, n.storeID, "err", err)...)
 		bidi.Close(err)
 		return
 	}
@@ -114,6 +117,8 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 		spanName = "streamkit.server.lease_release"
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleLeaseRelease(ctx, args, b) }
 	default:
+		slog.WarnContext(ctx, "server: invalid request message type",
+			logContextFields(ctx, n.storeID, slog.String("type", fmt.Sprintf("%T", envelope.Content)))...)
 		bidi.Close(fmt.Errorf("invalid request msg type: %T", envelope.Content))
 		return
 	}
@@ -125,22 +130,27 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 
 func (n *defaultNode) handleGetSpaces(ctx context.Context, _ *api.GetSpaces, bidi api.BidiStream) {
 	enumerator := n.store.GetSpaces(ctx)
-	streamNames(ctx, enumerator, bidi)
+	streamNames(ctx, "get spaces", enumerator, bidi, logContextFields(ctx, n.storeID)...)
 }
 
 func (n *defaultNode) handleConsumeSpace(ctx context.Context, args *api.ConsumeSpace, bidi api.BidiStream) {
 	enumerator := n.store.ConsumeSpace(ctx, args)
-	streamEntries(ctx, enumerator, bidi)
+	streamEntries(ctx, "consume space", enumerator, bidi,
+		logContextFields(ctx, n.storeID, slog.String("space", args.Space))...)
 }
 
 func (n *defaultNode) handleGetSegments(ctx context.Context, args *api.GetSegments, bidi api.BidiStream) {
 	enumerator := n.store.GetSegments(ctx, args.Space)
-	streamNames(ctx, enumerator, bidi)
+	streamNames(ctx, "get segments", enumerator, bidi,
+		logContextFields(ctx, n.storeID, slog.String("space", args.Space))...)
 }
 
 func (n *defaultNode) handleConsumeSegment(ctx context.Context, args *api.ConsumeSegment, bidi api.BidiStream) {
 	enumerator := n.store.ConsumeSegment(ctx, args)
-	streamEntries(ctx, enumerator, bidi)
+	streamEntries(ctx, "consume segment", enumerator, bidi,
+		logContextFields(ctx, n.storeID,
+			slog.String("space", args.Space),
+			slog.String("segment", args.Segment))...)
 }
 
 func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.BidiStream) {
@@ -150,6 +160,11 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 	entry, err := n.store.Peek(ctx, args.Space, args.Segment)
 	if err != nil {
 		telemetry.RecordError(trace.SpanFromContext(ctx), err)
+		slog.ErrorContext(ctx, "server: peek failed",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment),
+				"err", err)...)
 		bidi.CloseSend(err)
 		return
 	}
@@ -163,6 +178,11 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 
 	if err := bidi.Encode(entry); err != nil {
 		telemetry.RecordError(trace.SpanFromContext(ctx), err)
+		slog.WarnContext(ctx, "server: failed to encode peek response",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment),
+				"err", err)...)
 		bidi.CloseSend(err)
 		return
 	}
@@ -244,13 +264,23 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 				SegmentStatus: result,
 			}
 			if err := bus.Notify(notification); err != nil {
-				slog.WarnContext(ctx, err.Error())
+				slog.WarnContext(ctx, "server: failed to publish segment notification",
+					logContextFields(ctx, n.storeID,
+						slog.String("space", result.Space),
+						slog.String("segment", result.Segment),
+						slog.Uint64("last_sequence", result.LastSequence),
+						"err", err)...)
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		slog.ErrorContext(ctx, "produce failed", "err", err)
+		slog.ErrorContext(ctx, "server: produce failed",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment),
+				slog.Int("status_count", count),
+				"err", err)...)
 		bidi.CloseSend(err)
 		return
 	}
@@ -269,7 +299,8 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 		}))
 	}
 	enumerator := enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
-	streamEntries(ctx, enumerator, bidi)
+	streamEntries(ctx, "consume", enumerator, bidi,
+		logContextFields(ctx, n.storeID, slog.Int("space_count", len(args.Offsets)))...)
 }
 
 func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
@@ -277,7 +308,10 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	if n.busFactory == nil {
 		err := fmt.Errorf("the message bus was not configured")
 		telemetry.RecordError(span, err)
-		slog.WarnContext(ctx, "the message bus factory was not configured")
+		slog.WarnContext(ctx, "server: message bus factory was not configured",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment))...)
 		bidi.CloseSend(err)
 		return
 	}
@@ -285,7 +319,11 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	messageBus, err := n.busFactory.Get(ctx)
 	if err != nil {
 		telemetry.RecordError(span, err)
-		slog.WarnContext(ctx, "failed to connect to the message bus")
+		slog.WarnContext(ctx, "server: failed to connect to the message bus",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment),
+				"err", err)...)
 		bidi.CloseSend(fmt.Errorf("failed to connect to the message bus"))
 		return
 	}
@@ -309,7 +347,11 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "subscription cleanup goroutine panic", "err", r)
+				slog.ErrorContext(ctx, "server: subscription cleanup goroutine panic",
+					logContextFields(ctx, n.storeID,
+						slog.String("space", args.Space),
+						slog.String("segment", args.Segment),
+						slog.Any("panic", r))...)
 			}
 		}()
 		select {
@@ -328,13 +370,14 @@ func (n *defaultNode) getBus(ctx context.Context) bus.MessageBus {
 	}
 	messageBus, err := n.busFactory.Get(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "the message bus factory was not configured")
+		slog.WarnContext(ctx, "server: failed to get message bus",
+			logContextFields(ctx, n.storeID, "err", err)...)
 		return nil
 	}
 	return messageBus
 }
 
-func streamNames(ctx context.Context, enumerator enumerators.Enumerator[string], bidi api.BidiStream) {
+func streamNames(ctx context.Context, operation string, enumerator enumerators.Enumerator[string], bidi api.BidiStream, fields ...any) {
 	defer enumerator.Dispose()
 	for enumerator.MoveNext() {
 		if !checkContext(ctx, bidi) {
@@ -342,10 +385,14 @@ func streamNames(ctx context.Context, enumerator enumerators.Enumerator[string],
 		}
 		name, err := enumerator.Current()
 		if err != nil {
+			slog.WarnContext(ctx, "server: "+operation+" enumerator failed",
+				appendLogFields(fields, "err", err)...)
 			bidi.CloseSend(err)
 			return
 		}
 		if err := bidi.Encode(name); err != nil {
+			slog.WarnContext(ctx, "server: "+operation+" response encode failed",
+				appendLogFields(fields, "err", err)...)
 			bidi.CloseSend(err)
 			return
 		}
@@ -353,7 +400,7 @@ func streamNames(ctx context.Context, enumerator enumerators.Enumerator[string],
 	bidi.CloseSend(nil)
 }
 
-func streamEntries(ctx context.Context, enumerator enumerators.Enumerator[*api.Entry], bidi api.BidiStream) {
+func streamEntries(ctx context.Context, operation string, enumerator enumerators.Enumerator[*api.Entry], bidi api.BidiStream, fields ...any) {
 	defer enumerator.Dispose()
 	for enumerator.MoveNext() {
 		if !checkContext(ctx, bidi) {
@@ -361,15 +408,34 @@ func streamEntries(ctx context.Context, enumerator enumerators.Enumerator[*api.E
 		}
 		entry, err := enumerator.Current()
 		if err != nil {
+			slog.WarnContext(ctx, "server: "+operation+" enumerator failed",
+				appendLogFields(fields, "err", err)...)
 			bidi.CloseSend(err)
 			return
 		}
 		if err := bidi.Encode(entry); err != nil {
+			slog.WarnContext(ctx, "server: "+operation+" response encode failed",
+				appendLogFields(fields, "err", err)...)
 			bidi.CloseSend(err)
 			return
 		}
 	}
 	bidi.CloseSend(nil)
+}
+
+func logContextFields(ctx context.Context, storeID uuid.UUID, extras ...any) []any {
+	fields := []any{slog.String("store_id", storeID.String())}
+	if channelID, ok := ChannelIDFromContext(ctx); ok {
+		fields = append(fields, slog.String("channel_id", channelID.String()))
+	}
+	return append(fields, extras...)
+}
+
+func appendLogFields(fields []any, extras ...any) []any {
+	out := make([]any, 0, len(fields)+len(extras))
+	out = append(out, fields...)
+	out = append(out, extras...)
+	return out
 }
 
 func checkContext(ctx context.Context, bidi api.BidiStream) bool {

@@ -103,7 +103,15 @@ Use `log/slog` and be **strategic about levels** so production logs stay actiona
 - **Error** — Failures that need attention (e.g. stream creation failed, handler panic, table creation failed).
 - **Debug** — Reserved for troubleshooting; keep minimal so default (Info) stays quiet.
 
+Prefer structured fields that make correlation and triage fast. Use the identifiers that matter for the operation instead of free-form text parsing:
+
+- `store_id`, `space`, `segment`, `channel_id` for stream and transport scope
+- `request_id`, `subscription_id`, `transaction_id` for end-to-end correlation
+- `attempt`, `max_attempts`, `last_sequence`, `record_count`, `entry_count` for progress and retry state
+- `error_type` plus the original `error` value for grouping common failure modes
+
 Do not add Info logs on hot paths (peek, publish, produce, per-subscription connect, per-offset retry). Prefer metrics or tracing for high-cardinality observability.
+Routine reconnect success, benign disconnects, and ordinary close events belong in Debug unless they indicate a degraded state that needs operator action.
 
 ### Project Architecture
 

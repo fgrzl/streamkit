@@ -416,6 +416,12 @@ func (s *AzureStore) processBufferedChunk(ctx context.Context, space, segment st
 			}
 		}
 	}
+	slog.ErrorContext(ctx, "azure store: exhausted retries processing chunk",
+		slog.String("space", space),
+		slog.String("segment", segment),
+		slog.Int("record_count", len(records)),
+		slog.Int("max_attempts", maxRetryAttempts),
+		slog.String("last_error", lastErr.Error()))
 	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetryAttempts, lastErr)
 }
 
@@ -465,11 +471,19 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 				return nil, fmt.Errorf("%s: %w", ErrUnmarshalTransaction, err)
 			}
 			if err := s.fanoutTransaction(ctx, transaction); err != nil {
-				slog.ErrorContext(ctx, LogErrorFanout, "err", err)
+				slog.ErrorContext(ctx, LogErrorFanout,
+					append(transactionLogFields(transaction),
+						slog.String("wal_partition_key", e.PartitionKey),
+						slog.String("wal_row_key", e.RowKey),
+						slog.Any("err", err))...)
 				return nil, err
 			}
 			if err := s.cleanupWAL(ctx, e.PartitionKey, e.RowKey); err != nil {
-				slog.ErrorContext(ctx, LogErrorWALCleanup, "err", err)
+				slog.ErrorContext(ctx, LogErrorWALCleanup,
+					append(transactionLogFields(transaction),
+						slog.String("wal_partition_key", e.PartitionKey),
+						slog.String("wal_row_key", e.RowKey),
+						slog.Any("err", err))...)
 				return nil, err
 			}
 			return transaction, nil
@@ -880,6 +894,22 @@ func createTransaction(trx api.TRX, space, segment string, entries []*api.Entry)
 		LastSequence:  entries[len(entries)-1].Sequence,
 		Entries:       entries,
 		Timestamp:     timestamp.GetTimestamp(),
+	}
+}
+
+func transactionLogFields(transaction *txn.Transaction) []any {
+	if transaction == nil {
+		return nil
+	}
+
+	return []any{
+		slog.String("transaction_id", transaction.TRX.ID.String()),
+		slog.Uint64("transaction_number", transaction.TRX.Number),
+		slog.String("space", transaction.Space),
+		slog.String("segment", transaction.Segment),
+		slog.Uint64("first_sequence", transaction.FirstSequence),
+		slog.Uint64("last_sequence", transaction.LastSequence),
+		slog.Int("entry_count", len(transaction.Entries)),
 	}
 }
 

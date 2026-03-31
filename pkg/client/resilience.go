@@ -146,14 +146,14 @@ func RetryWithBackoff(ctx context.Context, policy RetryPolicy, fn func(context.C
 
 		if attempt == policy.MaxAttempts {
 			slog.ErrorContext(ctx, "exhausted retry attempts",
-				slog.Int("maxAttempts", policy.MaxAttempts),
-				slog.String("lastError", err.Error()))
+				slog.Int("max_attempts", policy.MaxAttempts),
+				slog.String("last_error", err.Error()))
 			return err
 		}
 
 		slog.WarnContext(ctx, "operation failed, retrying",
 			slog.Int("attempt", attempt),
-			slog.Int("maxAttempts", policy.MaxAttempts),
+			slog.Int("max_attempts", policy.MaxAttempts),
 			slog.Duration("backoff", backoff),
 			slog.String("error", err.Error()))
 

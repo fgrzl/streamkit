@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -90,10 +91,23 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 		if failure.count >= m.maxFailures {
 			// Circuit is open - check if enough time has passed to retry
 			if time.Since(failure.lastFailed) < m.failureWindow {
+				retryAfter := m.failureWindow - time.Since(failure.lastFailed)
+				if retryAfter < 0 {
+					retryAfter = 0
+				}
+				slog.WarnContext(ctx, "node manager: store creation circuit open",
+					slog.String("store_id", storeID.String()),
+					slog.Int("failure_count", failure.count),
+					slog.Duration("retry_after", retryAfter),
+					slog.Duration("failure_window", m.failureWindow))
 				return nil, fmt.Errorf("store creation circuit open: too many recent failures (%d), retry after %v",
 					failure.count, m.failureWindow-time.Since(failure.lastFailed))
 			}
 			// Enough time has passed, allow retry (half-open state)
+			slog.InfoContext(ctx, "node manager: retrying store creation after failure window",
+				slog.String("store_id", storeID.String()),
+				slog.Int("failure_count", failure.count),
+				slog.Duration("failure_window", m.failureWindow))
 			failure.count = m.maxFailures - 1 // Reduce count to allow one retry
 		}
 	}
@@ -101,17 +115,34 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 	store, err := m.storeFactory.NewStore(ctx, storeID)
 	if err != nil {
 		// Track failure
+		failureCount := 1
 		if failure, exists := m.failures[storeID]; exists {
 			failure.count++
 			failure.lastFailed = time.Now()
+			failureCount = failure.count
 		} else {
 			m.failures[storeID] = &storeFailure{count: 1, lastFailed: time.Now()}
 		}
+		slog.ErrorContext(ctx, "node manager: store creation failed",
+			slog.String("store_id", storeID.String()),
+			slog.Int("failure_count", failureCount),
+			slog.Int("max_failures", m.maxFailures),
+			slog.Bool("circuit_open", failureCount >= m.maxFailures),
+			slog.String("error", err.Error()))
 		return nil, err
 	}
 
 	// Success - clear failures
+	previousFailures := 0
+	if failure, exists := m.failures[storeID]; exists {
+		previousFailures = failure.count
+	}
 	delete(m.failures, storeID)
+	if previousFailures > 0 {
+		slog.InfoContext(ctx, "node manager: store creation recovered",
+			slog.String("store_id", storeID.String()),
+			slog.Int("previous_failure_count", previousFailures))
+	}
 
 	leaseStore := lease.NewStore()
 	node := NewNode(storeID, store, m.busFactory, leaseStore)
