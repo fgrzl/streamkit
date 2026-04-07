@@ -9,6 +9,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	client "github.com/fgrzl/azkit/tables"
@@ -57,6 +58,7 @@ const (
 	ErrDecodeEntry          = "failed to decode entry"
 	ErrUnmarshalTransaction = "failed to unmarshal transaction"
 	ErrBatchPrepare         = "failed to prepare batch"
+	ErrStoreClosing         = "store is closing"
 )
 
 // Log Constants
@@ -155,6 +157,7 @@ type AzureStore struct {
 	client              *client.HTTPTableClient
 	cache               *cache.ExpiringCache
 	wg                  sync.WaitGroup
+	shuttingDown        atomic.Bool
 	closeOnce           sync.Once
 	opts                *AzureStoreOptions
 	stopWALMonitor      chan struct{}
@@ -296,6 +299,9 @@ func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enu
 	if args == nil || args.Space == "" || args.Segment == "" {
 		return enumerators.Error[*api.SegmentStatus](errors.New(ErrInvalidProduceArgs))
 	}
+	if s.shuttingDown.Load() {
+		return enumerators.Error[*api.SegmentStatus](errors.New(ErrStoreClosing))
+	}
 
 	// Wait for WAL recovery to complete before accepting writes
 	select {
@@ -323,6 +329,7 @@ func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enu
 
 func (s *AzureStore) Close() {
 	s.closeOnce.Do(func() {
+		s.shuttingDown.Store(true)
 		// Stop WAL monitor
 		close(s.stopWALMonitor)
 		if !s.waitForTasks(ShutdownTimeout) {
@@ -442,8 +449,10 @@ func (s *AzureStore) processBufferedChunk(ctx context.Context, space, segment st
 }
 
 func (s *AzureStore) processChunk(ctx context.Context, space, segment string, records []*api.Record, lastSeq, lastTrx uint64) (*api.SegmentStatus, error) {
-	s.wg.Add(1)
-	defer s.wg.Done()
+	if !s.beginTask() {
+		return nil, errors.New(ErrStoreClosing)
+	}
+	defer s.endTask()
 
 	trx := api.TRX{ID: uuid.New(), Number: lastTrx + 1}
 	entries, err := createEntries(records, space, segment, trx, lastSeq)
@@ -464,6 +473,22 @@ func (s *AzureStore) processChunk(ctx context.Context, space, segment string, re
 	status := createSegmentStatus(space, segment, entries)
 
 	return status, nil
+}
+
+func (s *AzureStore) beginTask() bool {
+	if s.shuttingDown.Load() {
+		return false
+	}
+	s.wg.Add(1)
+	if s.shuttingDown.Load() {
+		s.wg.Done()
+		return false
+	}
+	return true
+}
+
+func (s *AzureStore) endTask() {
+	s.wg.Done()
 }
 
 func (s *AzureStore) recoverWAL(ctx context.Context) error {

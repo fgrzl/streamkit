@@ -76,10 +76,12 @@ func (m *mockStore) Close() {}
 
 type mockBusSubscription struct {
 	unsubscribed atomic.Bool
+	unsubCalls   atomic.Int32
 }
 
 func (s *mockBusSubscription) Unsubscribe() error {
 	s.unsubscribed.Store(true)
+	s.unsubCalls.Add(1)
 	return nil
 }
 
@@ -320,6 +322,60 @@ func TestLeaseRenewAndReleaseReturnOk(t *testing.T) {
 	require.True(t, bidiRelease.encoded[0].(*api.LeaseResult).Ok)
 }
 
+func TestLeaseAcquireValidationFailures(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+
+	tests := []struct {
+		name    string
+		args    *api.LeaseAcquire
+		message string
+	}{
+		{
+			name:    "empty key",
+			args:    &api.LeaseAcquire{Key: "", Holder: "h1", TTLSeconds: 30},
+			message: "lease key must not be empty",
+		},
+		{
+			name:    "empty holder",
+			args:    &api.LeaseAcquire{Key: "k", Holder: "", TTLSeconds: 30},
+			message: "lease holder must not be empty",
+		},
+		{
+			name:    "ttl above max",
+			args:    &api.LeaseAcquire{Key: "k", Holder: "h1", TTLSeconds: 86401},
+			message: "ttl_seconds exceeds maximum of 86400",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := &polymorphic.Envelope{Content: tt.args}
+			bidi := newMockBidi(env)
+			node.Handle(context.Background(), bidi)
+			require.Len(t, bidi.encoded, 1)
+			result, ok := bidi.encoded[0].(*api.LeaseResult)
+			require.True(t, ok)
+			require.False(t, result.Ok)
+			require.Equal(t, tt.message, result.Message)
+		})
+	}
+}
+
+func TestLeaseReleaseValidationFailures(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+
+	env := &polymorphic.Envelope{Content: &api.LeaseRelease{Key: "", Holder: "h1"}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	require.Len(t, bidi.encoded, 1)
+	result, ok := bidi.encoded[0].(*api.LeaseResult)
+	require.True(t, ok)
+	require.False(t, result.Ok)
+	require.Equal(t, "lease key must not be empty", result.Message)
+}
+
 type panickingStore struct{}
 
 func (p *panickingStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] { panic("boom") }
@@ -395,6 +451,7 @@ func TestSubscribeEmitsHeartbeats(t *testing.T) {
 	waitForClosed(t, bidi)
 	require.NotNil(t, messageBus.subscription)
 	require.True(t, messageBus.subscription.unsubscribed.Load())
+	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
 func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
@@ -416,6 +473,8 @@ func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return messageBus.subscription != nil && messageBus.subscription.unsubscribed.Load()
 	}, time.Second, 10*time.Millisecond)
+	require.NotNil(t, messageBus.subscription)
+	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
 // (removed failingBusFactory - not used)

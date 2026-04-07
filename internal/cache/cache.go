@@ -3,6 +3,7 @@ package cache
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,14 +20,19 @@ type ExpiringCache struct {
 	interval time.Duration
 	stop     chan struct{}
 	disposed sync.Once
+
+	cleanupPanics       atomic.Int32
+	maxCleanupPanics    int32
+	cleanupTickTestHook atomic.Value // stores func() for test-only fault injection
 }
 
 // NewExpiringCache creates a new cache with expiration and cleanup interval
 func NewExpiringCache(ttl, cleanupInterval time.Duration) *ExpiringCache {
 	cache := &ExpiringCache{
-		ttl:      ttl,
-		interval: cleanupInterval,
-		stop:     make(chan struct{}),
+		ttl:              ttl,
+		interval:         cleanupInterval,
+		stop:             make(chan struct{}),
+		maxCleanupPanics: 5,
 	}
 
 	// Start cleanup goroutine
@@ -68,6 +74,18 @@ func (c *ExpiringCache) Delete(key string) {
 
 // cleanupExpiredEntries runs periodically to remove expired items
 func (c *ExpiringCache) cleanupExpiredEntries() {
+	defer func() {
+		if recover() != nil {
+			if c.cleanupPanics.Add(1) <= c.maxCleanupPanics {
+				select {
+				case <-c.stop:
+					return
+				default:
+				}
+				go c.cleanupExpiredEntries()
+			}
+		}
+	}()
 
 	runtime.Gosched()
 
@@ -77,6 +95,11 @@ func (c *ExpiringCache) cleanupExpiredEntries() {
 	for {
 		select {
 		case <-ticker.C:
+			if hookAny := c.cleanupTickTestHook.Load(); hookAny != nil {
+				if hook, ok := hookAny.(func()); ok && hook != nil {
+					hook()
+				}
+			}
 			now := time.Now().UnixNano()
 			c.store.Range(func(key, value any) bool {
 				if item, ok := value.(CacheItem); ok {

@@ -2,6 +2,7 @@ package inprockit
 
 import (
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,4 +107,44 @@ func TestShouldSignalPeerClosedWhenLocalStreamCloses(t *testing.T) {
 	}
 
 	require.ErrorIs(t, server.Encode("late message"), io.ErrClosedPipe)
+}
+
+func TestShouldNotDeadlockWhenBothLinkedStreamsClose(t *testing.T) {
+	client := NewInProcBidiStream()
+	server := NewInProcBidiStream()
+	LinkStreams(client, server)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		client.Close(nil)
+	}()
+	go func() {
+		defer wg.Done()
+		server.Close(nil)
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for simultaneous linked stream closes")
+	}
+
+	select {
+	case <-client.Closed():
+	default:
+		t.Fatal("client stream should be closed")
+	}
+	select {
+	case <-server.Closed():
+	default:
+		t.Fatal("server stream should be closed")
+	}
 }

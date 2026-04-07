@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/fgrzl/enumerators"
@@ -49,6 +50,8 @@ type defaultNode struct {
 	busFactory bus.MessageBusFactory
 	leaseStore *lease.Store
 }
+
+const maxLeaseTTL = 24 * time.Hour
 
 func (n *defaultNode) Close() {
 	n.store.Close()
@@ -204,9 +207,24 @@ func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcq
 		bidi.CloseSend(nil)
 		return
 	}
+	if args.Key == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Holder == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
 	ttl := time.Duration(args.TTLSeconds) * time.Second
 	if ttl <= 0 {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if ttl > maxLeaseTTL {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
 		bidi.CloseSend(nil)
 		return
 	}
@@ -225,9 +243,24 @@ func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew
 		bidi.CloseSend(nil)
 		return
 	}
+	if args.Key == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Holder == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
 	ttl := time.Duration(args.TTLSeconds) * time.Second
 	if ttl <= 0 {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if ttl > maxLeaseTTL {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
 		bidi.CloseSend(nil)
 		return
 	}
@@ -243,6 +276,16 @@ func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew
 func (n *defaultNode) handleLeaseRelease(ctx context.Context, args *api.LeaseRelease, bidi api.BidiStream) {
 	if n.leaseStore == nil {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Key == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Holder == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
 		bidi.CloseSend(nil)
 		return
 	}
@@ -356,8 +399,22 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
+	// Use a dedicated subscription context so cleanup is deterministic and
+	// not tightly coupled to outer request context lifetime.
+	subCtx, cancelSub := context.WithCancel(ctx)
+	var cleanupOnce sync.Once
+	cleanup := func(closeErr error, closeBidi bool) {
+		cleanupOnce.Do(func() {
+			_ = sub.Unsubscribe()
+			cancelSub()
+			if closeBidi {
+				bidi.Close(closeErr)
+			}
+		})
+	}
+
 	if args.HeartbeatIntervalSeconds > 0 {
-		go n.streamSubscriptionHeartbeats(ctx, args, bidi)
+		go n.streamSubscriptionHeartbeats(subCtx, args, bidi)
 	}
 
 	// Clean up on bidi close or context cancellation
@@ -365,8 +422,8 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "server: subscription cleanup goroutine panic",
-					logContextFields(ctx, n.storeID,
+				slog.ErrorContext(subCtx, "server: subscription cleanup goroutine panic",
+					logContextFields(subCtx, n.storeID,
 						slog.String("space", args.Space),
 						slog.String("segment", args.Segment),
 						slog.Any("panic", r))...)
@@ -374,10 +431,9 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		}()
 		select {
 		case <-bidi.Closed():
-			sub.Unsubscribe()
-		case <-ctx.Done():
-			sub.Unsubscribe()
-			bidi.Close(ctx.Err())
+			cleanup(nil, false)
+		case <-subCtx.Done():
+			cleanup(subCtx.Err(), true)
 		}
 	}()
 }

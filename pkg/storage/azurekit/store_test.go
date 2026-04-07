@@ -289,6 +289,31 @@ func TestShouldWaitForTasksUntilCompleteOrTimeout(t *testing.T) {
 	})
 }
 
+func TestShouldRejectProduceWhenStoreIsClosing(t *testing.T) {
+	store := &AzureStore{}
+	store.shuttingDown.Store(true)
+
+	results := store.Produce(
+		context.Background(),
+		&api.Produce{Space: "space-a", Segment: "segment-a"},
+		enumerators.Slice([]*api.Record{{Sequence: 1}}),
+	)
+
+	_, err := enumerators.ToSlice(results)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, ErrStoreClosing)
+}
+
+func TestProcessChunkShouldReturnStoreClosingWhenShuttingDown(t *testing.T) {
+	store := &AzureStore{}
+	store.shuttingDown.Store(true)
+
+	status, err := store.processChunk(context.Background(), "space-a", "segment-a", []*api.Record{{Sequence: 1}}, 0, 0)
+	require.Error(t, err)
+	assert.Nil(t, status)
+	assert.ErrorContains(t, err, ErrStoreClosing)
+}
+
 func TestShouldReturnErrorWhenCreateTableReturnsResourceNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

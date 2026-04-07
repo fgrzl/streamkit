@@ -7,6 +7,7 @@ import (
 	"io"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -22,6 +23,7 @@ type InProcBidiStream struct {
 	closeOnce   sync.Once
 	closeErr    error
 	closed      chan struct{}
+	closedFlag  atomic.Uint32
 }
 
 var payloadBufPool = sync.Pool{
@@ -50,16 +52,17 @@ func NewInProcBidiStreamLoopback() *InProcBidiStream {
 }
 
 func (s *InProcBidiStream) Encode(m any) error {
-	// Issue #7: Removed closeErr check which had a data race (not synchronized).
-	// The closed channel select below is the correct synchronization mechanism.
-	// For in-process streams we can avoid serialization overhead by sending
-	// the object directly across the channel. The receiver will attempt a
-	// direct type assignment before falling back to JSON decoding when needed.
-	select {
-	case <-s.closed:
+	// Once a local or peer close has been observed, Encode must fail
+	// deterministically. A plain select on <-closed vs sendChan is insufficient
+	// because both cases can be ready and select may pick the send path.
+	if s.closedFlag.Load() != 0 {
 		return io.ErrClosedPipe
+	}
+	select {
 	case s.sendChan <- m:
 		return nil
+	case <-s.closed:
+		return io.ErrClosedPipe
 	}
 }
 
@@ -423,12 +426,14 @@ func (s *InProcBidiStream) CloseSend(err error) error {
 
 func (s *InProcBidiStream) Close(err error) {
 	s.closeSend(err)
+	peer := s.peer
 	s.closeOnce.Do(func() {
+		s.closedFlag.Store(1)
 		close(s.closed)
-		if s.peer != nil {
-			s.peer.closeRemote(err)
-		}
 	})
+	if peer != nil {
+		peer.closeRemote(err)
+	}
 }
 
 func (s *InProcBidiStream) Closed() <-chan struct{} {
@@ -453,6 +458,7 @@ func LinkStreams(client, server *InProcBidiStream) {
 func (s *InProcBidiStream) closeRemote(err error) {
 	s.recordCloseErr(err)
 	s.closeOnce.Do(func() {
+		s.closedFlag.Store(1)
 		close(s.closed)
 	})
 }

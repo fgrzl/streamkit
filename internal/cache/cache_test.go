@@ -3,6 +3,7 @@ package cache
 import (
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,4 +65,26 @@ func TestShouldSupportConcurrentSetAndGet(t *testing.T) {
 	// Assert
 	// If we reach here without race or panics the concurrent access passed.
 	assert.True(t, true)
+}
+
+func TestShouldRecoverCleanupLoopFromPanic(t *testing.T) {
+	// Arrange
+	c := NewExpiringCache(30*time.Millisecond, 10*time.Millisecond)
+	defer c.Close()
+
+	var ticks atomic.Int32
+	c.cleanupTickTestHook.Store(func() {
+		if ticks.Add(1) == 1 {
+			panic("cleanup panic")
+		}
+	})
+
+	c.Set("k-panic", "v")
+
+	// Act + Assert: cleanup loop should recover and continue expiring entries.
+	require.Eventually(t, func() bool {
+		_, ok := c.Get("k-panic")
+		return !ok
+	}, time.Second, 10*time.Millisecond)
+	require.GreaterOrEqual(t, ticks.Load(), int32(2))
 }
