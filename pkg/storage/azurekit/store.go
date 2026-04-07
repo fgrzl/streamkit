@@ -72,6 +72,18 @@ type batchEntry struct {
 	EncodedValue []byte
 }
 
+type committedInventoryError struct {
+	cause error
+}
+
+func (e *committedInventoryError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *committedInventoryError) Unwrap() error {
+	return e.cause
+}
+
 func NewAzureStore(ctx context.Context, client *client.HTTPTableClient, cache *cache.ExpiringCache, options *AzureStoreOptions) (*AzureStore, error) {
 	store := &AzureStore{
 		client:              client,
@@ -395,6 +407,10 @@ func (s *AzureStore) processBufferedChunk(ctx context.Context, space, segment st
 			*lastTrx += 1
 			return status, nil
 		}
+		var inventoryErr *committedInventoryError
+		if errors.As(err, &inventoryErr) {
+			return nil, inventoryErr
+		}
 		if !isRetryableError(err) {
 			return nil, err
 		}
@@ -478,6 +494,11 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 						slog.Any("err", err))...)
 				return nil, err
 			}
+			invKey := fmt.Sprintf("inventory:%s:%s", transaction.Space, transaction.Segment)
+			s.cache.Delete(invKey)
+			if err := s.retryInventoryUpdate(ctx, transaction.Space, transaction.Segment); err != nil {
+				return nil, err
+			}
 			if err := s.cleanupWAL(ctx, e.PartitionKey, e.RowKey); err != nil {
 				slog.ErrorContext(ctx, LogErrorWALCleanup,
 					append(transactionLogFields(transaction),
@@ -485,6 +506,10 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 						slog.String("wal_row_key", e.RowKey),
 						slog.Any("err", err))...)
 				return nil, err
+			}
+			if len(transaction.Entries) > 0 {
+				peekKey := fmt.Sprintf("peek:%s:%s", transaction.Space, transaction.Segment)
+				s.cache.Set(peekKey, transaction.Entries[len(transaction.Entries)-1])
 			}
 			return transaction, nil
 		})
@@ -597,9 +622,6 @@ func (s *AzureStore) executeTransaction(ctx context.Context, transaction *txn.Tr
 	if err := s.fanoutTransaction(ctx, transaction); err != nil {
 		return fmt.Errorf("%s: %w", ErrTransactionFanout, err)
 	}
-	if err := s.cleanupWAL(ctx, transactionEntity.PartitionKey, transactionEntity.RowKey); err != nil {
-		return fmt.Errorf("%s: %w", ErrWALCleanup, err)
-	}
 
 	// Invalidate affected caches after successful write
 	peekKey := fmt.Sprintf("peek:%s:%s", transaction.Space, transaction.Segment)
@@ -608,7 +630,14 @@ func (s *AzureStore) executeTransaction(ctx context.Context, transaction *txn.Tr
 	invKey := fmt.Sprintf("inventory:%s:%s", transaction.Space, transaction.Segment)
 	s.cache.Delete(invKey)
 
-	return s.updateInventory(ctx, transaction.Space, transaction.Segment)
+	if err := s.retryInventoryUpdate(ctx, transaction.Space, transaction.Segment); err != nil {
+		return &committedInventoryError{cause: err}
+	}
+	if err := s.cleanupWAL(ctx, transactionEntity.PartitionKey, transactionEntity.RowKey); err != nil {
+		return fmt.Errorf("%s: %w", ErrWALCleanup, err)
+	}
+
+	return nil
 }
 
 func (s *AzureStore) cleanupWAL(ctx context.Context, pk, rk string) error {
@@ -817,20 +846,10 @@ func (s *AzureStore) writeBatch(ctx context.Context, entities []client.Entity) e
 func (s *AzureStore) updateInventory(ctx context.Context, space, segment string) error {
 	cacheKey := fmt.Sprintf("inventory:%s:%s", space, segment)
 
-	// Issue #3 FIX: Use sync.Once to prevent cache stampede
-	// This ensures inventory updates are idempotent and concurrent calls use the same update
-	// Problem: non-atomic check-set pattern allowed multiple writers
-	// Solution: Use sync.Once per key (via cache.GetOrSet pattern would be better, but
-	// sync.Once per key via a separate map or a load-with-store operation)
-
 	// Fast check without lock (best effort)
 	if _, ok := s.cache.Get(cacheKey); ok {
 		return nil
 	}
-
-	// For true atomicity, we'd need a per-segment once. For now, use compare-and-set semantics:
-	// Set a sentinel in cache immediately to prevent other goroutines from entering slow path
-	s.cache.Set(cacheKey, struct{}{}) // Mark as processing
 
 	// Write segment to space-specific partition
 	segmentPK := lexkey.Encode(api.INVENTORY, api.SEGMENTS, space).ToHexString()
@@ -858,8 +877,44 @@ func (s *AzureStore) updateInventory(ctx context.Context, space, segment string)
 		return fmt.Errorf("%s: %w", ErrSpaceInventory, err)
 	}
 
-	// Cache is already set above, no need to set again
+	// Cache only after both writes succeed so a failed first attempt does not
+	// poison future retries.
+	s.cache.Set(cacheKey, struct{}{})
 	return nil
+}
+
+func (s *AzureStore) retryInventoryUpdate(ctx context.Context, space, segment string) error {
+	const maxRetryAttempts = 3
+	const initialRetryDelay = 100 * time.Millisecond
+	const maxRetryDelay = 10 * time.Second
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
+		err := s.updateInventory(ctx, space, segment)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			return err
+		}
+		lastErr = err
+		if attempt == maxRetryAttempts-1 {
+			break
+		}
+
+		backoff := initialRetryDelay * time.Duration(1<<uint(attempt))
+		if backoff > maxRetryDelay {
+			backoff = maxRetryDelay
+		}
+		jitter := time.Duration(float64(backoff) * 0.25 * float64(time.Now().UnixNano()%100) / 100.0)
+		select {
+		case <-time.After(backoff + jitter):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("failed after %d attempts: %w", maxRetryAttempts, lastErr)
 }
 
 func (s *AzureStore) waitForTasks(timeout time.Duration) bool {
@@ -882,7 +937,7 @@ func (s *AzureStore) createTableIfNotExists(ctx context.Context) error {
 		return nil
 	}
 
-	if isNotFoundError(err) || strings.Contains(err.Error(), "TableAlreadyExists") {
+	if strings.Contains(err.Error(), "TableAlreadyExists") {
 		return nil
 	}
 
@@ -1068,6 +1123,8 @@ func calculateSegmentBounds(ts int64, args *api.ConsumeSegment) struct {
 	}
 	if bounds.MaxSeq == 0 {
 		bounds.MaxSeq = math.MaxUint64
+	} else if bounds.MaxSeq < bounds.MinSeq {
+		bounds.MaxSeq = bounds.MinSeq
 	}
 	return bounds
 }

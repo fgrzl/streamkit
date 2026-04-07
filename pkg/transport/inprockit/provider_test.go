@@ -2,6 +2,7 @@ package inprockit
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,14 +34,32 @@ func (f *fakeNode) Close() {}
 
 type fakeNodeManager struct {
 	node server.Node
+	err  error
 }
 
 func (m *fakeNodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (server.Node, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	return m.node, nil
 }
 
 func (m *fakeNodeManager) Remove(ctx context.Context, storeID uuid.UUID) {}
 func (m *fakeNodeManager) Close()                                        {}
+
+type fakeReconnectListener struct {
+	calls int
+}
+
+func (l *fakeReconnectListener) OnReconnected(ctx context.Context, storeID uuid.UUID) error {
+	l.calls++
+	return nil
+}
+
+func nilContextForTest() context.Context {
+	var ctx context.Context
+	return ctx
+}
 
 func TestShouldDeliverEnvelopeToNodeWhenCallStreamInvoked(t *testing.T) {
 	// Arrange
@@ -65,4 +85,44 @@ func TestShouldDeliverEnvelopeToNodeWhenCallStreamInvoked(t *testing.T) {
 
 	// close client to let muxer cleanup if needed
 	client.Close(nil)
+}
+
+func TestShouldReturnErrorWhenNodeManagerFailsDuringCallStream(t *testing.T) {
+	expectedErr := errors.New("node create failed")
+	provider := NewInProcBidiStreamProvider(context.Background(), &fakeNodeManager{err: expectedErr})
+
+	client, err := provider.CallStream(context.Background(), uuid.New(), &api.GetSpaces{})
+
+	require.ErrorIs(t, err, expectedErr)
+	assert.Nil(t, client)
+}
+
+func TestShouldAllowNilContextWhenCallStreamInvoked(t *testing.T) {
+	fnode := &fakeNode{done: make(chan struct{})}
+	provider := NewInProcBidiStreamProvider(context.Background(), &fakeNodeManager{node: fnode})
+
+	client, err := provider.CallStream(nilContextForTest(), uuid.New(), &api.GetSpaces{})
+	require.NoError(t, err)
+
+	select {
+	case <-fnode.done:
+	case <-time.After(1 * time.Second):
+		require.FailNow(t, "timeout waiting for node to receive envelope")
+	}
+
+	require.NotNil(t, fnode.received)
+	client.Close(nil)
+}
+
+func TestShouldTreatReconnectListenerMethodsAsNoOps(t *testing.T) {
+	provider := NewInProcBidiStreamProvider(context.Background(), &fakeNodeManager{node: &fakeNode{}})
+	listener := &fakeReconnectListener{}
+
+	assert.NotPanics(t, func() {
+		provider.RegisterReconnectListener(listener)
+		provider.UnregisterReconnectListener(listener)
+		provider.RegisterReconnectListener(nil)
+		provider.UnregisterReconnectListener(nil)
+	})
+	assert.Equal(t, 0, listener.calls)
 }

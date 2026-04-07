@@ -2,6 +2,7 @@ package telemetry_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -10,8 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 type captureHandler struct {
@@ -44,6 +47,25 @@ func recordAttrs(record slog.Record) map[string]string {
 		return true
 	})
 	return attrs
+}
+
+func collectSpan(t *testing.T, fn func(oteltrace.Span)) tracetest.SpanStub {
+	t.Helper()
+
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(
+		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
+	)
+	defer tp.Shutdown(context.Background())
+
+	_, span := tp.Tracer("test").Start(context.Background(), "test_span")
+	fn(span)
+	span.End()
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	return spans[0]
 }
 
 func TestGetTracerReturnsGlobalTracer(t *testing.T) {
@@ -203,4 +225,58 @@ func TestGetMeterReturnsNonNil(t *testing.T) {
 
 	// Assert
 	require.NotNil(t, meter)
+}
+
+func TestRecordErrorSetsErrorStatusAndRecordsEvent(t *testing.T) {
+	span := collectSpan(t, func(span oteltrace.Span) {
+		telemetry.RecordError(span, errors.New("boom"))
+	})
+
+	assert.Equal(t, codes.Error, span.Status.Code)
+	assert.Equal(t, "boom", span.Status.Description)
+	require.NotEmpty(t, span.Events)
+}
+
+func TestRecordErrorIgnoresNilError(t *testing.T) {
+	span := collectSpan(t, func(span oteltrace.Span) {
+		telemetry.RecordError(span, nil)
+	})
+
+	assert.Equal(t, codes.Unset, span.Status.Code)
+	assert.Empty(t, span.Status.Description)
+	assert.Empty(t, span.Events)
+}
+
+func TestRecordErrorMsgUsesCustomMessageAndMarksOKForNilError(t *testing.T) {
+	t.Run("error", func(t *testing.T) {
+		span := collectSpan(t, func(span oteltrace.Span) {
+			telemetry.RecordErrorMsg(span, errors.New("boom"), "custom message")
+		})
+
+		assert.Equal(t, codes.Error, span.Status.Code)
+		assert.Equal(t, "custom message", span.Status.Description)
+		require.NotEmpty(t, span.Events)
+	})
+
+	t.Run("nil", func(t *testing.T) {
+		span := collectSpan(t, func(span oteltrace.Span) {
+			telemetry.RecordErrorMsg(span, nil, "ignored")
+		})
+
+		assert.Equal(t, codes.Ok, span.Status.Code)
+		assert.Empty(t, span.Status.Description)
+		assert.Empty(t, span.Events)
+	})
+}
+
+func TestSetSpanStatusOKAndAddEventUpdateSpan(t *testing.T) {
+	span := collectSpan(t, func(span oteltrace.Span) {
+		telemetry.SetSpanStatusOK(span)
+		telemetry.AddEvent(span, "checkpoint")
+	})
+
+	assert.Equal(t, codes.Ok, span.Status.Code)
+	assert.Empty(t, span.Status.Description)
+	require.Len(t, span.Events, 1)
+	assert.Equal(t, "checkpoint", span.Events[0].Name)
 }
