@@ -17,8 +17,9 @@ import (
 
 // SubscribeToSegmentStatus represents a subscription request for segment status updates.
 type SubscribeToSegmentStatus struct {
-	Space   string `json:"space"`
-	Segment string `json:"segment"`
+	Space                    string `json:"space"`
+	Segment                  string `json:"segment"`
+	HeartbeatIntervalSeconds int64  `json:"heartbeat_interval_seconds"`
 }
 
 // GetDiscriminator returns the unique message type identifier for SubscribeToSegmentStatus.
@@ -35,6 +36,7 @@ type SegmentStatus struct {
 	FirstTimestamp int64  `json:"first_timestamp"`
 	LastSequence   uint64 `json:"last_sequence"`
 	LastTimestamp  int64  `json:"last_timestamp"`
+	Heartbeat      bool   `json:"heartbeat"`
 }
 
 // GetDiscriminator returns the unique message type identifier for SegmentStatus.

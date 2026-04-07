@@ -3,6 +3,7 @@ package inprockit
 import (
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -70,4 +71,39 @@ func TestShouldCloseSendAndSignalClosed(t *testing.T) {
 	default:
 		require.Fail(t, "stream should be closed")
 	}
+}
+
+func TestShouldUnblockDecodeWhenClosedLocally(t *testing.T) {
+	stream := NewInProcBidiStream()
+	errCh := make(chan error, 1)
+
+	go func() {
+		var out string
+		errCh <- stream.Decode(&out)
+	}()
+
+	stream.Close(nil)
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, io.EOF)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for decode to unblock after close")
+	}
+}
+
+func TestShouldSignalPeerClosedWhenLocalStreamCloses(t *testing.T) {
+	client := NewInProcBidiStream()
+	server := NewInProcBidiStream()
+	LinkStreams(client, server)
+
+	client.Close(nil)
+
+	select {
+	case <-server.Closed():
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for peer closed signal")
+	}
+
+	require.ErrorIs(t, server.Encode("late message"), io.ErrClosedPipe)
 }

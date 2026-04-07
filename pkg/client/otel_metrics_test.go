@@ -17,4 +17,9 @@ func TestNewOTelClientMetrics_RecordsWithoutPanic(t *testing.T) {
 	m.RecordConsumeLatency("space", "segment", 2*time.Millisecond)
 	m.RecordHandlerTimeout("sub-id")
 	m.RecordHandlerPanic("sub-id")
+	if overload, ok := m.(interface{ RecordSubscriptionCoalesced(string) }); ok {
+		overload.RecordSubscriptionCoalesced("sub-id")
+	} else {
+		t.Fatal("NewOTelClientMetrics should expose coalescing metrics recorder")
+	}
 }

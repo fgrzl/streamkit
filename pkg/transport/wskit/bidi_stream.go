@@ -6,11 +6,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/google/uuid"
 )
+
+// controlMsgSentinel is a prefix that all muxer-level control messages must carry
+// in their Type field. Application domain objects may validly have a "type" JSON
+// field; without this prefix they would previously be silently consumed as
+// control messages and never delivered to the application.
+const controlMsgSentinel = "mux::"
 
 // MuxerBidiStream is a bidirectional stream abstraction for use with a WebSocketMuxer.
 // It is envelope-agnostic and operates on raw JSON payloads.
@@ -113,17 +120,19 @@ func (c *MuxerBidiStream) payloadFromMsg(msg any) ([]byte, error) {
 }
 
 // handleErrorMessage inspects the payload for an ErrorMessage. If the payload
-// contains a control message, it handles logging and returns (true, err) where
-// err is the appropriate error to return from Decode (or nil for EOF). If the
-// payload is not an ErrorMessage, (false, nil) is returned.
+// contains a muxer control message (type prefixed with controlMsgSentinel), it
+// handles logging and returns (true, err) where err is the appropriate error to
+// return from Decode (or nil for EOF). If the payload is not a control message,
+// (false, nil) is returned. Domain objects that happen to have a "type" JSON
+// field are not affected since they lack the controlMsgSentinel prefix.
 func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 	var errMsg ErrorMessage
-	if err := json.Unmarshal(payload, &errMsg); err != nil || errMsg.Type == "" {
+	if err := json.Unmarshal(payload, &errMsg); err != nil || !strings.HasPrefix(errMsg.Type, controlMsgSentinel) {
 		return false, nil
 	}
 
 	switch errMsg.Type {
-	case "close":
+	case controlMsgSentinel + "close":
 		if errMsg.Err != "" {
 			remoteErr := errors.New(errMsg.Err)
 			if benignDisconnect(remoteErr) {
@@ -140,7 +149,7 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 			return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
 		}
 		return true, io.EOF
-	case "error":
+	case controlMsgSentinel + "error":
 		remoteErr := errors.New(errMsg.Err)
 		slog.Warn("bidi: remote error",
 			slog.String("channel_id", c.channelID.String()),
@@ -160,7 +169,7 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 // CloseSend sends a JSON close message to the remote side.
 func (c *MuxerBidiStream) CloseSend(err error) error {
 	msg := &ErrorMessage{
-		Type: "close",
+		Type: controlMsgSentinel + "close",
 	}
 	if err != nil {
 		msg.Err = err.Error()
@@ -208,6 +217,17 @@ func (c *MuxerBidiStream) CloseLocal(err error) {
 		// Do not call CloseSend since network may be down.
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
+
+		// Drain buffered messages to prevent memory leak (mirrors Close drain).
+		for {
+			select {
+			case <-c.recvChan:
+			default:
+				goto drainDone
+			}
+		}
+	drainDone:
+
 		if c.onClose != nil {
 			c.onClose()
 		}

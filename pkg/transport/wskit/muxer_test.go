@@ -172,6 +172,39 @@ func TestHeartbeatReturnsImmediatelyWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestShouldShutdownOnHeartbeatTimeout(t *testing.T) {
+	closed := make(chan struct{})
+	m := &WebSocketMuxer{
+		Context:       context.Background(),
+		done:          make(chan struct{}),
+		channels:      make(map[uuid.UUID]*MuxerBidiStream),
+		heartbeatStop: make(chan struct{}),
+		pongTimeout:   1,
+	}
+
+	stream := NewMuxerBidiStream(func([]byte) error { return nil }, func() {
+		select {
+		case <-closed:
+		default:
+			close(closed)
+		}
+	})
+	channelID := uuid.New()
+	m.channels[channelID] = stream
+	atomic.StoreInt64(&m.lastPongUnix, 0)
+
+	assert.True(t, m.checkHeartbeatTimeout())
+	assert.Equal(t, int64(1), m.MissedPongs())
+
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for stream to close after heartbeat timeout")
+	}
+
+	assert.True(t, stream.IsClosed())
+}
+
 func TestShouldShutdownOnSendDataError(t *testing.T) {
 	// Arrange
 	m := &WebSocketMuxer{
@@ -313,8 +346,7 @@ func TestMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {
 // on a muxer that has already been shut down returns a stream that immediately
 // fails on Encode with ErrMuxerClosed, rather than creating an orphaned entry
 // in the channels map.
-func TestRegisterOnClosedMuxerReturnsFailingStream(t *testing.T) {
-	// Arrange
+func TestRegisterOnClosedMuxerReturnsFailingStream(t *testing.T) { // Arrange
 	done := make(chan struct{})
 	close(done) // muxer is already shut down
 	m := &WebSocketMuxer{
@@ -339,4 +371,48 @@ func TestRegisterOnClosedMuxerReturnsFailingStream(t *testing.T) {
 	_, exists := m.channels[channelID]
 	m.channelsMu.RUnlock()
 	assert.False(t, exists, "Register on closed muxer should not add stream to channels map")
+}
+
+func TestShutdownWithOpenStreamDoesNotDeadlock(t *testing.T) {
+	// Arrange: a muxer with a real registered stream whose cleanup acquires channelsMu.Lock.
+	m := &WebSocketMuxer{
+		Context:        context.Background(),
+		name:           "test",
+		done:           make(chan struct{}),
+		channels:       make(map[uuid.UUID]*MuxerBidiStream),
+		heartbeatStop:  make(chan struct{}),
+		writeQueueSize: 16,
+		writeQueue:     make(chan *MuxerMsg, 16),
+		msgPool:        sync.Pool{New: func() any { return &MuxerMsg{} }},
+		bufPool:        sync.Pool{New: func() any { return make([]byte, 0, 1024) }},
+		writerDone:     make(chan struct{}),
+		sendJSON:       func(_ *websocket.Conn, _ interface{}) error { return nil },
+	}
+	go m.writePump()
+	// register via the normal path so the cleanup closure is the real one
+	storeID := uuid.New()
+	channelID := uuid.New()
+	stream := m.register(context.Background(), storeID, channelID)
+	require.NotNil(t, stream)
+
+	// Act: shutdown must complete without deadlocking
+	done := make(chan struct{})
+	go func() {
+		m.shutdown(nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// success: shutdown returned
+	case <-time.After(time.Second):
+		t.Fatal("shutdown deadlocked with an open stream")
+	}
+
+	// Assert: stream is closed and removed
+	assert.True(t, stream.IsClosed(), "expected stream to be closed after shutdown")
+	m.channelsMu.RLock()
+	_, exists := m.channels[channelID]
+	m.channelsMu.RUnlock()
+	assert.False(t, exists, "expected channel to be removed after shutdown")
 }

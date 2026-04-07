@@ -45,6 +45,10 @@ func NewOTelClientMetrics() ClientMetrics {
 		"streamkit.client.subscription.handler.panic.total",
 		metric.WithDescription("Subscription handler panic count"),
 	)
+	coalescedTotal, _ := meter.Int64Counter(
+		"streamkit.client.subscription.coalesced.total",
+		metric.WithDescription("Subscription updates coalesced while handlers were saturated"),
+	)
 	return &otelClientMetrics{
 		produceLatency:      produceLatency,
 		consumeLatency:      consumeLatency,
@@ -53,6 +57,7 @@ func NewOTelClientMetrics() ClientMetrics {
 		replayDuration:      replayDuration,
 		handlerTimeoutTotal: handlerTimeoutTotal,
 		handlerPanicTotal:   handlerPanicTotal,
+		coalescedTotal:      coalescedTotal,
 	}
 }
 
@@ -64,6 +69,7 @@ type otelClientMetrics struct {
 	replayDuration      metric.Float64Histogram
 	handlerTimeoutTotal metric.Int64Counter
 	handlerPanicTotal   metric.Int64Counter
+	coalescedTotal      metric.Int64Counter
 }
 
 func (o *otelClientMetrics) RecordProduceLatency(space, segment string, duration time.Duration) {
@@ -110,5 +116,11 @@ func (o *otelClientMetrics) RecordHandlerTimeout(id string) {
 func (o *otelClientMetrics) RecordHandlerPanic(id string) {
 	if o.handlerPanicTotal != nil {
 		o.handlerPanicTotal.Add(context.Background(), 1)
+	}
+}
+
+func (o *otelClientMetrics) RecordSubscriptionCoalesced(id string) {
+	if o.coalescedTotal != nil {
+		o.coalescedTotal.Add(context.Background(), 1)
 	}
 }

@@ -91,6 +91,7 @@ type WebSocketMuxer struct {
 	pongsReceived int64
 	missedPongs   int64
 	writeErrors   int64
+	activeStreams int64 // number of streams currently registered (in-flight)
 	logger        *slog.Logger
 	rng           *rand.Rand
 	// JSON send/receive hooks (set to websocket.JSON.Send/Receive by default).
@@ -269,6 +270,7 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 	}
 
 	cleanup := func() {
+		atomic.AddInt64(&m.activeStreams, -1)
 		m.channelsMu.Lock()
 		defer m.channelsMu.Unlock()
 		delete(m.channels, channelID)
@@ -280,6 +282,8 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 	m.channelsMu.Lock()
 	m.channels[channelID] = bidi
 	m.channelsMu.Unlock()
+
+	atomic.AddInt64(&m.activeStreams, 1)
 
 	return bidi
 }
@@ -511,7 +515,7 @@ func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, chan
 	if m.session.CanAccessStore(storeID) {
 		return true
 	}
-	payload, err := json.Marshal(&ErrorMessage{Type: "err", Err: "access denied"})
+	payload, err := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "err", Err: "access denied"})
 	if err != nil {
 		slog.WarnContext(ctx, "muxer: marshal access-denied error failed",
 			m.logFields(ctx, slog.String("store_id", storeID.String()), "err", err)...)
@@ -553,7 +557,7 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 		slog.ErrorContext(ctx, "muxer: failed to get or create node",
 			m.msgLogFields(msg,
 				slog.String("err", err.Error()))...)
-		payload, marshalErr := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
+		payload, marshalErr := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "error", Err: "store unavailable"})
 		if marshalErr != nil {
 			slog.WarnContext(ctx, "muxer: marshal store-unavailable error failed",
 				m.msgLogFields(msg, "err", marshalErr)...)
@@ -980,17 +984,40 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 		}
 		// m.done already closed above to prevent races with writers
 
-		// close streams locally
+		// Snapshot channels under read lock, then close outside the lock.
+		// Holding RLock while calling CloseLocal would deadlock because CloseLocal
+		// triggers the cleanup closure which acquires channelsMu.Lock (not reentrant).
 		m.channelsMu.RLock()
+		streams := make([]*MuxerBidiStream, 0, len(m.channels))
 		for _, s := range m.channels {
+			streams = append(streams, s)
+		}
+		m.channelsMu.RUnlock()
+
+		for _, s := range streams {
 			if reason != nil {
 				s.CloseLocal(reason)
 			} else {
 				s.CloseLocal(nil)
 			}
 		}
-		m.channelsMu.RUnlock()
 	})
+}
+
+// Close shuts down the muxer. It satisfies the providerMuxer interface and
+// delegates to shutdown so callers need not type-assert to *WebSocketMuxer.
+// Before shutting down it waits (up to 1 s) for any in-flight streams to
+// complete, replacing the heuristic 500 ms sleep in replaceMuxer/invalidateMuxer.
+func (m *WebSocketMuxer) Close(err error) {
+	// Wait for in-flight streams to finish. Poll every 10 ms, bail after 1 s.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&m.activeStreams) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	m.shutdown(err)
 }
 
 // Metrics accessors (atomic snapshots)

@@ -356,6 +356,10 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
+	if args.HeartbeatIntervalSeconds > 0 {
+		go n.streamSubscriptionHeartbeats(ctx, args, bidi)
+	}
+
 	// Clean up on bidi close or context cancellation
 	// Issue #6 FIX: Add panic recovery to cleanup goroutine
 	go func() {
@@ -376,6 +380,43 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 			bidi.Close(ctx.Err())
 		}
 	}()
+}
+
+func (n *defaultNode) streamSubscriptionHeartbeats(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
+	interval := time.Duration(args.HeartbeatIntervalSeconds) * time.Second
+	if interval <= 0 {
+		return
+	}
+
+	sendHeartbeat := func() error {
+		return bidi.Encode(&api.SegmentStatus{
+			Space:     args.Space,
+			Segment:   args.Segment,
+			Heartbeat: true,
+		})
+	}
+
+	if err := sendHeartbeat(); err != nil {
+		bidi.Close(err)
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-bidi.Closed():
+			return
+		case <-ticker.C:
+			if err := sendHeartbeat(); err != nil {
+				bidi.Close(err)
+				return
+			}
+		}
+	}
 }
 
 func (n *defaultNode) getBus(ctx context.Context) bus.MessageBus {

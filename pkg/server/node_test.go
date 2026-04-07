@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/bus"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -72,13 +74,58 @@ func (m *mockStore) Produce(ctx context.Context, args *api.Produce, entries enum
 }
 func (m *mockStore) Close() {}
 
-// (no message bus mocks here; tests avoid configuring a bus factory)
+type mockBusSubscription struct {
+	unsubscribed atomic.Bool
+}
+
+func (s *mockBusSubscription) Unsubscribe() error {
+	s.unsubscribed.Store(true)
+	return nil
+}
+
+type mockMessageBus struct {
+	route        bus.Route
+	handler      bus.MessageHandler
+	subscription *mockBusSubscription
+}
+
+func (b *mockMessageBus) Notify(msg bus.Message) error {
+	return nil
+}
+
+func (b *mockMessageBus) NotifyWithContext(ctx context.Context, msg bus.Message) error {
+	return nil
+}
+
+func (b *mockMessageBus) Subscribe(route bus.Route, handler bus.MessageHandler) (bus.Subscription, error) {
+	b.route = route
+	b.handler = handler
+	if b.subscription == nil {
+		b.subscription = &mockBusSubscription{}
+	}
+	return b.subscription, nil
+}
+
+func (b *mockMessageBus) Close() error {
+	return nil
+}
+
+type mockMessageBusFactory struct {
+	bus bus.MessageBus
+	err error
+}
+
+func (f *mockMessageBusFactory) Get(ctx context.Context) (bus.MessageBus, error) {
+	return f.bus, f.err
+}
 
 // mock bidi stream used to drive Node.Handle
 type mockBidi struct {
 	// decodeEnvelope will be returned on the first Decode call
 	decodeEnvelope *polymorphic.Envelope
 	encoded        []any
+	encodedCh      chan any
+	encodeErr      error
 	closed         chan struct{}
 	closeErr       error
 	closeSendErr   error
@@ -98,7 +145,16 @@ func waitForClosed(t *testing.T, bidi api.BidiStream) {
 }
 
 func (m *mockBidi) Encode(msg any) error {
+	if m.encodeErr != nil {
+		return m.encodeErr
+	}
 	m.encoded = append(m.encoded, msg)
+	if m.encodedCh != nil {
+		select {
+		case m.encodedCh <- msg:
+		default:
+		}
+	}
 	return nil
 }
 func (m *mockBidi) Decode(v any) error {
@@ -306,6 +362,60 @@ func TestSubscribeNoBusConfigured(t *testing.T) {
 
 	// Assert
 	require.Error(t, bidi.closeSendErr, "expected CloseSend with error when bus factory is nil")
+}
+
+func TestSubscribeEmitsHeartbeats(t *testing.T) {
+	store := &mockStore{}
+	messageBus := &mockMessageBus{}
+	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	env := &polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:                    "s",
+		Segment:                  "*",
+		HeartbeatIntervalSeconds: 1,
+	}}
+	bidi := newMockBidi(env)
+	bidi.encodedCh = make(chan any, 4)
+
+	node.Handle(ctx, bidi)
+
+	select {
+	case msg := <-bidi.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok, "expected SegmentStatus heartbeat")
+		require.True(t, status.Heartbeat)
+		require.Equal(t, "s", status.Space)
+		require.Equal(t, "*", status.Segment)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscription heartbeat")
+	}
+
+	cancel()
+	waitForClosed(t, bidi)
+	require.NotNil(t, messageBus.subscription)
+	require.True(t, messageBus.subscription.unsubscribed.Load())
+}
+
+func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
+	store := &mockStore{}
+	messageBus := &mockMessageBus{}
+	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
+
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:                    "s",
+		Segment:                  "*",
+		HeartbeatIntervalSeconds: 1,
+	}})
+	bidi.encodeErr = errors.New("encode failed")
+
+	node.Handle(context.Background(), bidi)
+
+	waitForClosed(t, bidi)
+	require.ErrorContains(t, bidi.closeErr, "encode failed")
+	require.Eventually(t, func() bool {
+		return messageBus.subscription != nil && messageBus.subscription.unsubscribed.Load()
+	}, time.Second, 10*time.Millisecond)
 }
 
 // (removed failingBusFactory - not used)

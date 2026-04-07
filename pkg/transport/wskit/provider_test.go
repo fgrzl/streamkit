@@ -3,6 +3,7 @@ package wskit
 import (
 	"context"
 	"errors"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -153,6 +154,52 @@ func TestCallStreamRetriesOnMuxerClosed(t *testing.T) {
 	_ = b.Close
 }
 
+func TestCallStreamRetriesOnBenignDisconnect(t *testing.T) {
+	// Arrange
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+
+	var failingEncodeCount int32
+	failing := &testBidi{
+		encodeFn: func(m any) error {
+			atomic.AddInt32(&failingEncodeCount, 1)
+			p.mu.Lock()
+			p.muxer = nil
+			p.mu.Unlock()
+			return io.EOF
+		},
+	}
+
+	var encodeSucceeded atomic.Bool
+	succeeded := &testBidi{}
+	succeeded.encodeFn = func(m any) error {
+		encodeSucceeded.Store(true)
+		return nil
+	}
+
+	failingMux := &fakeMuxer{pingFn: func() bool { return true }, bidi: failing}
+	succeedingMux := &fakeMuxer{pingFn: func() bool { return true }, bidi: succeeded}
+
+	p.mu.Lock()
+	p.muxer = failingMux
+	p.mu.Unlock()
+
+	p.dialFn = func() (*websocket.Conn, error) { return nil, nil }
+	p.newClientMuxer = func(ctx context.Context, session MuxerSession, conn *websocket.Conn) providerMuxer {
+		return succeedingMux
+	}
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	b, err := p.CallStream(ctx, uuid.New(), &api.GetStatus{})
+
+	// Assert
+	require.NoError(t, err)
+	assert.True(t, encodeSucceeded.Load(), "expected Encode to succeed after benign disconnect reconnect")
+	_ = b.Close
+}
+
 // testBidi implements api.BidiStream for tests
 type testBidi struct {
 	encodeFn func(any) error
@@ -216,12 +263,26 @@ func TestShouldRetryAuthErrorsWhenRetryAuthFailuresEnabled(t *testing.T) {
 
 // fakeMuxer implements providerMuxer for tests
 type fakeMuxer struct {
-	pingFn func() bool
-	bidi   api.BidiStream
+	pingFn     func() bool
+	bidi       api.BidiStream
+	closeCalls int32
 }
 
 func (f *fakeMuxer) Ping() bool                                   { return f.pingFn() }
 func (f *fakeMuxer) Register(uuid.UUID, uuid.UUID) api.BidiStream { return f.bidi }
 func (f *fakeMuxer) RegisterWithContext(context.Context, uuid.UUID, uuid.UUID) api.BidiStream {
 	return f.bidi
+}
+func (f *fakeMuxer) Close(_ error) { atomic.AddInt32(&f.closeCalls, 1) }
+
+func TestCloseMuxerClosesArbitraryProviderMuxer(t *testing.T) {
+	// Arrange
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	fake := &fakeMuxer{pingFn: func() bool { return true }}
+
+	// Act
+	p.closeMuxer(fake)
+
+	// Assert
+	assert.Equal(t, int32(1), atomic.LoadInt32(&fake.closeCalls), "expected Close to be called once on any providerMuxer")
 }
