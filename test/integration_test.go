@@ -44,7 +44,7 @@ func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 
 	router := mux.NewRouter()
 
-	mux.UseAuthentication(router, mux.WithValidator(validator.Validate))
+	mux.UseAuthentication(router, mux.WithAuthValidator(validator.Validate))
 
 	mux.UseAuthorization(router)
 
