@@ -116,8 +116,13 @@ func (m *mockProvider) GetListeners() []api.ReconnectListener {
 var _ api.BidiStreamProvider = (*mockProvider)(nil)
 
 type testClientMetrics struct {
-	handlerTimeouts atomic.Int32
-	handlerPanics   atomic.Int32
+	handlerTimeouts    atomic.Int32
+	handlerPanics      atomic.Int32
+	reconnectDepth     atomic.Int64
+	reconnectMaxDepth  atomic.Int64
+	reconnectBlocked   atomic.Int32
+	reconnectWaitCount atomic.Int32
+	reconnectMaxWaitNs atomic.Int64
 }
 
 func (m *testClientMetrics) RecordProduceLatency(space, segment string, duration time.Duration) {}
@@ -133,6 +138,53 @@ func (m *testClientMetrics) RecordHandlerTimeout(id string) {
 
 func (m *testClientMetrics) RecordHandlerPanic(id string) {
 	m.handlerPanics.Add(1)
+}
+
+func (m *testClientMetrics) RecordReconnectQueueDepth(depth int) {
+	value := int64(depth)
+	m.reconnectDepth.Store(value)
+	for {
+		current := m.reconnectMaxDepth.Load()
+		if value <= current || m.reconnectMaxDepth.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func (m *testClientMetrics) RecordReconnectQueueBlocked(duration time.Duration) {
+	m.reconnectBlocked.Add(1)
+	m.RecordReconnectQueueWait(duration)
+}
+
+func (m *testClientMetrics) RecordReconnectQueueWait(duration time.Duration) {
+	m.reconnectWaitCount.Add(1)
+	value := duration.Nanoseconds()
+	for {
+		current := m.reconnectMaxWaitNs.Load()
+		if value <= current || m.reconnectMaxWaitNs.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func newTestClientWithQueue(provider api.BidiStreamProvider, metrics ClientMetrics, queueSize int) *client {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &client{
+		provider:              provider,
+		policy:                DefaultRetryPolicy(),
+		handlerTimeout:        30 * time.Second,
+		maxConcurrentHandlers: 50,
+		subscriptions:         make(map[string]*activeSubscription),
+		reconnectQueue:        make(chan *reconnectRequest, queueSize),
+		reconnectDone:         make(chan struct{}),
+		reconnectCtx:          ctx,
+		reconnectCancel:       cancel,
+		produceLocks:          make(map[string]*sync.Mutex),
+		metrics:               metrics,
+	}
+	c.startReconnectDispatcher()
+	provider.RegisterReconnectListener(c)
+	return c
 }
 
 func withSubscriptionHeartbeatTiming(interval, timeout time.Duration, fn func()) {
@@ -652,6 +704,121 @@ func TestReconnectFailureBackoffDoesNotBlockOtherSubscriptions(t *testing.T) {
 	cancel()
 	badSub.Unsubscribe()
 	goodSub.Unsubscribe()
+}
+
+func TestReconnectQueueMetricsTrackDepthAndBlockedEnqueue(t *testing.T) {
+	firstCallStarted := make(chan struct{})
+	releaseFirstCall := make(chan struct{})
+	metrics := &testClientMetrics{}
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			select {
+			case <-firstCallStarted:
+			default:
+				close(firstCallStarted)
+				<-releaseFirstCall
+			}
+
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return stream, nil
+		},
+	}
+
+	c := newTestClientWithQueue(provider, metrics, 1)
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	subs := make([]api.Subscription, 0, 3)
+	for i := range 3 {
+		sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", fmt.Sprintf("seg-%d", i), func(*SegmentStatus) {})
+		require.NoError(t, err)
+		subs = append(subs, sub)
+	}
+
+	select {
+	case <-firstCallStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for the reconnect dispatcher to start its first call")
+	}
+
+	require.Eventually(t, func() bool {
+		return metrics.reconnectMaxDepth.Load() >= 1
+	}, time.Second, 10*time.Millisecond)
+
+	close(releaseFirstCall)
+
+	require.Eventually(t, func() bool {
+		return metrics.reconnectBlocked.Load() >= 1 && c.reconnectBlocks.Load() >= 1
+	}, time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, int64(1), metrics.reconnectMaxDepth.Load())
+
+	cancel()
+	for _, sub := range subs {
+		sub.Unsubscribe()
+	}
+}
+
+func TestReconnectQueueMetricsRecordDispatcherWait(t *testing.T) {
+	firstCallStarted := make(chan struct{})
+	releaseFirstCall := make(chan struct{})
+	metrics := &testClientMetrics{}
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			select {
+			case <-firstCallStarted:
+			default:
+				close(firstCallStarted)
+				<-releaseFirstCall
+			}
+
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return stream, nil
+		},
+	}
+
+	c := newTestClientWithQueue(provider, metrics, 2)
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	firstSub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "seg-a", func(*SegmentStatus) {})
+	require.NoError(t, err)
+
+	select {
+	case <-firstCallStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for the reconnect dispatcher to stall on the first request")
+	}
+
+	secondSub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "seg-b", func(*SegmentStatus) {})
+	require.NoError(t, err)
+
+	time.Sleep(50 * time.Millisecond)
+	close(releaseFirstCall)
+
+	require.Eventually(t, func() bool {
+		return metrics.reconnectWaitCount.Load() >= 2 && time.Duration(metrics.reconnectMaxWaitNs.Load()) >= 40*time.Millisecond
+	}, time.Second, 10*time.Millisecond)
+
+	assert.GreaterOrEqual(t, c.reconnectDepth.Load(), int64(0))
+
+	cancel()
+	firstSub.Unsubscribe()
+	secondSub.Unsubscribe()
 }
 
 // TestHealthStatusTracking tests Issue 4: Silent subscription failures detection

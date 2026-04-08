@@ -198,7 +198,8 @@ type activeSubscription struct {
 
 // reconnectRequest is sent by a subscription goroutine to enqueue itself for reconnection.
 type reconnectRequest struct {
-	sub *activeSubscription
+	sub        *activeSubscription
+	enqueuedAt time.Time
 }
 
 // ClientMetrics provides instrumentation hooks for external observability systems.
@@ -215,6 +216,12 @@ type subscriptionOverloadMetrics interface {
 	RecordSubscriptionCoalesced(id string)
 }
 
+type reconnectQueueMetrics interface {
+	RecordReconnectQueueDepth(depth int)
+	RecordReconnectQueueBlocked(duration time.Duration)
+	RecordReconnectQueueWait(duration time.Duration)
+}
+
 type client struct {
 	provider              api.BidiStreamProvider
 	policy                RetryPolicy
@@ -228,6 +235,8 @@ type client struct {
 	// Single-threaded reconnection: subscription goroutines enqueue themselves here
 	// and a single dispatcher loop calls CallStream serially for each one.
 	reconnectQueue  chan *reconnectRequest
+	reconnectDepth  atomic.Int64
+	reconnectBlocks atomic.Int64
 	reconnectLoop   sync.Once
 	reconnectDone   chan struct{}
 	reconnectCtx    context.Context
@@ -564,6 +573,26 @@ func (c *client) signalSubscriptionMailbox(sub *activeSubscription) {
 func (c *client) recordSubscriptionCoalesced(id string) {
 	if recorder, ok := c.metrics.(subscriptionOverloadMetrics); ok {
 		recorder.RecordSubscriptionCoalesced(id)
+	}
+}
+
+func (c *client) recordReconnectQueueDepth(depth int) {
+	c.reconnectDepth.Store(int64(depth))
+	if recorder, ok := c.metrics.(reconnectQueueMetrics); ok {
+		recorder.RecordReconnectQueueDepth(depth)
+	}
+}
+
+func (c *client) recordReconnectQueueBlocked(duration time.Duration) {
+	c.reconnectBlocks.Add(1)
+	if recorder, ok := c.metrics.(reconnectQueueMetrics); ok {
+		recorder.RecordReconnectQueueBlocked(duration)
+	}
+}
+
+func (c *client) recordReconnectQueueWait(duration time.Duration) {
+	if recorder, ok := c.metrics.(reconnectQueueMetrics); ok {
+		recorder.RecordReconnectQueueWait(duration)
 	}
 }
 
@@ -1275,10 +1304,21 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 			if !waitForSubscriptionReconnect(subCtx, activeSub) {
 				return
 			}
+			req := &reconnectRequest{sub: activeSub, enqueuedAt: time.Now()}
 			select {
 			case <-subCtx.Done():
 				return
-			case c.reconnectQueue <- &reconnectRequest{sub: activeSub}:
+			case c.reconnectQueue <- req:
+				c.recordReconnectQueueDepth(len(c.reconnectQueue))
+			default:
+				blockedAt := time.Now()
+				select {
+				case <-subCtx.Done():
+					return
+				case c.reconnectQueue <- req:
+					c.recordReconnectQueueBlocked(time.Since(blockedAt))
+					c.recordReconnectQueueDepth(len(c.reconnectQueue))
+				}
 			}
 
 			// Wait for the dispatcher to hand us a stream (or cancellation).
@@ -1474,6 +1514,10 @@ func (c *client) startReconnectDispatcher() {
 					}
 
 					sub := req.sub
+					if !req.enqueuedAt.IsZero() {
+						c.recordReconnectQueueWait(time.Since(req.enqueuedAt))
+					}
+					c.recordReconnectQueueDepth(len(c.reconnectQueue))
 					replayStart := time.Now()
 
 					// Skip if subscription was canceled while waiting in queue
