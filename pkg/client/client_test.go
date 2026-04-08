@@ -1965,6 +1965,66 @@ func TestResilienceEnumeratorResumesConsumeSpace(t *testing.T) {
 	}
 }
 
+func TestResilienceEnumeratorResumesConsume(t *testing.T) {
+	var calls int
+	var capturedArgs []api.Routeable
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			calls++
+			capturedArgs = append(capturedArgs, routeable)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			first := true
+			stream.decodeFn = func(m any) error {
+				switch v := m.(type) {
+				case *api.Entry:
+					if first {
+						first = false
+						*v = api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
+						return nil
+					}
+				case **api.Entry:
+					if first {
+						first = false
+						*v = &api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
+						return nil
+					}
+				}
+				return errors.New("simulated disconnect")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+	args := &Consume{
+		Offsets: map[string]lexkey.LexKey{
+			"spaceX": {},
+		},
+	}
+	enum := c.Consume(ctx, storeID, args)
+	defer enum.Dispose()
+
+	assert.True(t, enum.MoveNext())
+	entry, err := enum.Current()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), entry.Sequence)
+
+	_ = enum.MoveNext()
+
+	require.GreaterOrEqual(t, calls, 2)
+	if consumeArgs, ok := capturedArgs[len(capturedArgs)-1].(*api.Consume); ok {
+		expected := entry.GetSpaceOffset()
+		require.Contains(t, consumeArgs.Offsets, "spaceX")
+		assert.Equal(t, expected, consumeArgs.Offsets["spaceX"])
+		assert.NotContains(t, consumeArgs.Offsets, "spaceX/segX")
+	} else {
+		t.Fatalf("expected Consume, got %T", capturedArgs[len(capturedArgs)-1])
+	}
+}
+
 func TestProduceLockEviction(t *testing.T) {
 	prev := MaxProduceLocks
 	MaxProduceLocks = 100 // shrink for test

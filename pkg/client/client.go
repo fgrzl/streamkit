@@ -826,11 +826,10 @@ func (e *resilienceEnumerator) updateConsumePosition() {
 			args.MinTimestamp = e.lastEntry.Timestamp + 1
 		}
 	case *api.Consume:
-		// For Consume (multi-space), update offset map with last seen position
-		// If Offsets map exists, update the specific space/segment pair
+		// For Consume (multi-space), update the per-space offset so the next stream
+		// resumes strictly after the last delivered entry in that space.
 		if e.lastEntry != nil && args.Offsets != nil {
-			offsetKey := e.lastEntry.Space + "/" + e.lastEntry.Segment
-			args.Offsets[offsetKey] = lexkey.Encode(e.lastEntry.Sequence + 1)
+			args.Offsets[e.lastEntry.Space] = e.lastEntry.GetSpaceOffset()
 		}
 	}
 }
@@ -856,8 +855,7 @@ func (e *resilienceEnumerator) updateArgsWithOffset() api.Routeable {
 		if newArgs.Offsets == nil {
 			newArgs.Offsets = make(map[string]lexkey.LexKey)
 		}
-		offsetKey := e.lastEntry.Space + "/" + e.lastEntry.Segment
-		newArgs.Offsets[offsetKey] = lexkey.Encode(e.lastEntry.Timestamp, e.lastEntry.Space, e.lastEntry.Segment, e.lastEntry.Sequence)
+		newArgs.Offsets[e.lastEntry.Space] = e.lastEntry.GetSpaceOffset()
 		return &newArgs
 	}
 
