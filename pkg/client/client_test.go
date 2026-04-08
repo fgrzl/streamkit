@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
