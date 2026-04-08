@@ -155,7 +155,7 @@ func TestLocalWebSocketChaosSoak(t *testing.T) {
 	producerWG.Add(1)
 	go func() {
 		defer producerWG.Done()
-		runLocalChaosProducerLoop(producerCtx, writerClient, storeID, targets, state, errCh)
+		runLocalChaosProducerLoop(producerCtx, writerClient, storeID, targets, state)
 	}()
 
 	consumerWG.Add(1)
@@ -538,7 +538,6 @@ func runLocalChaosProducerLoop(
 		segment string
 	},
 	state *localChaosSoakState,
-	errCh chan<- error,
 ) {
 	idx := 0
 	for ctx.Err() == nil {
