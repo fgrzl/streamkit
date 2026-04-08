@@ -17,15 +17,16 @@ import (
 
 func newQueueTestMuxer(queueSize int) *WebSocketMuxer {
 	return &WebSocketMuxer{
-		Context:        context.Background(),
-		name:           "test",
-		done:           make(chan struct{}),
-		writeQueueSize: queueSize,
-		writeQueue:     make(chan *MuxerMsg, queueSize),
-		msgPool:        sync.Pool{New: func() any { return &MuxerMsg{} }},
-		bufPool:        sync.Pool{New: func() any { return make([]byte, 0, 1024) }},
-		writerDone:     make(chan struct{}),
-		sendJSON:       func(_ *websocket.Conn, _ interface{}) error { return nil },
+		Context:                context.Background(),
+		name:                   "test",
+		done:                   make(chan struct{}),
+		writeQueueSize:         queueSize,
+		writeQueueOfferTimeout: defaultWriteQueueOfferTimeout,
+		writeQueue:             make(chan *MuxerMsg, queueSize),
+		msgPool:                sync.Pool{New: func() any { return &MuxerMsg{} }},
+		bufPool:                sync.Pool{New: func() any { return make([]byte, 0, 1024) }},
+		writerDone:             make(chan struct{}),
+		sendJSON:               func(_ *websocket.Conn, _ interface{}) error { return nil },
 	}
 }
 
@@ -300,10 +301,76 @@ func TestShouldCountControlQueueSaturationWarningsWhenFallbackPersists(t *testin
 
 func TestShouldCountPingQueueFallbackWhenQueueIsFull(t *testing.T) {
 	m := newQueueTestMuxer(1)
+	m.writeQueueOfferTimeout = 5 * time.Millisecond
 
 	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("seed"), nil))
 	require.NoError(t, m.sendPing())
 
+	assert.Equal(t, int64(1), m.WriteQueueBlocks())
+	assert.Equal(t, int64(1), m.WriteQueueFallbacks())
+	assert.Equal(t, int64(1), m.WriteQueueDepth())
+}
+
+func TestShouldBlockBrieflyAndEnqueueWhenQueueDrainsBeforeTimeout(t *testing.T) {
+	m := newQueueTestMuxer(1)
+	m.writeQueueOfferTimeout = 75 * time.Millisecond
+
+	releaseSend := make(chan struct{})
+	sendCalls := atomic.Int32{}
+	m.sendJSON = func(_ *websocket.Conn, _ interface{}) error {
+		if sendCalls.Add(1) == 1 {
+			<-releaseSend
+		}
+		return nil
+	}
+
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("first"), nil))
+
+	errCh := make(chan error, 1)
+	durationCh := make(chan time.Duration, 1)
+	go func() {
+		started := time.Now()
+		errCh <- m.sendData(uuid.New(), uuid.New(), []byte("second"), nil)
+		durationCh <- time.Since(started)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	go m.writePump()
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for blocked enqueue to complete")
+	}
+
+	blockedFor := <-durationCh
+	assert.GreaterOrEqual(t, blockedFor, 20*time.Millisecond)
+	assert.Equal(t, int64(1), m.WriteQueueBlocks())
+	assert.Equal(t, int64(0), m.WriteQueueFallbacks())
+	assert.Equal(t, int64(1), m.WriteQueueDepth())
+
+	close(releaseSend)
+	m.shutdown(nil)
+	select {
+	case <-m.writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for writer to stop")
+	}
+}
+
+func TestShouldFallbackAfterBoundedQueueWaitExpires(t *testing.T) {
+	m := newQueueTestMuxer(1)
+	m.writeQueueOfferTimeout = 25 * time.Millisecond
+
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("first"), nil))
+
+	started := time.Now()
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("second"), nil))
+	blockedFor := time.Since(started)
+
+	assert.GreaterOrEqual(t, blockedFor, 20*time.Millisecond)
+	assert.Equal(t, int64(1), m.WriteQueueBlocks())
 	assert.Equal(t, int64(1), m.WriteQueueFallbacks())
 	assert.Equal(t, int64(1), m.WriteQueueDepth())
 }

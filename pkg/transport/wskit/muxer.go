@@ -71,12 +71,13 @@ type WebSocketMuxer struct {
 	closeOnce   sync.Once
 
 	// outbound write pump
-	writeQueue     chan *MuxerMsg
-	writeQueueSize int
-	queueMetrics   *telemetry.WSKitQueueMetrics
-	msgPool        sync.Pool
-	bufPool        sync.Pool
-	writerDone     chan struct{}
+	writeQueue             chan *MuxerMsg
+	writeQueueSize         int
+	writeQueueOfferTimeout time.Duration
+	queueMetrics           *telemetry.WSKitQueueMetrics
+	msgPool                sync.Pool
+	bufPool                sync.Pool
+	writerDone             chan struct{}
 
 	// Heartbeat configuration (seconds)
 	pingInterval  int64
@@ -93,6 +94,7 @@ type WebSocketMuxer struct {
 	missedPongs                  int64
 	writeErrors                  int64
 	activeStreams                int64 // number of streams currently registered (in-flight)
+	writeQueueBlocks             int64
 	writeQueueDepth              int64
 	writeQueueFallbacks          int64
 	writeQueueSaturationStreak   int64
@@ -114,6 +116,7 @@ var (
 const (
 	writeQueueSaturationWarnThreshold int64 = 32
 	writeQueueSaturationWarnEvery     int64 = 256
+	defaultWriteQueueOfferTimeout           = 5 * time.Millisecond
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -122,19 +125,20 @@ const (
 func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *websocket.Conn) *WebSocketMuxer {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:       ctx,
-		session:       session,
-		name:          "client",
-		conn:          conn,
-		channels:      make(map[uuid.UUID]*MuxerBidiStream),
-		done:          make(chan struct{}),
-		pingInterval:  30,
-		pongTimeout:   90,
-		pingJitter:    5,
-		lastPongUnix:  timestamp.GetTimestamp(),
-		heartbeatStop: make(chan struct{}),
-		cancelFunc:    cancel,
-		queueMetrics:  telemetry.NewWSKitQueueMetrics(),
+		Context:                ctx,
+		session:                session,
+		name:                   "client",
+		conn:                   conn,
+		channels:               make(map[uuid.UUID]*MuxerBidiStream),
+		done:                   make(chan struct{}),
+		pingInterval:           30,
+		pongTimeout:            90,
+		pingJitter:             5,
+		lastPongUnix:           timestamp.GetTimestamp(),
+		heartbeatStop:          make(chan struct{}),
+		cancelFunc:             cancel,
+		writeQueueOfferTimeout: defaultWriteQueueOfferTimeout,
+		queueMetrics:           telemetry.NewWSKitQueueMetrics(),
 	}
 
 	// write pump defaults
@@ -165,20 +169,21 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeManager server.NodeManager, conn *websocket.Conn) {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:       cctx,
-		session:       session,
-		name:          "server",
-		conn:          conn,
-		nodeManager:   nodeManager,
-		channels:      make(map[uuid.UUID]*MuxerBidiStream),
-		done:          make(chan struct{}),
-		pingInterval:  30,
-		pongTimeout:   90,
-		pingJitter:    5,
-		lastPongUnix:  timestamp.GetTimestamp(),
-		heartbeatStop: make(chan struct{}),
-		cancelFunc:    cancel,
-		queueMetrics:  telemetry.NewWSKitQueueMetrics(),
+		Context:                cctx,
+		session:                session,
+		name:                   "server",
+		conn:                   conn,
+		nodeManager:            nodeManager,
+		channels:               make(map[uuid.UUID]*MuxerBidiStream),
+		done:                   make(chan struct{}),
+		pingInterval:           30,
+		pongTimeout:            90,
+		pingJitter:             5,
+		lastPongUnix:           timestamp.GetTimestamp(),
+		heartbeatStop:          make(chan struct{}),
+		cancelFunc:             cancel,
+		writeQueueOfferTimeout: defaultWriteQueueOfferTimeout,
+		queueMetrics:           telemetry.NewWSKitQueueMetrics(),
 	}
 	m.Context = cctx
 	m.logger = slog.With(slog.String("muxer", m.name))
@@ -377,6 +382,13 @@ func (m *WebSocketMuxer) writeQueueCapacity() int {
 	return 0
 }
 
+func (m *WebSocketMuxer) writeQueueWaitTimeout() time.Duration {
+	if m.writeQueueOfferTimeout > 0 {
+		return m.writeQueueOfferTimeout
+	}
+	return defaultWriteQueueOfferTimeout
+}
+
 func (m *WebSocketMuxer) snapshotWriteQueueDepth() int64 {
 	depth := int64(0)
 	if m.writeQueue != nil {
@@ -392,6 +404,13 @@ func (m *WebSocketMuxer) snapshotWriteQueueDepth() int64 {
 func (m *WebSocketMuxer) recordWriteQueueEnqueue() {
 	atomic.StoreInt64(&m.writeQueueSaturationStreak, 0)
 	m.snapshotWriteQueueDepth()
+}
+
+func (m *WebSocketMuxer) recordWriteQueueBlocked(duration time.Duration) {
+	atomic.AddInt64(&m.writeQueueBlocks, 1)
+	if m.queueMetrics != nil {
+		m.queueMetrics.RecordWriteQueueBlocked(m.metricsContext(), m.name, duration)
+	}
 }
 
 func (m *WebSocketMuxer) recordWriteQueueDrain() {
@@ -430,6 +449,29 @@ func (m *WebSocketMuxer) enqueueWriteMessage(msg *MuxerMsg, fallback func() erro
 		m.recordWriteQueueEnqueue()
 		return nil
 	default:
+	}
+
+	blockedAt := time.Now()
+	timer := time.NewTimer(m.writeQueueWaitTimeout())
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+
+	select {
+	case <-m.done:
+		m.releaseMsg(msg)
+		return ErrMuxerClosed
+	case m.writeQueue <- msg:
+		m.recordWriteQueueBlocked(time.Since(blockedAt))
+		m.recordWriteQueueEnqueue()
+		return nil
+	case <-timer.C:
+		m.recordWriteQueueBlocked(time.Since(blockedAt))
 		m.releaseMsg(msg)
 		m.recordWriteQueueFallback()
 		return fallback()
@@ -815,13 +857,7 @@ func (m *WebSocketMuxer) sendPing() error {
 	msg.ChannelID = uuid.Nil
 	msg.Payload = nil
 
-	select {
-	case m.writeQueue <- msg:
-		m.recordWriteQueueEnqueue()
-		return nil
-	default:
-		m.releaseMsg(msg)
-		m.recordWriteQueueFallback()
+	return m.enqueueWriteMessage(msg, func() error {
 		m.writeMu.Lock()
 		defer m.writeMu.Unlock()
 		if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypePing}); err != nil {
@@ -840,7 +876,7 @@ func (m *WebSocketMuxer) sendPing() error {
 			return err
 		}
 		return nil
-	}
+	})
 }
 
 // sendJSONWithLock performs a synchronous JSON send under m.writeMu and
@@ -1105,6 +1141,9 @@ func (m *WebSocketMuxer) PingsSent() int64     { return atomic.LoadInt64(&m.ping
 func (m *WebSocketMuxer) PongsReceived() int64 { return atomic.LoadInt64(&m.pongsReceived) }
 func (m *WebSocketMuxer) MissedPongs() int64   { return atomic.LoadInt64(&m.missedPongs) }
 func (m *WebSocketMuxer) WriteErrors() int64   { return atomic.LoadInt64(&m.writeErrors) }
+func (m *WebSocketMuxer) WriteQueueBlocks() int64 {
+	return atomic.LoadInt64(&m.writeQueueBlocks)
+}
 func (m *WebSocketMuxer) WriteQueueDepth() int64 {
 	return atomic.LoadInt64(&m.writeQueueDepth)
 }

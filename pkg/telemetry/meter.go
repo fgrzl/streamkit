@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
@@ -21,6 +22,8 @@ func GetMeter() metric.Meter {
 // WSKitQueueMetrics records websocket muxer queue pressure signals.
 type WSKitQueueMetrics struct {
 	writeQueueDepth       metric.Int64Gauge
+	writeQueueBlocked     metric.Int64Counter
+	writeQueueBlockTime   metric.Float64Histogram
 	writeQueueFallbacks   metric.Int64Counter
 	writeQueueSaturations metric.Int64Counter
 }
@@ -32,6 +35,16 @@ func NewWSKitQueueMetrics() *WSKitQueueMetrics {
 		"streamkit.transport.wskit.write.queue.depth",
 		metric.WithDescription("Current websocket muxer write queue depth"),
 		metric.WithUnit("1"),
+	)
+	writeQueueBlocked, _ := meter.Int64Counter(
+		"streamkit.transport.wskit.write.queue.blocked.total",
+		metric.WithDescription("Number of websocket muxer writes that had to wait for queue capacity"),
+		metric.WithUnit("1"),
+	)
+	writeQueueBlockTime, _ := meter.Float64Histogram(
+		"streamkit.transport.wskit.write.queue.blocked.duration",
+		metric.WithDescription("Time spent waiting for websocket muxer queue capacity"),
+		metric.WithUnit("ms"),
 	)
 	writeQueueFallbacks, _ := meter.Int64Counter(
 		"streamkit.transport.wskit.write.queue.fallback.total",
@@ -45,6 +58,8 @@ func NewWSKitQueueMetrics() *WSKitQueueMetrics {
 	)
 	return &WSKitQueueMetrics{
 		writeQueueDepth:       writeQueueDepth,
+		writeQueueBlocked:     writeQueueBlocked,
+		writeQueueBlockTime:   writeQueueBlockTime,
 		writeQueueFallbacks:   writeQueueFallbacks,
 		writeQueueSaturations: writeQueueSaturations,
 	}
@@ -59,6 +74,25 @@ func (m *WSKitQueueMetrics) RecordWriteQueueDepth(ctx context.Context, role stri
 		WithTransportType("websocket"),
 		WithMuxerRole(role),
 	))
+}
+
+// RecordWriteQueueBlocked increments the blocked-write counter and duration histogram.
+func (m *WSKitQueueMetrics) RecordWriteQueueBlocked(ctx context.Context, role string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	if m.writeQueueBlocked != nil {
+		m.writeQueueBlocked.Add(metricContext(ctx), 1, metric.WithAttributes(
+			WithTransportType("websocket"),
+			WithMuxerRole(role),
+		))
+	}
+	if m.writeQueueBlockTime != nil {
+		m.writeQueueBlockTime.Record(metricContext(ctx), float64(duration.Milliseconds()), metric.WithAttributes(
+			WithTransportType("websocket"),
+			WithMuxerRole(role),
+		))
+	}
 }
 
 // RecordWriteQueueFallback increments the websocket queue fallback counter.
