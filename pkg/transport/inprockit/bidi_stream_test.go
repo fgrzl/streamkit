@@ -74,6 +74,98 @@ func TestShouldCloseSendAndSignalClosed(t *testing.T) {
 	}
 }
 
+func TestShouldReturnClosedPipeWhenEncodingAfterCloseSend(t *testing.T) {
+	stream := NewInProcBidiStream()
+
+	require.NoError(t, stream.CloseSend(nil))
+	require.ErrorIs(t, stream.Encode("late message"), io.ErrClosedPipe)
+
+	select {
+	case <-stream.Closed():
+		t.Fatal("CloseSend should not fully close the stream")
+	default:
+	}
+}
+
+func TestShouldStillDecodePeerMessagesAfterLocalCloseSend(t *testing.T) {
+	client := NewInProcBidiStream()
+	server := NewInProcBidiStream()
+	LinkStreams(client, server)
+
+	require.NoError(t, client.CloseSend(nil))
+	require.NoError(t, server.Encode("reply"))
+
+	var out string
+	require.NoError(t, client.Decode(&out))
+	require.Equal(t, "reply", out)
+	require.ErrorIs(t, client.Encode("late message"), io.ErrClosedPipe)
+
+	select {
+	case <-client.Closed():
+		t.Fatal("CloseSend should leave the receive side open")
+	default:
+	}
+}
+
+func TestShouldPreferNonNilCloseErrorAcrossRepeatedCloseSendCalls(t *testing.T) {
+	stream := NewInProcBidiStream()
+
+	require.NoError(t, stream.CloseSend(nil))
+	require.ErrorIs(t, stream.CloseSend(io.ErrUnexpectedEOF), io.ErrUnexpectedEOF)
+}
+
+func TestShouldNotPanicWhenEncodeRacesWithCloseSend(t *testing.T) {
+	for iteration := 0; iteration < 256; iteration++ {
+		stream := NewInProcBidiStream()
+		start := make(chan struct{})
+		panicCh := make(chan any, 2)
+		encodeErrCh := make(chan error, 1)
+		closeErrCh := make(chan error, 1)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					panicCh <- recovered
+				}
+			}()
+
+			<-start
+			encodeErrCh <- stream.Encode("message")
+		}()
+
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					panicCh <- recovered
+				}
+			}()
+
+			<-start
+			closeErrCh <- stream.CloseSend(nil)
+		}()
+
+		close(start)
+		wg.Wait()
+		close(panicCh)
+
+		for recovered := range panicCh {
+			t.Fatalf("iteration %d panicked: %v", iteration, recovered)
+		}
+
+		require.NoError(t, <-closeErrCh)
+		encodeErr := <-encodeErrCh
+		if encodeErr != nil {
+			require.ErrorIs(t, encodeErr, io.ErrClosedPipe)
+		}
+		require.ErrorIs(t, stream.Encode("late message"), io.ErrClosedPipe)
+	}
+}
+
 func TestShouldUnblockDecodeWhenClosedLocally(t *testing.T) {
 	stream := NewInProcBidiStream()
 	errCh := make(chan error, 1)

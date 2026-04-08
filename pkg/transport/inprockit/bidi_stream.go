@@ -14,16 +14,18 @@ import (
 )
 
 type InProcBidiStream struct {
-	sendChan    chan any
-	recvChan    chan any
-	recvOwned   bool
-	peer        *InProcBidiStream
-	sendClosed  sync.Once
-	sendCloseMu sync.Mutex
-	closeOnce   sync.Once
-	closeErr    error
-	closed      chan struct{}
-	closedFlag  atomic.Uint32
+	sendChan       chan any
+	recvChan       chan any
+	recvOwned      bool
+	peer           *InProcBidiStream
+	sendCloseOnce  sync.Once
+	sendStateMu    sync.RWMutex
+	sendCloseMu    sync.Mutex
+	closeOnce      sync.Once
+	closeErr       error
+	closed         chan struct{}
+	sendClosedFlag atomic.Uint32
+	closedFlag     atomic.Uint32
 }
 
 var payloadBufPool = sync.Pool{
@@ -55,7 +57,12 @@ func (s *InProcBidiStream) Encode(m any) error {
 	// Once a local or peer close has been observed, Encode must fail
 	// deterministically. A plain select on <-closed vs sendChan is insufficient
 	// because both cases can be ready and select may pick the send path.
-	if s.closedFlag.Load() != 0 {
+	if s.sendClosedFlag.Load() != 0 || s.closedFlag.Load() != 0 {
+		return io.ErrClosedPipe
+	}
+	s.sendStateMu.RLock()
+	defer s.sendStateMu.RUnlock()
+	if s.sendClosedFlag.Load() != 0 || s.closedFlag.Load() != 0 {
 		return io.ErrClosedPipe
 	}
 	select {
@@ -425,15 +432,16 @@ func (s *InProcBidiStream) CloseSend(err error) error {
 }
 
 func (s *InProcBidiStream) Close(err error) {
-	s.closeSend(err)
 	peer := s.peer
 	s.closeOnce.Do(func() {
+		s.recordCloseErr(err)
 		s.closedFlag.Store(1)
 		close(s.closed)
 	})
 	if peer != nil {
 		peer.closeRemote(err)
 	}
+	s.closeSend(err)
 }
 
 func (s *InProcBidiStream) Closed() <-chan struct{} {
@@ -465,8 +473,11 @@ func (s *InProcBidiStream) closeRemote(err error) {
 
 func (s *InProcBidiStream) closeSend(err error) {
 	var didClose bool
-	s.sendClosed.Do(func() {
+	s.sendCloseOnce.Do(func() {
+		s.sendClosedFlag.Store(1)
 		s.recordCloseErr(err)
+		s.sendStateMu.Lock()
+		defer s.sendStateMu.Unlock()
 		didClose = true
 		close(s.sendChan)
 	})
