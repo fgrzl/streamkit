@@ -2,9 +2,11 @@ package wskit
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -64,25 +66,25 @@ func TestDecodeErrorMessageTypes(t *testing.T) {
 		s, _ := newCapturingStream()
 
 		t.Run("remote closed with error", func(t *testing.T) {
-			s.RecvChan() <- []byte(`{"type":"close","err":"boom"}`)
+			s.RecvChan() <- []byte(`{"type":"mux::close","err":"boom"}`)
 			var v string
 			assert.EqualError(t, s.Decode(&v), "remote closed stream: boom")
 		})
 
 		t.Run("remote closed without error", func(t *testing.T) {
-			s.RecvChan() <- []byte(`{"type":"close"}`)
+			s.RecvChan() <- []byte(`{"type":"mux::close"}`)
 			var v string
 			assert.Equal(t, io.EOF, s.Decode(&v))
 		})
 
 		t.Run("remote error", func(t *testing.T) {
-			s.RecvChan() <- []byte(`{"type":"error","err":"oops"}`)
+			s.RecvChan() <- []byte(`{"type":"mux::error","err":"oops"}`)
 			var v string
 			assert.EqualError(t, s.Decode(&v), "remote error: oops")
 		})
 
 		t.Run("unknown error type", func(t *testing.T) {
-			s.RecvChan() <- []byte(`{"type":"weird","err":"x"}`)
+			s.RecvChan() <- []byte(`{"type":"mux::weird","err":"x"}`)
 			var v string
 			assert.Error(t, s.Decode(&v))
 		})
@@ -95,7 +97,7 @@ func TestCloseSendEncodesCloseMessage(t *testing.T) {
 		assert.NoError(t, s.CloseSend(nil))
 		var em ErrorMessage
 		assert.NoError(t, json.Unmarshal(*got, &em))
-		assert.Equal(t, "close", em.Type)
+		assert.Equal(t, controlMsgSentinel+"close", em.Type)
 
 		// with error
 		assert.NoError(t, s.CloseSend(io.ErrUnexpectedEOF))
@@ -154,9 +156,88 @@ func TestRecvChanAndOfferBehavior(t *testing.T) {
 	})
 }
 
+func TestOfferReturnsFalseWhenBufferIsFull(t *testing.T) {
+	s, _ := newCapturingStream()
+	for i := 0; i < cap(s.recvChan); i++ {
+		require.True(t, s.Offer([]byte(`"x"`)))
+	}
+
+	assert.False(t, s.Offer([]byte(`"overflow"`)))
+}
+
+func TestOfferWithinWaitsForBufferHeadroom(t *testing.T) {
+	s, _ := newCapturingStream()
+	s.recvChan = make(chan any, 1)
+	require.True(t, s.Offer([]byte(`"blocked"`)))
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		<-s.recvChan
+	}()
+
+	start := time.Now()
+	require.True(t, s.OfferWithin([]byte(`"recovered"`), 100*time.Millisecond))
+	assert.GreaterOrEqual(t, time.Since(start), 10*time.Millisecond)
+
+	var value string
+	require.NoError(t, s.Decode(&value))
+	assert.Equal(t, "recovered", value)
+}
+
+func TestOfferWithinReturnsFalseWhenBufferStaysFull(t *testing.T) {
+	s, _ := newCapturingStream()
+	s.recvChan = make(chan any, 1)
+	require.True(t, s.Offer([]byte(`"blocked"`)))
+
+	start := time.Now()
+	assert.False(t, s.OfferWithin([]byte(`"overflow"`), 20*time.Millisecond))
+	assert.GreaterOrEqual(t, time.Since(start), 20*time.Millisecond)
+}
+
 func TestEndOfStreamError(t *testing.T) {
 	t.Run("EndOfStreamError returns io.EOF", func(t *testing.T) {
 		s, _ := newCapturingStream()
 		assert.Equal(t, io.EOF, s.EndOfStreamError())
 	})
+}
+
+func TestCloseLocalDrainsBufferedMessages(t *testing.T) {
+	// Arrange
+	s, _ := newCapturingStream()
+	for i := 0; i < 5; i++ {
+		ok := s.Offer([]byte(`"x"`))
+		require.True(t, ok)
+	}
+
+	// Act
+	s.CloseLocal(nil)
+
+	// Assert: after CloseLocal the channel should be empty
+	require.Equal(t, 0, len(s.recvChan), "expected recvChan to be drained by CloseLocal")
+}
+
+func TestDecodeReturnsLocalCloseError(t *testing.T) {
+	s, _ := newCapturingStream()
+
+	closeErr := errors.New("stream receive buffer overloaded")
+	s.CloseLocal(closeErr)
+
+	var v string
+	assert.ErrorIs(t, s.Decode(&v), closeErr)
+}
+
+func TestDecodeIgnoresDomainObjectWithTypeField(t *testing.T) {
+	// Arrange: a domain object that has a "type" field — previously consumed
+	// as a control message, silently dropping the application payload.
+	s, _ := newCapturingStream()
+	s.Offer([]byte(`{"type":"close","data":"legit"}`))
+
+	// Act
+	var v map[string]string
+	err := s.Decode(&v)
+
+	// Assert: must be delivered to the application, not consumed as a close command
+	require.NoError(t, err, "domain object with 'type' field must not be treated as a control message")
+	assert.Equal(t, "legit", v["data"])
+	assert.Equal(t, "close", v["type"])
 }

@@ -2,7 +2,6 @@ package wskit
 
 import (
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/fgrzl/claims"
@@ -30,11 +29,7 @@ func NewServerMuxerSession(principal claims.Principal) (MuxerSession, error) {
 			raw := strings.TrimPrefix(scope, ScopePrefix)
 			id, err := uuid.Parse(raw)
 			if err != nil {
-				slog.Warn("ignoring invalid store scope",
-					slog.String("scope", scope),
-					slog.String("error_type", "scope_parse"),
-					"error", err)
-				continue
+				return nil, fmt.Errorf("invalid store scope %q: %w", scope, err)
 			}
 			allowedStores[id] = struct{}{}
 		}

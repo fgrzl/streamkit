@@ -12,4 +12,6 @@ const (
 	SPACES = "SPACES"
 	// SEGMENTS is used as a key component for segment-related storage.
 	SEGMENTS = "SEGMENTS"
+	// SEGMENT_STATUSES is used as a key component for persisted segment-status snapshots.
+	SEGMENT_STATUSES = "SEGMENT_STATUSES"
 )

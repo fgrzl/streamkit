@@ -53,9 +53,9 @@ func TestShouldReturnFalseWhenErrorMessageContainsPermanentKeyword(t *testing.T)
 	// Arrange
 	// Must match strings in resilience.go permanentErrors list (substring match).
 	permanent := []string{
-		"unauthorized", "forbidden", "authentication failed",
+		"unauthorized", "forbidden", "access denied", "authentication failed",
 		"permission denied", "not found", "invalid argument",
-		"bad request", "invalid request",
+		"bad request", "invalid request", "stream receive buffer overloaded",
 	}
 
 	for _, msg := range permanent {

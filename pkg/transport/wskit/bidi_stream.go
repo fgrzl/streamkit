@@ -6,11 +6,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+// controlMsgSentinel is a prefix that all muxer-level control messages must carry
+// in their Type field. Application domain objects may validly have a "type" JSON
+// field; without this prefix they would previously be silently consumed as
+// control messages and never delivered to the application.
+const controlMsgSentinel = "mux::"
 
 // MuxerBidiStream is a bidirectional stream abstraction for use with a WebSocketMuxer.
 // It is envelope-agnostic and operates on raw JSON payloads.
@@ -20,6 +28,8 @@ type MuxerBidiStream struct {
 	closeOnce  sync.Once
 	closed     chan struct{}
 	closedFlag uint32 // 0 == open, 1 == closed
+	closeErrMu sync.Mutex
+	closeErr   error
 	onClose    func()
 	channelID  uuid.UUID
 }
@@ -33,7 +43,7 @@ func NewMuxerBidiStream(
 ) *MuxerBidiStream {
 	s := &MuxerBidiStream{
 		encode:   encode,
-		recvChan: make(chan any, 256),
+		recvChan: make(chan any, defaultStreamRecvQueueSize),
 		closed:   make(chan struct{}),
 		onClose:  onClose,
 	}
@@ -65,34 +75,65 @@ func (c *MuxerBidiStream) Encode(m any) error {
 
 // Decode blocks until a message is received or the stream is closed.
 func (c *MuxerBidiStream) Decode(v any) error {
+	msg, ok, err := c.recv()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return c.closedErr()
+	}
+
+	payload, err := c.payloadFromMsg(msg)
+	if err != nil {
+		return err
+	}
+
+	// Check whether payload represents a control ErrorMessage and handle it
+	if handled, err := c.handleErrorMessage(payload); handled {
+		return err
+	}
+
+	// Normal decode
+	if err := json.Unmarshal(payload, v); err != nil {
+		slog.Warn("bidi: decode unmarshal failed",
+			slog.String("channel_id", c.channelID.String()),
+			slog.String("error_type", "decode"),
+			slog.Int("bytes", len(payload)),
+			"err", err)
+		return err
+	}
+	return nil
+}
+
+func (c *MuxerBidiStream) recv() (any, bool, error) {
 	select {
+	case msg := <-c.recvChan:
+		return msg, true, nil
+	default:
+	}
+
+	select {
+	case msg := <-c.recvChan:
+		return msg, true, nil
 	case <-c.closed:
-		return io.EOF
+		return nil, false, c.closedErr()
+	}
+}
 
-	case msg, ok := <-c.recvChan:
-		if !ok {
-			return io.EOF
-		}
-		payload, err := c.payloadFromMsg(msg)
-		if err != nil {
-			return err
-		}
+func (c *MuxerBidiStream) closedErr() error {
+	c.closeErrMu.Lock()
+	defer c.closeErrMu.Unlock()
+	if c.closeErr != nil {
+		return c.closeErr
+	}
+	return io.EOF
+}
 
-		// Check whether payload represents a control ErrorMessage and handle it
-		if handled, err := c.handleErrorMessage(payload); handled {
-			return err
-		}
-
-		// Normal decode
-		if err := json.Unmarshal(payload, v); err != nil {
-			slog.Warn("bidi: decode unmarshal failed",
-				slog.String("channel_id", c.channelID.String()),
-				slog.String("error_type", "decode"),
-				slog.Int("bytes", len(payload)),
-				"err", err)
-			return err
-		}
-		return nil
+func (c *MuxerBidiStream) recordCloseErr(err error) {
+	c.closeErrMu.Lock()
+	defer c.closeErrMu.Unlock()
+	if c.closeErr == nil || err != nil {
+		c.closeErr = err
 	}
 }
 
@@ -113,17 +154,19 @@ func (c *MuxerBidiStream) payloadFromMsg(msg any) ([]byte, error) {
 }
 
 // handleErrorMessage inspects the payload for an ErrorMessage. If the payload
-// contains a control message, it handles logging and returns (true, err) where
-// err is the appropriate error to return from Decode (or nil for EOF). If the
-// payload is not an ErrorMessage, (false, nil) is returned.
+// contains a muxer control message (type prefixed with controlMsgSentinel), it
+// handles logging and returns (true, err) where err is the appropriate error to
+// return from Decode (or nil for EOF). If the payload is not a control message,
+// (false, nil) is returned. Domain objects that happen to have a "type" JSON
+// field are not affected since they lack the controlMsgSentinel prefix.
 func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 	var errMsg ErrorMessage
-	if err := json.Unmarshal(payload, &errMsg); err != nil || errMsg.Type == "" {
+	if err := json.Unmarshal(payload, &errMsg); err != nil || !strings.HasPrefix(errMsg.Type, controlMsgSentinel) {
 		return false, nil
 	}
 
 	switch errMsg.Type {
-	case "close":
+	case controlMsgSentinel + "close":
 		if errMsg.Err != "" {
 			remoteErr := errors.New(errMsg.Err)
 			if benignDisconnect(remoteErr) {
@@ -140,7 +183,7 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 			return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
 		}
 		return true, io.EOF
-	case "error":
+	case controlMsgSentinel + "error":
 		remoteErr := errors.New(errMsg.Err)
 		slog.Warn("bidi: remote error",
 			slog.String("channel_id", c.channelID.String()),
@@ -160,7 +203,7 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 // CloseSend sends a JSON close message to the remote side.
 func (c *MuxerBidiStream) CloseSend(err error) error {
 	msg := &ErrorMessage{
-		Type: "close",
+		Type: controlMsgSentinel + "close",
 	}
 	if err != nil {
 		msg.Err = err.Error()
@@ -176,6 +219,7 @@ func (c *MuxerBidiStream) Close(err error) {
 	c.closeOnce.Do(func() {
 		// Attempt to notify remote of close; on network errors this may fail.
 		_ = c.CloseSend(err)
+		c.recordCloseErr(err)
 		// mark closed and notify listeners; do not close recvChan to avoid send-on-closed panics
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
@@ -206,8 +250,20 @@ func (c *MuxerBidiStream) Close(err error) {
 func (c *MuxerBidiStream) CloseLocal(err error) {
 	c.closeOnce.Do(func() {
 		// Do not call CloseSend since network may be down.
+		c.recordCloseErr(err)
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
+
+		// Drain buffered messages to prevent memory leak (mirrors Close drain).
+		for {
+			select {
+			case <-c.recvChan:
+			default:
+				goto drainDone
+			}
+		}
+	drainDone:
+
 		if c.onClose != nil {
 			c.onClose()
 		}
@@ -234,6 +290,39 @@ func (c *MuxerBidiStream) Offer(msg any) (ok bool) {
 	case c.recvChan <- msg:
 		return true
 	case <-c.closed:
+		return false
+	default:
+		return false
+	}
+}
+
+// OfferWithin attempts to deliver a message to the stream, waiting up to the
+// provided timeout for receive buffer headroom before giving up.
+func (c *MuxerBidiStream) OfferWithin(msg any, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return c.Offer(msg)
+	}
+	if atomic.LoadUint32(&c.closedFlag) != 0 {
+		return false
+	}
+
+	select {
+	case c.recvChan <- msg:
+		return true
+	case <-c.closed:
+		return false
+	default:
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case c.recvChan <- msg:
+		return true
+	case <-c.closed:
+		return false
+	case <-timer.C:
 		return false
 	}
 }

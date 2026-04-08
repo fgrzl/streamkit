@@ -80,3 +80,20 @@ func TestShouldErrorForInvalidOrEmptyScopes(t *testing.T) {
 	assert.Error(t, err2)
 	assert.Nil(t, s2)
 }
+
+func TestShouldRejectTokenWithMixedValidAndMalformedScopes(t *testing.T) {
+	// Arrange: one valid per-store scope and one malformed one
+	validID := uuid.New()
+	sp := claims.SerializablePrincipal{Scopes: []string{
+		ScopePrefix + validID.String(),
+		ScopePrefix + "not-a-uuid",
+	}}
+	p := claims.NewReconstructedPrincipal(sp)
+
+	// Act
+	s, err := NewServerMuxerSession(p)
+
+	// Assert: a malformed scope must fail the whole request, not grant partial access
+	assert.Error(t, err)
+	assert.Nil(t, s)
+}

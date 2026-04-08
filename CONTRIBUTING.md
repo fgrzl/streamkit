@@ -189,7 +189,12 @@ go test -race -cover ./...
 
 # With timeout (default 10m)
 go test -race -timeout=2m ./...
+
+# Local-only Azure-backed WebSocket chaos soak (skipped in CI unless explicitly enabled)
+STREAMKIT_SOAK=1 STREAMKIT_SOAK_DURATION=90s go test -run TestLocalWebSocketChaosSoak -count=1 ./pkg/transport/wskit
 ```
+
+The chaos soak uses the local Azure Table emulator by default (`http://127.0.0.1:10002/devstoreaccount1`), so start `docker compose up -d` first if it is not already running. The soak is opt-in on purpose and remains skipped during normal `go test ./...` and CI runs unless `STREAMKIT_SOAK` is set explicitly.
 
 ### Test Requirements
 

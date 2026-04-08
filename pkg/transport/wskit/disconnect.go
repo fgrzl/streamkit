@@ -58,6 +58,12 @@ func classifyTransportError(err error) string {
 	if errors.Is(err, ErrHeartbeatTimeout) {
 		return "heartbeat_timeout"
 	}
+	if errors.Is(err, ErrTooManyStreams) {
+		return "stream_limit"
+	}
+	if errors.Is(err, ErrPayloadTooLarge) {
+		return "payload_too_large"
+	}
 	if benignDisconnect(err) {
 		return "disconnect"
 	}
@@ -73,6 +79,7 @@ func classifyTransportError(err error) string {
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "401") ||
 		strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "access denied") ||
 		strings.Contains(msg, "authentication failed") ||
 		strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "permission denied") {

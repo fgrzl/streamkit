@@ -2,6 +2,7 @@ package pebblekit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,6 +93,14 @@ func (s *PebbleStore) Peek(ctx context.Context, space, segment string) (*api.Ent
 	return entry, nil
 }
 
+func (s *PebbleStore) GetSegmentStatus(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	status, err := s.readStoredSegmentStatus(ctx, space, segment)
+	if err != nil || status != nil {
+		return status, err
+	}
+	return s.buildSegmentStatusFromData(ctx, space, segment)
+}
+
 func (s *PebbleStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
 	ts := timestamp.GetTimestamp()
 	bounds := s.calculateTimeBounds(ts, args.MinTimestamp, args.MaxTimestamp)
@@ -164,6 +173,10 @@ func (s *PebbleStore) Produce(ctx context.Context, args *api.Produce, records en
 
 	lastSeq := lastEntry.Sequence
 	lastTrx := lastEntry.TRX.Number
+	currentStatus, err := s.GetSegmentStatus(ctx, args.Space, args.Segment)
+	if err != nil {
+		return enumerators.Error[*api.SegmentStatus](fmt.Errorf("get segment status failed: %w", err))
+	}
 	chunks := enumerators.ChunkByCount(records, 10_000)
 
 	return enumerators.Map(chunks, func(chunk enumerators.Enumerator[*api.Record]) (*api.SegmentStatus, error) {
@@ -217,24 +230,23 @@ func (s *PebbleStore) Produce(ctx context.Context, args *api.Produce, records en
 			lastWritten = entry
 		}
 
-		if err := batch.Commit(pebble.Sync); err != nil {
-			return nil, err
-		}
-
-		lastTrx++
-
 		if firstEntry == nil || lastWritten == nil {
 			return nil, fmt.Errorf("empty chunk unexpectedly")
 		}
-
-		return &api.SegmentStatus{
-			Space:          args.Space,
-			Segment:        args.Segment,
-			FirstSequence:  firstEntry.Sequence,
-			LastSequence:   lastWritten.Sequence,
-			FirstTimestamp: firstEntry.Timestamp,
-			LastTimestamp:  lastWritten.Timestamp,
-		}, nil
+		nextStatus := mergeSegmentStatus(currentStatus, firstEntry, lastWritten)
+		statusData, err := json.Marshal(nextStatus)
+		if err != nil {
+			return nil, err
+		}
+		if err := batch.Set(encodeSegmentStatusInventoryKey(args.Space, args.Segment), statusData, pebble.NoSync); err != nil {
+			return nil, err
+		}
+		if err := batch.Commit(pebble.Sync); err != nil {
+			return nil, err
+		}
+		currentStatus = nextStatus
+		lastTrx++
+		return nextStatus, nil
 	})
 }
 
@@ -281,6 +293,86 @@ func (s *PebbleStore) updateInventory(batch *pebble.Batch, space, segment string
 
 	s.cache.Set(segmentKey, struct{}{})
 	return nil
+}
+
+func (s *PebbleStore) readStoredSegmentStatus(_ context.Context, space, segment string) (*api.SegmentStatus, error) {
+	value, closer, err := s.db.Get(encodeSegmentStatusInventoryKey(space, segment))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer closer.Close()
+
+	status := &api.SegmentStatus{}
+	if err := json.Unmarshal(value, status); err != nil {
+		return nil, err
+	}
+	return status, nil
+}
+
+func (s *PebbleStore) buildSegmentStatusFromData(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	lower := lexkey.EncodeFirst(api.DATA, api.SEGMENTS, space, segment)
+	upper := lexkey.EncodeLast(api.DATA, api.SEGMENTS, space, segment)
+
+	iter, err := s.db.NewIterWithContext(ctx, &pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	if !iter.First() {
+		if err := iter.Error(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	firstEntry := &api.Entry{}
+	if err := codec.DecodeEntry(iter.Value(), firstEntry); err != nil {
+		return nil, err
+	}
+
+	lastEntry := firstEntry
+	if iter.Last() {
+		lastEntry = &api.Entry{}
+		if err := codec.DecodeEntry(iter.Value(), lastEntry); err != nil {
+			return nil, err
+		}
+	}
+
+	return &api.SegmentStatus{
+		Space:          space,
+		Segment:        segment,
+		FirstSequence:  firstEntry.Sequence,
+		FirstTimestamp: firstEntry.Timestamp,
+		LastSequence:   lastEntry.Sequence,
+		LastTimestamp:  lastEntry.Timestamp,
+	}, nil
+}
+
+func mergeSegmentStatus(current *api.SegmentStatus, firstEntry, lastEntry *api.Entry) *api.SegmentStatus {
+	status := &api.SegmentStatus{
+		Space:          lastEntry.Space,
+		Segment:        lastEntry.Segment,
+		LastSequence:   lastEntry.Sequence,
+		LastTimestamp:  lastEntry.Timestamp,
+		FirstSequence:  firstEntry.Sequence,
+		FirstTimestamp: firstEntry.Timestamp,
+	}
+	if current != nil && current.FirstSequence > 0 {
+		status.FirstSequence = current.FirstSequence
+		status.FirstTimestamp = current.FirstTimestamp
+	}
+	return status
+}
+
+func encodeSegmentStatusInventoryKey(space, segment string) []byte {
+	return lexkey.Encode(api.INVENTORY, api.SEGMENT_STATUSES, space, segment)
 }
 
 func (s *PebbleStore) calculateSegmentBounds(ts int64, args *api.ConsumeSegment) struct {

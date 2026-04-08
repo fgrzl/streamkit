@@ -64,6 +64,7 @@ type WebSocketMuxer struct {
 	name        string
 	conn        *websocket.Conn
 	channels    map[uuid.UUID]*MuxerBidiStream
+	tombstones  map[uuid.UUID]error
 	channelsMu  sync.RWMutex
 	writeMu     sync.Mutex
 	done        chan struct{}
@@ -71,28 +72,41 @@ type WebSocketMuxer struct {
 	closeOnce   sync.Once
 
 	// outbound write pump
-	writeQueue     chan *MuxerMsg
-	writeQueueSize int
-	msgPool        sync.Pool
-	bufPool        sync.Pool
-	writerDone     chan struct{}
+	writeQueue             chan *MuxerMsg
+	writeQueueSize         int
+	writeQueueOfferTimeout time.Duration
+	queueMetrics           *telemetry.WSKitQueueMetrics
+	msgPool                sync.Pool
+	bufPool                sync.Pool
+	writerDone             chan struct{}
 
 	// Heartbeat configuration (seconds)
 	pingInterval  int64
 	pongTimeout   int64
-	lastPongUnix  int64 // atomic
+	lastPongUnix  int64 // atomic; tracks the most recent inbound activity/pong
 	heartbeatStop chan struct{}
 	cancelFunc    context.CancelFunc
 	pingJitter    int64
+	maxStreams    int64
+
+	// frame/message size guardrails
+	maxFramePayloadBytes   int
+	maxMessagePayloadBytes int
 
 	// runtime counters
-	pingsSent     int64
-	pingsReceived int64
-	pongsReceived int64
-	missedPongs   int64
-	writeErrors   int64
-	logger        *slog.Logger
-	rng           *rand.Rand
+	pingsSent                    int64
+	pingsReceived                int64
+	pongsReceived                int64
+	missedPongs                  int64
+	writeErrors                  int64
+	activeStreams                int64 // number of streams currently registered (in-flight)
+	writeQueueBlocks             int64
+	writeQueueDepth              int64
+	writeQueueFallbacks          int64
+	writeQueueSaturationStreak   int64
+	writeQueueSaturationWarnings int64
+	logger                       *slog.Logger
+	rng                          *rand.Rand
 	// JSON send/receive hooks (set to websocket.JSON.Send/Receive by default).
 	// Tests may override these to simulate network behavior.
 	sendJSON func(conn *websocket.Conn, v interface{}) error
@@ -103,6 +117,21 @@ type WebSocketMuxer struct {
 var (
 	ErrMuxerClosed      = errors.New("muxer closed")
 	ErrHeartbeatTimeout = errors.New("heartbeat timeout")
+	ErrStreamOverloaded = errors.New("stream receive buffer overloaded")
+	ErrStreamTombstoned = errors.New("stream closed locally")
+	ErrTooManyStreams   = errors.New("too many active streams")
+	ErrPayloadTooLarge  = errors.New("muxer payload too large")
+)
+
+const (
+	writeQueueSaturationWarnThreshold int64 = 32
+	writeQueueSaturationWarnEvery     int64 = 256
+	defaultWriteQueueOfferTimeout           = 5 * time.Millisecond
+	defaultMaxLogicalStreams                = 1024
+	defaultMaxFramePayloadBytes             = 8 << 20
+	defaultMaxMessagePayloadBytes           = 6 << 20
+	defaultStreamRecvQueueSize              = 512
+	defaultStreamRecvOfferTimeout           = 100 * time.Millisecond
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -111,18 +140,24 @@ var (
 func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *websocket.Conn) *WebSocketMuxer {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:       ctx,
-		session:       session,
-		name:          "client",
-		conn:          conn,
-		channels:      make(map[uuid.UUID]*MuxerBidiStream),
-		done:          make(chan struct{}),
-		pingInterval:  30,
-		pongTimeout:   90,
-		pingJitter:    5,
-		lastPongUnix:  timestamp.GetTimestamp(),
-		heartbeatStop: make(chan struct{}),
-		cancelFunc:    cancel,
+		Context:                ctx,
+		session:                session,
+		name:                   "client",
+		conn:                   conn,
+		channels:               make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:             make(map[uuid.UUID]error),
+		done:                   make(chan struct{}),
+		pingInterval:           30,
+		pongTimeout:            90,
+		pingJitter:             5,
+		maxStreams:             defaultMaxLogicalStreams,
+		maxFramePayloadBytes:   defaultMaxFramePayloadBytes,
+		maxMessagePayloadBytes: defaultMaxMessagePayloadBytes,
+		lastPongUnix:           timestamp.GetTimestamp(),
+		heartbeatStop:          make(chan struct{}),
+		cancelFunc:             cancel,
+		writeQueueOfferTimeout: defaultWriteQueueOfferTimeout,
+		queueMetrics:           telemetry.NewWSKitQueueMetrics(),
 	}
 
 	// write pump defaults
@@ -141,6 +176,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	// default send/recv use websocket.JSON
 	m.sendJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Send(conn, v) }
 	m.recvJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Receive(conn, v) }
+	m.applyConnectionLimits()
 	go m.readLoop()
 	go m.heartbeat()
 	go m.writePump()
@@ -153,19 +189,25 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeManager server.NodeManager, conn *websocket.Conn) {
 	cctx, cancel := context.WithCancel(ctx)
 	m := &WebSocketMuxer{
-		Context:       cctx,
-		session:       session,
-		name:          "server",
-		conn:          conn,
-		nodeManager:   nodeManager,
-		channels:      make(map[uuid.UUID]*MuxerBidiStream),
-		done:          make(chan struct{}),
-		pingInterval:  30,
-		pongTimeout:   90,
-		pingJitter:    5,
-		lastPongUnix:  timestamp.GetTimestamp(),
-		heartbeatStop: make(chan struct{}),
-		cancelFunc:    cancel,
+		Context:                cctx,
+		session:                session,
+		name:                   "server",
+		conn:                   conn,
+		nodeManager:            nodeManager,
+		channels:               make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:             make(map[uuid.UUID]error),
+		done:                   make(chan struct{}),
+		pingInterval:           30,
+		pongTimeout:            90,
+		pingJitter:             5,
+		maxStreams:             defaultMaxLogicalStreams,
+		maxFramePayloadBytes:   defaultMaxFramePayloadBytes,
+		maxMessagePayloadBytes: defaultMaxMessagePayloadBytes,
+		lastPongUnix:           timestamp.GetTimestamp(),
+		heartbeatStop:          make(chan struct{}),
+		cancelFunc:             cancel,
+		writeQueueOfferTimeout: defaultWriteQueueOfferTimeout,
+		queueMetrics:           telemetry.NewWSKitQueueMetrics(),
 	}
 	m.Context = cctx
 	m.logger = slog.With(slog.String("muxer", m.name))
@@ -173,6 +215,7 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	m.sendJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Send(conn, v) }
 	m.recvJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Receive(conn, v) }
+	m.applyConnectionLimits()
 	// Initialize write pump infrastructure like the client muxer so server
 	// behavior is symmetric and safe for concurrent use.
 	m.writeQueueSize = 1024
@@ -217,6 +260,13 @@ func (m *WebSocketMuxer) Ping() bool {
 	return false
 }
 
+func (m *WebSocketMuxer) applyConnectionLimits() {
+	if m == nil || m.conn == nil || m.maxFramePayloadBytes <= 0 {
+		return
+	}
+	m.conn.MaxPayloadBytes = m.maxFramePayloadBytes
+}
+
 // Serve blocks until the WebSocket connection is closed or an error occurs.
 func (m *WebSocketMuxer) Serve() {
 	<-m.done
@@ -257,6 +307,14 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 		return bidi
 	default:
 	}
+	if m.maxStreams > 0 && atomic.LoadInt64(&m.activeStreams) >= m.maxStreams {
+		bidi := NewMuxerBidiStream(
+			func([]byte) error { return ErrTooManyStreams },
+			func() {},
+		)
+		bidi.SetChannelID(channelID)
+		return bidi
+	}
 
 	sendFn := func(payload []byte) error {
 		// Only client-originated data frames should inherit the request trace.
@@ -269,6 +327,7 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 	}
 
 	cleanup := func() {
+		atomic.AddInt64(&m.activeStreams, -1)
 		m.channelsMu.Lock()
 		defer m.channelsMu.Unlock()
 		delete(m.channels, channelID)
@@ -278,10 +337,33 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 	bidi.SetChannelID(channelID)
 
 	m.channelsMu.Lock()
+	delete(m.tombstones, channelID)
 	m.channels[channelID] = bidi
 	m.channelsMu.Unlock()
 
+	atomic.AddInt64(&m.activeStreams, 1)
+
 	return bidi
+}
+
+func (m *WebSocketMuxer) tombstoneStream(channelID uuid.UUID, reason error) {
+	if channelID == uuid.Nil {
+		return
+	}
+
+	m.channelsMu.Lock()
+	if m.tombstones == nil {
+		m.tombstones = make(map[uuid.UUID]error)
+	}
+	if existing, exists := m.tombstones[channelID]; !exists || existing == nil || reason != nil {
+		m.tombstones[channelID] = reason
+	}
+	bidi := m.channels[channelID]
+	m.channelsMu.Unlock()
+
+	if bidi != nil {
+		bidi.CloseLocal(reason)
+	}
 }
 
 // sendDataWithTrace injects trace context from ctx into the message and sends a data frame.
@@ -302,6 +384,9 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte, 
 	case <-m.done:
 		return ErrMuxerClosed
 	default:
+	}
+	if m.maxMessagePayloadBytes > 0 && len(payload) > m.maxMessagePayloadBytes {
+		return ErrPayloadTooLarge
 	}
 
 	// prepare pooled message (if available)
@@ -339,15 +424,121 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte, 
 		msg.Payload = nil
 	}
 
-	// try enqueue without blocking; fall back to synchronous write to preserve semantics
+	return m.enqueueWriteMessage(msg, func() error {
+		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload, TraceContext: traceContext}, true)
+	})
+}
+
+func (m *WebSocketMuxer) metricsContext() context.Context {
+	if m.Context != nil {
+		return m.Context
+	}
+	return context.Background()
+}
+
+func (m *WebSocketMuxer) writeQueueCapacity() int {
+	if m.writeQueueSize > 0 {
+		return m.writeQueueSize
+	}
+	if m.writeQueue != nil {
+		return cap(m.writeQueue)
+	}
+	return 0
+}
+
+func (m *WebSocketMuxer) writeQueueWaitTimeout() time.Duration {
+	if m.writeQueueOfferTimeout > 0 {
+		return m.writeQueueOfferTimeout
+	}
+	return defaultWriteQueueOfferTimeout
+}
+
+func (m *WebSocketMuxer) snapshotWriteQueueDepth() int64 {
+	depth := int64(0)
+	if m.writeQueue != nil {
+		depth = int64(len(m.writeQueue))
+	}
+	atomic.StoreInt64(&m.writeQueueDepth, depth)
+	if m.queueMetrics != nil {
+		m.queueMetrics.RecordWriteQueueDepth(m.metricsContext(), m.name, depth)
+	}
+	return depth
+}
+
+func (m *WebSocketMuxer) recordWriteQueueEnqueue() {
+	atomic.StoreInt64(&m.writeQueueSaturationStreak, 0)
+	m.snapshotWriteQueueDepth()
+}
+
+func (m *WebSocketMuxer) recordWriteQueueBlocked(duration time.Duration) {
+	atomic.AddInt64(&m.writeQueueBlocks, 1)
+	if m.queueMetrics != nil {
+		m.queueMetrics.RecordWriteQueueBlocked(m.metricsContext(), m.name, duration)
+	}
+}
+
+func (m *WebSocketMuxer) recordWriteQueueDrain() {
+	depth := m.snapshotWriteQueueDepth()
+	capacity := m.writeQueueCapacity()
+	if capacity <= 0 || depth < int64(capacity) {
+		atomic.StoreInt64(&m.writeQueueSaturationStreak, 0)
+	}
+}
+
+func (m *WebSocketMuxer) recordWriteQueueFallback() {
+	depth := m.snapshotWriteQueueDepth()
+	fallbacks := atomic.AddInt64(&m.writeQueueFallbacks, 1)
+	streak := atomic.AddInt64(&m.writeQueueSaturationStreak, 1)
+	if m.queueMetrics != nil {
+		m.queueMetrics.RecordWriteQueueFallback(m.metricsContext(), m.name)
+	}
+	if streak == writeQueueSaturationWarnThreshold || (streak > writeQueueSaturationWarnThreshold && streak%writeQueueSaturationWarnEvery == 0) {
+		warnings := atomic.AddInt64(&m.writeQueueSaturationWarnings, 1)
+		if m.queueMetrics != nil {
+			m.queueMetrics.RecordWriteQueueSaturation(m.metricsContext(), m.name)
+		}
+		slog.WarnContext(m.metricsContext(), "muxer: write queue saturated; falling back to synchronous send",
+			m.logFields(m.metricsContext(),
+				slog.Int64("queue_depth", depth),
+				slog.Int("queue_capacity", m.writeQueueCapacity()),
+				slog.Int64("queue_fallbacks", fallbacks),
+				slog.Int64("saturation_streak", streak),
+				slog.Int64("saturation_warnings", warnings))...)
+	}
+}
+
+func (m *WebSocketMuxer) enqueueWriteMessage(msg *MuxerMsg, fallback func() error) error {
 	select {
 	case m.writeQueue <- msg:
+		m.recordWriteQueueEnqueue()
 		return nil
 	default:
-		// queue full; return msg to pool and perform synchronous send under lock
-		m.msgPool.Put(msg)
-		// perform synchronous send under lock (shutdown on error)
-		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload, TraceContext: traceContext}, true)
+	}
+
+	blockedAt := time.Now()
+	timer := time.NewTimer(m.writeQueueWaitTimeout())
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+
+	select {
+	case <-m.done:
+		m.releaseMsg(msg)
+		return ErrMuxerClosed
+	case m.writeQueue <- msg:
+		m.recordWriteQueueBlocked(time.Since(blockedAt))
+		m.recordWriteQueueEnqueue()
+		return nil
+	case <-timer.C:
+		m.recordWriteQueueBlocked(time.Since(blockedAt))
+		m.releaseMsg(msg)
+		m.recordWriteQueueFallback()
+		return fallback()
 	}
 }
 
@@ -362,6 +553,10 @@ func (m *WebSocketMuxer) readLoop() {
 
 		if err != nil {
 			// Delegate receive-error handling (logs + shutdown) to helper for clarity.
+			m.handleReceiveError(err)
+			return
+		}
+		if err := m.validateInboundMessage(&msg); err != nil {
 			m.handleReceiveError(err)
 			return
 		}
@@ -382,7 +577,7 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 			slog.String("muxer", m.name),
 			slog.String("error_type", classifyTransportError(err)),
 			slog.String("detail", err.Error()))
-		m.shutdown(nil)
+		m.shutdown(ErrMuxerClosed)
 		return
 	}
 	// Unwrap net errors for richer logs
@@ -463,6 +658,16 @@ func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 	}
 }
 
+func (m *WebSocketMuxer) validateInboundMessage(msg *MuxerMsg) error {
+	if msg == nil {
+		return nil
+	}
+	if m.maxMessagePayloadBytes > 0 && len(msg.Payload) > m.maxMessagePayloadBytes {
+		return ErrPayloadTooLarge
+	}
+	return nil
+}
+
 func (m *WebSocketMuxer) handlePing(_ context.Context) {
 	atomic.AddInt64(&m.pingsReceived, 1)
 	if err := m.sendControl(ControlTypePong, uuid.Nil, uuid.Nil, nil); err != nil {
@@ -482,10 +687,25 @@ func (m *WebSocketMuxer) handlePong(_ context.Context) {
 
 func (m *WebSocketMuxer) handleClose(ctx context.Context) {
 	slog.DebugContext(ctx, "muxer: received close", slog.String("muxer", m.name))
-	m.shutdown(nil)
+	m.shutdown(ErrMuxerClosed)
 }
 
 func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) {
+	if msg != nil && msg.ChannelID != uuid.Nil {
+		m.channelsMu.RLock()
+		bidi, exists := m.channels[msg.ChannelID]
+		_, tombstoned := m.tombstones[msg.ChannelID]
+		m.channelsMu.RUnlock()
+		if exists {
+			m.deliverToStream(bidi, ctx, msg)
+			return
+		}
+		if tombstoned {
+			slog.DebugContext(ctx, "muxer: ignoring error control for closed channel", m.msgLogFields(msg)...)
+			return
+		}
+	}
+
 	slog.WarnContext(ctx, "muxer: received error control message",
 		m.msgLogFields(msg,
 			slog.String("payload", string(msg.Payload)))...,
@@ -511,7 +731,7 @@ func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, chan
 	if m.session.CanAccessStore(storeID) {
 		return true
 	}
-	payload, err := json.Marshal(&ErrorMessage{Type: "err", Err: "access denied"})
+	payload, err := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "error", Err: "access denied"})
 	if err != nil {
 		slog.WarnContext(ctx, "muxer: marshal access-denied error failed",
 			m.logFields(ctx, slog.String("store_id", storeID.String()), "err", err)...)
@@ -534,10 +754,36 @@ func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, chan
 func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (*MuxerBidiStream, error) {
 	m.channelsMu.RLock()
 	bidi, exists := m.channels[msg.ChannelID]
+	_, tombstoned := m.tombstones[msg.ChannelID]
 	m.channelsMu.RUnlock()
 
 	if exists {
 		return bidi, nil
+	}
+	if tombstoned {
+		slog.DebugContext(ctx, "muxer: ignoring late message for closed channel", m.msgLogFields(msg)...)
+		return nil, ErrStreamTombstoned
+	}
+	if m.maxStreams > 0 && atomic.LoadInt64(&m.activeStreams) >= m.maxStreams {
+		err := ErrTooManyStreams
+		slog.WarnContext(ctx, "muxer: active stream limit reached",
+			m.msgLogFields(msg,
+				slog.Int64("active_streams", atomic.LoadInt64(&m.activeStreams)),
+				slog.Int64("max_streams", m.maxStreams),
+				slog.String("error_type", classifyTransportError(err)),
+				"err", err)...)
+		m.tombstoneStream(msg.ChannelID, err)
+		payload, marshalErr := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "error", Err: err.Error()})
+		if marshalErr != nil {
+			slog.WarnContext(ctx, "muxer: marshal stream-limit error failed",
+				m.msgLogFields(msg, "err", marshalErr)...)
+		} else if sendErr := m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload); sendErr != nil {
+			slog.WarnContext(ctx, "muxer: send stream-limit error failed",
+				m.msgLogFields(msg,
+					slog.String("error_type", classifyTransportError(sendErr)),
+					"err", sendErr)...)
+		}
+		return nil, err
 	}
 
 	if m.nodeManager == nil {
@@ -553,7 +799,7 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 		slog.ErrorContext(ctx, "muxer: failed to get or create node",
 			m.msgLogFields(msg,
 				slog.String("err", err.Error()))...)
-		payload, marshalErr := json.Marshal(&ErrorMessage{Type: "error", Err: "store unavailable"})
+		payload, marshalErr := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "error", Err: "store unavailable"})
 		if marshalErr != nil {
 			slog.WarnContext(ctx, "muxer: marshal store-unavailable error failed",
 				m.msgLogFields(msg, "err", marshalErr)...)
@@ -599,7 +845,52 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", m.msgLogFields(msg)...)
 		return
 	}
-	bidi.Offer(msg.Payload)
+	if bidi.Offer(msg.Payload) {
+		return
+	}
+	if bidi.IsClosed() {
+		slog.DebugContext(ctx, "muxer: dropping message for closed stream", m.msgLogFields(msg)...)
+		return
+	}
+	if bidi.OfferWithin(msg.Payload, defaultStreamRecvOfferTimeout) {
+		return
+	}
+	if bidi.IsClosed() {
+		slog.DebugContext(ctx, "muxer: dropping message for closed stream after waiting", m.msgLogFields(msg)...)
+		return
+	}
+
+	slog.WarnContext(ctx, "muxer: stream receive buffer overloaded; closing channel",
+		m.msgLogFields(msg,
+			slog.String("error_type", classifyTransportError(ErrStreamOverloaded)),
+			slog.Duration("offer_timeout", defaultStreamRecvOfferTimeout))...)
+	m.tombstoneStream(msg.ChannelID, ErrStreamOverloaded)
+
+	if msg == nil || msg.ChannelID == uuid.Nil {
+		return
+	}
+
+	go func(storeID, channelID uuid.UUID) {
+		payload, err := json.Marshal(&ErrorMessage{
+			Type: controlMsgSentinel + "error",
+			Err:  ErrStreamOverloaded.Error(),
+		})
+		if err != nil {
+			slog.WarnContext(m.Context, "muxer: marshal overload error failed",
+				m.logFields(m.Context,
+					slog.String("channel_id", channelID.String()),
+					"err", err)...)
+			return
+		}
+		if err := m.sendControl(ControlTypeError, storeID, channelID, payload); err != nil {
+			slog.WarnContext(m.Context, "muxer: send overload error failed",
+				m.logFields(m.Context,
+					slog.String("store_id", storeID.String()),
+					slog.String("channel_id", channelID.String()),
+					slog.String("error_type", classifyTransportError(err)),
+					"err", err)...)
+		}
+	}(msg.StoreID, msg.ChannelID)
 }
 
 // heartbeat periodically sends ping control frames and verifies a timely pong or activity.
@@ -708,14 +999,9 @@ func (m *WebSocketMuxer) sendControl(control ControlType, storeID, channelID uui
 		msg.Payload = nil
 	}
 
-	select {
-	case m.writeQueue <- msg:
-		return nil
-	default:
-		// queue full -> synchronous fallback that increments writeErrors on failure
-		m.msgPool.Put(msg)
+	return m.enqueueWriteMessage(msg, func() error {
 		return m.syncSendIncrementOnError(&MuxerMsg{ControlType: control, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
-	}
+	})
 }
 
 // sendPing sends a ping control frame under the write lock. Returns an error
@@ -735,11 +1021,7 @@ func (m *WebSocketMuxer) sendPing() error {
 	msg.ChannelID = uuid.Nil
 	msg.Payload = nil
 
-	select {
-	case m.writeQueue <- msg:
-		return nil
-	default:
-		m.msgPool.Put(msg)
+	return m.enqueueWriteMessage(msg, func() error {
 		m.writeMu.Lock()
 		defer m.writeMu.Unlock()
 		if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypePing}); err != nil {
@@ -758,12 +1040,12 @@ func (m *WebSocketMuxer) sendPing() error {
 			return err
 		}
 		return nil
-	}
+	})
 }
 
 // sendJSONWithLock performs a synchronous JSON send under m.writeMu and
-// optionally triggers m.shutdown on error. It also updates lastPongUnix on
-// success and increments writeErrors on failure. This consolidates repeated
+// optionally triggers m.shutdown on error. It increments writeErrors on
+// failure. This consolidates repeated
 // send+log+shutdown patterns used across the muxer.
 func (m *WebSocketMuxer) sendJSONWithLock(msg *MuxerMsg, shutdownOnErr bool) error {
 	m.writeMu.Lock()
@@ -792,7 +1074,6 @@ func (m *WebSocketMuxer) sendJSONWithLock(msg *MuxerMsg, shutdownOnErr bool) err
 		return err
 	}
 
-	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	return nil
 }
 
@@ -880,6 +1161,7 @@ func (m *WebSocketMuxer) writePump() {
 					if msg == nil {
 						continue
 					}
+					m.recordWriteQueueDrain()
 					// ensure pooled resources are released regardless of send outcome
 					if ok := func(msg *MuxerMsg) bool {
 						defer m.releaseMsg(msg)
@@ -900,6 +1182,7 @@ func (m *WebSocketMuxer) writePump() {
 			if msg == nil {
 				continue
 			}
+			m.recordWriteQueueDrain()
 			// ensure pooled resources are released regardless of send outcome
 			if ok := func(msg *MuxerMsg) bool {
 				defer m.releaseMsg(msg)
@@ -980,17 +1263,40 @@ func (m *WebSocketMuxer) shutdown(reason error) {
 		}
 		// m.done already closed above to prevent races with writers
 
-		// close streams locally
+		// Snapshot channels under read lock, then close outside the lock.
+		// Holding RLock while calling CloseLocal would deadlock because CloseLocal
+		// triggers the cleanup closure which acquires channelsMu.Lock (not reentrant).
 		m.channelsMu.RLock()
+		streams := make([]*MuxerBidiStream, 0, len(m.channels))
 		for _, s := range m.channels {
+			streams = append(streams, s)
+		}
+		m.channelsMu.RUnlock()
+
+		for _, s := range streams {
 			if reason != nil {
 				s.CloseLocal(reason)
 			} else {
 				s.CloseLocal(nil)
 			}
 		}
-		m.channelsMu.RUnlock()
 	})
+}
+
+// Close shuts down the muxer. It satisfies the providerMuxer interface and
+// delegates to shutdown so callers need not type-assert to *WebSocketMuxer.
+// Before shutting down it waits (up to 1 s) for any in-flight streams to
+// complete, replacing the heuristic 500 ms sleep in replaceMuxer/invalidateMuxer.
+func (m *WebSocketMuxer) Close(err error) {
+	// Wait for in-flight streams to finish. Poll every 10 ms, bail after 1 s.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&m.activeStreams) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	m.shutdown(err)
 }
 
 // Metrics accessors (atomic snapshots)
@@ -998,3 +1304,15 @@ func (m *WebSocketMuxer) PingsSent() int64     { return atomic.LoadInt64(&m.ping
 func (m *WebSocketMuxer) PongsReceived() int64 { return atomic.LoadInt64(&m.pongsReceived) }
 func (m *WebSocketMuxer) MissedPongs() int64   { return atomic.LoadInt64(&m.missedPongs) }
 func (m *WebSocketMuxer) WriteErrors() int64   { return atomic.LoadInt64(&m.writeErrors) }
+func (m *WebSocketMuxer) WriteQueueBlocks() int64 {
+	return atomic.LoadInt64(&m.writeQueueBlocks)
+}
+func (m *WebSocketMuxer) WriteQueueDepth() int64 {
+	return atomic.LoadInt64(&m.writeQueueDepth)
+}
+func (m *WebSocketMuxer) WriteQueueFallbacks() int64 {
+	return atomic.LoadInt64(&m.writeQueueFallbacks)
+}
+func (m *WebSocketMuxer) WriteQueueSaturationWarnings() int64 {
+	return atomic.LoadInt64(&m.writeQueueSaturationWarnings)
+}

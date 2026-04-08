@@ -213,6 +213,41 @@ func TestShouldProducePeekAndEnumerateInventory(t *testing.T) {
 	assert.Equal(t, "space-a", spaceEntries[1].Space)
 }
 
+func TestShouldPersistSegmentStatusSnapshots(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+	args := &api.Produce{Space: "space-a", Segment: "segment-a"}
+
+	firstBatch, err := enumerators.ToSlice(store.Produce(ctx, args, enumerators.Slice([]*api.Record{
+		{Sequence: 1, Payload: []byte("first")},
+		{Sequence: 2, Payload: []byte("second")},
+	})))
+	require.NoError(t, err)
+	require.Len(t, firstBatch, 1)
+	assert.Equal(t, uint64(1), firstBatch[0].FirstSequence)
+	assert.Equal(t, uint64(2), firstBatch[0].LastSequence)
+
+	status, err := store.GetSegmentStatus(ctx, "space-a", "segment-a")
+	require.NoError(t, err)
+	require.NotNil(t, status)
+	assert.Equal(t, uint64(1), status.FirstSequence)
+	assert.Equal(t, uint64(2), status.LastSequence)
+
+	secondBatch, err := enumerators.ToSlice(store.Produce(ctx, args, enumerators.Slice([]*api.Record{
+		{Sequence: 3, Payload: []byte("third")},
+	})))
+	require.NoError(t, err)
+	require.Len(t, secondBatch, 1)
+	assert.Equal(t, uint64(1), secondBatch[0].FirstSequence)
+	assert.Equal(t, uint64(3), secondBatch[0].LastSequence)
+
+	status, err = store.GetSegmentStatus(ctx, "space-a", "segment-a")
+	require.NoError(t, err)
+	require.NotNil(t, status)
+	assert.Equal(t, uint64(1), status.FirstSequence)
+	assert.Equal(t, uint64(3), status.LastSequence)
+}
+
 func TestShouldReturnSequenceGapErrorWhenProduceSkipsSequence(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()

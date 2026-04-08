@@ -3,6 +3,7 @@ package wskit
 import (
 	"context"
 	"errors"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,8 +31,8 @@ func TestGetOrCreateMuxerRetries(t *testing.T) {
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
 
-	// simulate dialFn always failing; the foreground makes one inline attempt,
-	// then waits on the background loop which also retries.
+	// simulate dialFn always failing; the foreground should surface the inline
+	// error immediately instead of masking it behind a timeout.
 	var calls int32
 	p.maxDialAttempts = 3
 	p.dialFn = func() (*websocket.Conn, error) {
@@ -39,16 +40,15 @@ func TestGetOrCreateMuxerRetries(t *testing.T) {
 		return nil, errors.New("dial failed")
 	}
 
-	// Act: use a short timeout so the test doesn't block for the full deadline
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	m, err := p.getOrCreateMuxer(ctx)
 
-	// Assert: foreground makes 1 inline attempt, background loop makes additional
-	// attempts until the context deadline. The exact count depends on timing.
+	// Assert
 	assert.GreaterOrEqual(t, atomic.LoadInt32(&calls), int32(1), "expected at least 1 dial attempt (inline)")
 	assert.Nil(t, m)
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "dial failed")
 }
 
 func TestBackgroundReconnectRecreatesMuxer(t *testing.T) {
@@ -153,6 +153,52 @@ func TestCallStreamRetriesOnMuxerClosed(t *testing.T) {
 	_ = b.Close
 }
 
+func TestCallStreamRetriesOnBenignDisconnect(t *testing.T) {
+	// Arrange
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+
+	var failingEncodeCount int32
+	failing := &testBidi{
+		encodeFn: func(m any) error {
+			atomic.AddInt32(&failingEncodeCount, 1)
+			p.mu.Lock()
+			p.muxer = nil
+			p.mu.Unlock()
+			return io.EOF
+		},
+	}
+
+	var encodeSucceeded atomic.Bool
+	succeeded := &testBidi{}
+	succeeded.encodeFn = func(m any) error {
+		encodeSucceeded.Store(true)
+		return nil
+	}
+
+	failingMux := &fakeMuxer{pingFn: func() bool { return true }, bidi: failing}
+	succeedingMux := &fakeMuxer{pingFn: func() bool { return true }, bidi: succeeded}
+
+	p.mu.Lock()
+	p.muxer = failingMux
+	p.mu.Unlock()
+
+	p.dialFn = func() (*websocket.Conn, error) { return nil, nil }
+	p.newClientMuxer = func(ctx context.Context, session MuxerSession, conn *websocket.Conn) providerMuxer {
+		return succeedingMux
+	}
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	b, err := p.CallStream(ctx, uuid.New(), &api.GetStatus{})
+
+	// Assert
+	require.NoError(t, err)
+	assert.True(t, encodeSucceeded.Load(), "expected Encode to succeed after benign disconnect reconnect")
+	_ = b.Close
+}
+
 // testBidi implements api.BidiStream for tests
 type testBidi struct {
 	encodeFn func(any) error
@@ -177,17 +223,15 @@ func TestShouldTreatAuthErrorsAsPermanentByDefault(t *testing.T) {
 		return nil, errors.New("dial error: 401 unauthorized")
 	}
 
-	// Act: the foreground makes 1 inline attempt (permanent error), then waits
-	// on the background loop. The background loop also hits the permanent error
-	// and uses a 30s backoff, so the context deadline fires before many retries.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Act: the foreground should return the permanent auth error immediately.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_, err := p.getOrCreateMuxer(ctx)
 
-	// Assert: at least 1 call (the inline attempt); background may add a few
-	// more before the 30s permanent-error backoff kicks in.
+	// Assert
 	assert.GreaterOrEqual(t, atomic.LoadInt32(&calls), int32(1), "expected at least 1 dial attempt")
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "401 unauthorized")
 }
 
 func TestShouldRetryAuthErrorsWhenRetryAuthFailuresEnabled(t *testing.T) {
@@ -203,25 +247,65 @@ func TestShouldRetryAuthErrorsWhenRetryAuthFailuresEnabled(t *testing.T) {
 		return nil, errors.New("dial error: 401 unauthorized")
 	}
 
-	// Act: inline attempt fails, background loop retries with normal backoff
-	// since RetryAuthFailures treats 401 as transient.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Act: inline attempt still returns immediately, but the background loop keeps
+	// retrying with normal backoff because 401 is treated as transient.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_, err := p.getOrCreateMuxer(ctx)
 
-	// Assert: multiple attempts (inline + background retries with normal backoff)
-	assert.GreaterOrEqual(t, atomic.LoadInt32(&calls), int32(2), "expected multiple dial attempts when RetryAuthFailures is enabled")
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "401 unauthorized")
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&calls) >= 2
+	}, 3*time.Second, 50*time.Millisecond, "expected background retries when RetryAuthFailures is enabled")
+}
+
+func TestGetOrCreateMuxerInvokesOnDialFailureForInlineErrors(t *testing.T) {
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+
+	var callbackCalls atomic.Int32
+	p.OnDialFailure = func(err error) {
+		if err != nil {
+			callbackCalls.Add(1)
+		}
+	}
+	p.dialFn = func() (*websocket.Conn, error) {
+		return nil, errors.New("dial failed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := p.getOrCreateMuxer(ctx)
+
+	require.Error(t, err)
+	require.Eventually(t, func() bool {
+		return callbackCalls.Load() >= 1
+	}, time.Second, 10*time.Millisecond)
 }
 
 // fakeMuxer implements providerMuxer for tests
 type fakeMuxer struct {
-	pingFn func() bool
-	bidi   api.BidiStream
+	pingFn     func() bool
+	bidi       api.BidiStream
+	closeCalls int32
 }
 
 func (f *fakeMuxer) Ping() bool                                   { return f.pingFn() }
 func (f *fakeMuxer) Register(uuid.UUID, uuid.UUID) api.BidiStream { return f.bidi }
 func (f *fakeMuxer) RegisterWithContext(context.Context, uuid.UUID, uuid.UUID) api.BidiStream {
 	return f.bidi
+}
+func (f *fakeMuxer) Close(_ error) { atomic.AddInt32(&f.closeCalls, 1) }
+
+func TestCloseMuxerClosesArbitraryProviderMuxer(t *testing.T) {
+	// Arrange
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	fake := &fakeMuxer{pingFn: func() bool { return true }}
+
+	// Act
+	p.closeMuxer(fake)
+
+	// Assert
+	assert.Equal(t, int32(1), atomic.LoadInt32(&fake.closeCalls), "expected Close to be called once on any providerMuxer")
 }

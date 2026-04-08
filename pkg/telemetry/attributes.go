@@ -39,6 +39,7 @@ const (
 	// Transport attributes
 	AttrTransportType = attribute.Key("streamkit.transport_type") // "inproc", "websocket"
 	AttrMessageType   = attribute.Key("streamkit.message_type")   // "consume", "produce", etc.
+	AttrMuxerRole     = attribute.Key("streamkit.muxer_role")     // "client", "server"
 
 	// Storage backend attributes
 	AttrBackendType  = attribute.Key("streamkit.backend_type") // "pebbledb", "azure"
@@ -147,6 +148,11 @@ func WithCacheHit(hit bool) attribute.KeyValue {
 // WithTransportType returns an attribute for transport type.
 func WithTransportType(transportType string) attribute.KeyValue {
 	return AttrTransportType.String(transportType)
+}
+
+// WithMuxerRole returns an attribute for muxer role.
+func WithMuxerRole(role string) attribute.KeyValue {
+	return AttrMuxerRole.String(role)
 }
 
 // WithMessageType returns an attribute for message type.

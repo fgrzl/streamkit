@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	client "github.com/fgrzl/azkit/tables"
@@ -57,6 +61,7 @@ const (
 	ErrDecodeEntry          = "failed to decode entry"
 	ErrUnmarshalTransaction = "failed to unmarshal transaction"
 	ErrBatchPrepare         = "failed to prepare batch"
+	ErrStoreClosing         = "store is closing"
 )
 
 // Log Constants
@@ -155,6 +160,7 @@ type AzureStore struct {
 	client              *client.HTTPTableClient
 	cache               *cache.ExpiringCache
 	wg                  sync.WaitGroup
+	shuttingDown        atomic.Bool
 	closeOnce           sync.Once
 	opts                *AzureStoreOptions
 	stopWALMonitor      chan struct{}
@@ -194,7 +200,7 @@ func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) e
 	// RowKey encodes timestamp + segment + sequence, so we filter on timestamp range
 	var rLower, rUpper string
 	if len(args.Offset) > 0 {
-		rLower = args.Offset.ToHexString()
+		rLower = normalizeSpaceOffsetRowKey(args.Space, args.Offset)
 	} else {
 		rLower = lexkey.EncodeFirst(bounds.Min).ToHexString()
 	}
@@ -214,6 +220,18 @@ func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) e
 	return enumerators.TakeWhile(entries, func(e *api.Entry) bool {
 		return e.Timestamp > bounds.Min && e.Timestamp <= bounds.Max
 	})
+}
+
+func normalizeSpaceOffsetRowKey(space string, offset lexkey.LexKey) string {
+	if len(offset) == 0 {
+		return ""
+	}
+	rowKey := offset.ToHexString()
+	prefix := lexkey.Encode(api.DATA, api.SPACES, space).ToHexString()
+	if strings.HasPrefix(rowKey, prefix) {
+		return strings.TrimPrefix(rowKey[len(prefix):], "00")
+	}
+	return rowKey
 }
 
 func (s *AzureStore) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
@@ -292,9 +310,20 @@ func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entr
 	return entry, nil
 }
 
+func (s *AzureStore) GetSegmentStatus(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	status, err := s.readStoredSegmentStatus(ctx, space, segment)
+	if err != nil || status != nil {
+		return status, err
+	}
+	return s.buildSegmentStatusFromData(ctx, space, segment)
+}
+
 func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
 	if args == nil || args.Space == "" || args.Segment == "" {
 		return enumerators.Error[*api.SegmentStatus](errors.New(ErrInvalidProduceArgs))
+	}
+	if s.shuttingDown.Load() {
+		return enumerators.Error[*api.SegmentStatus](errors.New(ErrStoreClosing))
 	}
 
 	// Wait for WAL recovery to complete before accepting writes
@@ -323,6 +352,7 @@ func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enu
 
 func (s *AzureStore) Close() {
 	s.closeOnce.Do(func() {
+		s.shuttingDown.Store(true)
 		// Stop WAL monitor
 		close(s.stopWALMonitor)
 		if !s.waitForTasks(ShutdownTimeout) {
@@ -442,8 +472,10 @@ func (s *AzureStore) processBufferedChunk(ctx context.Context, space, segment st
 }
 
 func (s *AzureStore) processChunk(ctx context.Context, space, segment string, records []*api.Record, lastSeq, lastTrx uint64) (*api.SegmentStatus, error) {
-	s.wg.Add(1)
-	defer s.wg.Done()
+	if !s.beginTask() {
+		return nil, errors.New(ErrStoreClosing)
+	}
+	defer s.endTask()
 
 	trx := api.TRX{ID: uuid.New(), Number: lastTrx + 1}
 	entries, err := createEntries(records, space, segment, trx, lastSeq)
@@ -462,8 +494,31 @@ func (s *AzureStore) processChunk(ctx context.Context, space, segment string, re
 	s.cache.Set(cacheKey, lastEntry)
 
 	status := createSegmentStatus(space, segment, entries)
+	mergedStatus, err := s.mergeStoredSegmentStatus(ctx, status)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.writeSegmentStatus(ctx, mergedStatus); err != nil {
+		return nil, &committedInventoryError{cause: err}
+	}
 
-	return status, nil
+	return mergedStatus, nil
+}
+
+func (s *AzureStore) beginTask() bool {
+	if s.shuttingDown.Load() {
+		return false
+	}
+	s.wg.Add(1)
+	if s.shuttingDown.Load() {
+		s.wg.Done()
+		return false
+	}
+	return true
+}
+
+func (s *AzureStore) endTask() {
+	s.wg.Done()
 }
 
 func (s *AzureStore) recoverWAL(ctx context.Context) error {
@@ -498,6 +553,16 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 			s.cache.Delete(invKey)
 			if err := s.retryInventoryUpdate(ctx, transaction.Space, transaction.Segment); err != nil {
 				return nil, err
+			}
+			if len(transaction.Entries) > 0 {
+				status := createSegmentStatus(transaction.Space, transaction.Segment, transaction.Entries)
+				mergedStatus, err := s.mergeStoredSegmentStatus(ctx, status)
+				if err != nil {
+					return nil, err
+				}
+				if err := s.writeSegmentStatus(ctx, mergedStatus); err != nil {
+					return nil, err
+				}
 			}
 			if err := s.cleanupWAL(ctx, e.PartitionKey, e.RowKey); err != nil {
 				slog.ErrorContext(ctx, LogErrorWALCleanup,
@@ -883,6 +948,124 @@ func (s *AzureStore) updateInventory(ctx context.Context, space, segment string)
 	return nil
 }
 
+func (s *AzureStore) readStoredSegmentStatus(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	resp, err := s.client.GetEntity(ctx, segmentStatusPartitionKey(space), segment)
+	if err != nil {
+		if isNotFoundError(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get segment status: %w", err)
+	}
+
+	var entity client.Entity
+	if err := json.Unmarshal(resp, &entity); err != nil {
+		return nil, fmt.Errorf("failed to decode segment status entity: %w", err)
+	}
+
+	status := &api.SegmentStatus{}
+	if err := json.Unmarshal(entity.Value, status); err != nil {
+		return nil, fmt.Errorf("failed to decode segment status: %w", err)
+	}
+	return status, nil
+}
+
+func (s *AzureStore) buildSegmentStatusFromData(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	lastEntry, err := s.Peek(ctx, space, segment)
+	if err != nil {
+		return nil, err
+	}
+	if lastEntry == nil || lastEntry.Sequence == 0 {
+		return nil, nil
+	}
+
+	enum := s.ConsumeSegment(ctx, &api.ConsumeSegment{
+		Space:   space,
+		Segment: segment,
+	})
+	defer enum.Dispose()
+	if !enum.MoveNext() {
+		return &api.SegmentStatus{
+			Space:          space,
+			Segment:        segment,
+			FirstSequence:  lastEntry.Sequence,
+			FirstTimestamp: lastEntry.Timestamp,
+			LastSequence:   lastEntry.Sequence,
+			LastTimestamp:  lastEntry.Timestamp,
+		}, enum.Err()
+	}
+
+	firstEntry, err := enum.Current()
+	if err != nil {
+		return nil, err
+	}
+	if firstEntry == nil {
+		firstEntry = lastEntry
+	}
+
+	return &api.SegmentStatus{
+		Space:          space,
+		Segment:        segment,
+		FirstSequence:  firstEntry.Sequence,
+		FirstTimestamp: firstEntry.Timestamp,
+		LastSequence:   lastEntry.Sequence,
+		LastTimestamp:  lastEntry.Timestamp,
+	}, nil
+}
+
+func (s *AzureStore) mergeStoredSegmentStatus(ctx context.Context, chunkStatus *api.SegmentStatus) (*api.SegmentStatus, error) {
+	if chunkStatus == nil {
+		return nil, nil
+	}
+	if chunkStatus.FirstSequence <= 1 {
+		return chunkStatus, nil
+	}
+	stored, err := s.readStoredSegmentStatus(ctx, chunkStatus.Space, chunkStatus.Segment)
+	if err != nil {
+		return nil, err
+	}
+	if stored == nil {
+		if chunkStatus.FirstSequence <= 1 {
+			return chunkStatus, nil
+		}
+		return s.buildSegmentStatusFromData(ctx, chunkStatus.Space, chunkStatus.Segment)
+	}
+
+	return &api.SegmentStatus{
+		Space:          chunkStatus.Space,
+		Segment:        chunkStatus.Segment,
+		FirstSequence:  stored.FirstSequence,
+		FirstTimestamp: stored.FirstTimestamp,
+		LastSequence:   chunkStatus.LastSequence,
+		LastTimestamp:  chunkStatus.LastTimestamp,
+	}, nil
+}
+
+func (s *AzureStore) writeSegmentStatus(ctx context.Context, status *api.SegmentStatus) error {
+	if status == nil {
+		return nil
+	}
+	value, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("failed to encode segment status: %w", err)
+	}
+	data, err := marshalEntity(client.Entity{
+		PartitionKey: segmentStatusPartitionKey(status.Space),
+		RowKey:       status.Segment,
+		Value:        value,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal segment status: %w", err)
+	}
+	if err := s.client.UpsertEntity(ctx, data, "Replace"); err != nil {
+		return fmt.Errorf("failed to write segment status: %w", err)
+	}
+	return nil
+}
+
+func segmentStatusPartitionKey(space string) string {
+	return lexkey.Encode(api.INVENTORY, api.SEGMENT_STATUSES, space).ToHexString()
+}
+
 func (s *AzureStore) retryInventoryUpdate(ctx context.Context, space, segment string) error {
 	const maxRetryAttempts = 3
 	const initialRetryDelay = 100 * time.Millisecond
@@ -1032,22 +1215,135 @@ func createSegmentStatus(space, segment string, entries []*api.Entry) *api.Segme
 }
 
 func isNotFoundError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "ResourceNotFound")
-}
-
-func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Check for transient errors based on error messages
-	errStr := err.Error()
-	return strings.Contains(errStr, "ServiceUnavailable") ||
-		strings.Contains(errStr, "429") ||
-		strings.Contains(errStr, "500") ||
-		strings.Contains(errStr, "502") ||
-		strings.Contains(errStr, "503") ||
-		strings.Contains(errStr, "504") ||
-		strings.Contains(errStr, "TooManyRequests")
+	var azureErr *client.AzureError
+	if errors.As(err, &azureErr) && azureErr != nil {
+		return azureErr.StatusCode == http.StatusNotFound || azureErr.Code == "ResourceNotFound"
+	}
+	return strings.Contains(err.Error(), "ResourceNotFound") || strings.Contains(err.Error(), "status=404")
+}
+
+func isRetryableError(err error) bool {
+	retryable, _ := classifyAzureError(err)
+	return retryable
+}
+
+func classifyAzureError(err error) (retryable bool, reason string) {
+	if err == nil {
+		return false, "none"
+	}
+	if errors.Is(err, context.Canceled) {
+		return false, "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false, "deadline_exceeded"
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return false, "network_closed"
+	}
+
+	var azureErr *client.AzureError
+	if errors.As(err, &azureErr) && azureErr != nil {
+		return classifyAzureHTTPStatus(azureErr.StatusCode)
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return true, "network_timeout"
+		}
+		return true, "network"
+	}
+
+	if status, ok := extractHTTPStatusCode(err.Error()); ok {
+		return classifyAzureHTTPStatus(status)
+	}
+
+	return false, "other"
+}
+
+func classifyAzureHTTPStatus(status int) (retryable bool, reason string) {
+	switch status {
+	case 408:
+		return true, "http_408"
+	case 429:
+		return true, "http_429"
+	case 500:
+		return true, "http_500"
+	case 502:
+		return true, "http_502"
+	case 503:
+		return true, "http_503"
+	case 504:
+		return true, "http_504"
+	case 400:
+		return false, "http_400"
+	case 401:
+		return false, "http_401"
+	case 403:
+		return false, "http_403"
+	case 404:
+		return false, "http_404"
+	case 409:
+		return false, "http_409"
+	case 410:
+		return false, "http_410"
+	default:
+		if status >= 400 && status < 500 {
+			return false, fmt.Sprintf("http_%d", status)
+		}
+		if status >= 500 && status < 600 {
+			return false, fmt.Sprintf("http_%d", status)
+		}
+		return false, "other"
+	}
+}
+
+func extractHTTPStatusCode(message string) (int, bool) {
+	msg := strings.ToLower(strings.TrimSpace(message))
+	if len(msg) >= 3 && isThreeDigitStatus(msg[:3]) {
+		status, err := strconv.Atoi(msg[:3])
+		if err == nil {
+			return status, true
+		}
+	}
+
+	for _, marker := range []string{"status=", "status "} {
+		idx := strings.Index(msg, marker)
+		if idx == -1 {
+			continue
+		}
+		start := idx + len(marker)
+		for start < len(msg) && msg[start] == ' ' {
+			start++
+		}
+		end := start
+		for end < len(msg) && msg[end] >= '0' && msg[end] <= '9' {
+			end++
+		}
+		if end-start == 3 && isThreeDigitStatus(msg[start:end]) {
+			status, err := strconv.Atoi(msg[start:end])
+			if err == nil {
+				return status, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+func isThreeDigitStatus(value string) bool {
+	if len(value) != 3 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeSnappyEntryEntity(value []byte) (*api.Entry, error) {

@@ -15,10 +15,15 @@ import (
 
 // ─── Notification & Subscription ───────────────────────────────────────────────
 
-// SubscribeToSegmentStatus represents a subscription request for segment status updates.
+// SubscribeToSegmentStatus represents a subscription request for segment status
+// updates. When Segment is "*", the subscription receives updates for all
+// segments in the space. On reconnect, subscriptions receive a latest-state
+// snapshot before live updates resume. Durable missed-update replay/cursors are
+// not part of the current subscription contract.
 type SubscribeToSegmentStatus struct {
-	Space   string `json:"space"`
-	Segment string `json:"segment"`
+	Space                    string `json:"space"`
+	Segment                  string `json:"segment"`
+	HeartbeatIntervalSeconds int64  `json:"heartbeat_interval_seconds"`
 }
 
 // GetDiscriminator returns the unique message type identifier for SubscribeToSegmentStatus.
@@ -35,6 +40,7 @@ type SegmentStatus struct {
 	FirstTimestamp int64  `json:"first_timestamp"`
 	LastSequence   uint64 `json:"last_sequence"`
 	LastTimestamp  int64  `json:"last_timestamp"`
+	Heartbeat      bool   `json:"heartbeat"`
 }
 
 // GetDiscriminator returns the unique message type identifier for SegmentStatus.

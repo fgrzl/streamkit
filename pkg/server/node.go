@@ -11,6 +11,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/fgrzl/enumerators"
@@ -22,6 +24,11 @@ import (
 	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/trace"
+)
+
+const (
+	minSubscriptionHeartbeatIntervalSeconds = 1
+	maxSubscriptionHeartbeatIntervalSeconds = 300
 )
 
 // Node represents a request handler that processes streaming operations
@@ -36,10 +43,12 @@ type Node interface {
 // NewNode creates a new Node instance with the specified store, optional message bus factory, and lease store.
 func NewNode(storeID uuid.UUID, store storage.Store, busFactory bus.MessageBusFactory, leaseStore *lease.Store) Node {
 	return &defaultNode{
-		storeID:    storeID,
-		store:      store,
-		busFactory: busFactory,
-		leaseStore: leaseStore,
+		storeID:                 storeID,
+		store:                   store,
+		busFactory:              busFactory,
+		leaseStore:              leaseStore,
+		notifyFailureThreshold:  defaultNotifyFailureThreshold,
+		notifyCircuitOpenWindow: defaultNotifyCircuitOpenWindow,
 	}
 }
 
@@ -48,7 +57,17 @@ type defaultNode struct {
 	store      storage.Store
 	busFactory bus.MessageBusFactory
 	leaseStore *lease.Store
+
+	notifyMu                sync.Mutex
+	notifyFailureCount      int
+	notifyCircuitOpenUntil  time.Time
+	notifyFailureThreshold  int
+	notifyCircuitOpenWindow time.Duration
 }
+
+const maxLeaseTTL = 24 * time.Hour
+const defaultNotifyFailureThreshold = 5
+const defaultNotifyCircuitOpenWindow = time.Minute
 
 func (n *defaultNode) Close() {
 	n.store.Close()
@@ -204,9 +223,24 @@ func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcq
 		bidi.CloseSend(nil)
 		return
 	}
+	if args.Key == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Holder == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
 	ttl := time.Duration(args.TTLSeconds) * time.Second
 	if ttl <= 0 {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if ttl > maxLeaseTTL {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
 		bidi.CloseSend(nil)
 		return
 	}
@@ -225,9 +259,24 @@ func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew
 		bidi.CloseSend(nil)
 		return
 	}
+	if args.Key == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Holder == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
 	ttl := time.Duration(args.TTLSeconds) * time.Second
 	if ttl <= 0 {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if ttl > maxLeaseTTL {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
 		bidi.CloseSend(nil)
 		return
 	}
@@ -243,6 +292,16 @@ func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew
 func (n *defaultNode) handleLeaseRelease(ctx context.Context, args *api.LeaseRelease, bidi api.BidiStream) {
 	if n.leaseStore == nil {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Key == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
+		bidi.CloseSend(nil)
+		return
+	}
+	if args.Holder == "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
 		bidi.CloseSend(nil)
 		return
 	}
@@ -276,13 +335,8 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 					StoreID:       n.storeID,
 					SegmentStatus: result,
 				}
-				if err := bus.Notify(notification); err != nil {
-					slog.WarnContext(ctx, "server: failed to publish segment notification",
-						logContextFields(ctx, n.storeID,
-							slog.String("space", result.Space),
-							slog.String("segment", result.Segment),
-							slog.Uint64("last_sequence", result.LastSequence),
-							"err", err)...)
+				if err := n.publishSegmentNotification(ctx, bus, notification); err != nil {
+					return err
 				}
 			}
 			return nil
@@ -298,6 +352,94 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 
 		bidi.CloseSend(nil)
 	})
+}
+
+func (n *defaultNode) publishSegmentNotification(ctx context.Context, messageBus bus.MessageBus, notification *api.SegmentNotification) error {
+	if messageBus == nil || notification == nil || notification.SegmentStatus == nil {
+		return nil
+	}
+
+	now := time.Now()
+	if err := n.checkNotifyCircuit(now); err != nil {
+		slog.WarnContext(ctx, "server: segment notification circuit open",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", notification.SegmentStatus.Space),
+				slog.String("segment", notification.SegmentStatus.Segment),
+				slog.Uint64("last_sequence", notification.SegmentStatus.LastSequence),
+				"err", err)...)
+		return err
+	}
+
+	if err := messageBus.Notify(notification); err != nil {
+		telemetry.RecordError(trace.SpanFromContext(ctx), err)
+		count, opened, retryAfter := n.recordNotifyFailure(now)
+		fields := logContextFields(ctx, n.storeID,
+			slog.String("space", notification.SegmentStatus.Space),
+			slog.String("segment", notification.SegmentStatus.Segment),
+			slog.Uint64("last_sequence", notification.SegmentStatus.LastSequence),
+			slog.Int("consecutive_failures", count),
+			"err", err)
+		if opened {
+			circuitErr := fmt.Errorf("segment notification circuit open after %d consecutive failures; retry after %s: %w", count, retryAfter.Round(time.Second), err)
+			slog.ErrorContext(ctx, "server: failed to publish segment notification; circuit opened",
+				append(fields, slog.Duration("retry_after", retryAfter))...)
+			return circuitErr
+		}
+		slog.WarnContext(ctx, "server: failed to publish segment notification", fields...)
+		return nil
+	}
+
+	if recovered := n.recordNotifySuccess(); recovered {
+		slog.InfoContext(ctx, "server: segment notification publishing recovered",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", notification.SegmentStatus.Space),
+				slog.String("segment", notification.SegmentStatus.Segment),
+				slog.Uint64("last_sequence", notification.SegmentStatus.LastSequence))...)
+	}
+	return nil
+}
+
+func (n *defaultNode) checkNotifyCircuit(now time.Time) error {
+	n.notifyMu.Lock()
+	defer n.notifyMu.Unlock()
+	if n.notifyCircuitOpenUntil.After(now) {
+		return fmt.Errorf("segment notification circuit open: retry after %s", n.notifyCircuitOpenUntil.Sub(now).Round(time.Second))
+	}
+	if !n.notifyCircuitOpenUntil.IsZero() {
+		n.notifyCircuitOpenUntil = time.Time{}
+		n.notifyFailureCount = 0
+	}
+	return nil
+}
+
+func (n *defaultNode) recordNotifyFailure(now time.Time) (count int, opened bool, retryAfter time.Duration) {
+	n.notifyMu.Lock()
+	defer n.notifyMu.Unlock()
+	n.notifyFailureCount++
+	count = n.notifyFailureCount
+	threshold := n.notifyFailureThreshold
+	if threshold <= 0 {
+		threshold = defaultNotifyFailureThreshold
+	}
+	window := n.notifyCircuitOpenWindow
+	if window <= 0 {
+		window = defaultNotifyCircuitOpenWindow
+	}
+	if count >= threshold {
+		n.notifyCircuitOpenUntil = now.Add(window)
+		opened = true
+		retryAfter = window
+	}
+	return count, opened, retryAfter
+}
+
+func (n *defaultNode) recordNotifySuccess() bool {
+	n.notifyMu.Lock()
+	defer n.notifyMu.Unlock()
+	recovered := n.notifyFailureCount > 0 || !n.notifyCircuitOpenUntil.IsZero()
+	n.notifyFailureCount = 0
+	n.notifyCircuitOpenUntil = time.Time{}
+	return recovered
 }
 
 func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi api.BidiStream) {
@@ -343,9 +485,28 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	}
 
 	route := api.GetSegmentNotificationRoute(n.storeID, args.Space)
+	var (
+		snapshotMu      sync.Mutex
+		snapshotPending = true
+		bufferedStatus  = make(map[string]*api.SegmentStatus)
+	)
+	bufferStatus := func(status *api.SegmentStatus) {
+		if status == nil {
+			return
+		}
+		bufferedStatus[status.Segment] = cloneSegmentStatus(status)
+	}
+	// Buffer live notifications until the current snapshot has been emitted so
+	// reconnects observe a stable "snapshot first, then live updates" sequence.
 	sub, err := bus.Subscribe(messageBus, route, func(ctx context.Context, msg *api.SegmentNotification) error {
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {
+			snapshotMu.Lock()
+			defer snapshotMu.Unlock()
+			if snapshotPending {
+				bufferStatus(msg.SegmentStatus)
+				return nil
+			}
 			return bidi.Encode(msg.SegmentStatus)
 		}
 		return nil
@@ -356,13 +517,74 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
+	// Use a dedicated subscription context so cleanup is deterministic and
+	// not tightly coupled to outer request context lifetime.
+	subCtx, cancelSub := context.WithCancel(ctx)
+	var cleanupOnce sync.Once
+	cleanup := func(closeErr error, closeBidi bool) {
+		cleanupOnce.Do(func() {
+			_ = sub.Unsubscribe()
+			cancelSub()
+			if closeBidi {
+				bidi.Close(closeErr)
+			}
+		})
+	}
+
+	snapshotStatuses, err := n.collectSubscriptionSnapshots(ctx, args)
+	if err != nil {
+		telemetry.RecordError(span, err)
+		slog.WarnContext(ctx, "server: failed to collect subscription snapshot",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment),
+				"err", err)...)
+		cleanup(err, true)
+		return
+	}
+
+	snapshotMu.Lock()
+	for _, status := range snapshotStatuses {
+		if err := bidi.Encode(status); err != nil {
+			snapshotMu.Unlock()
+			telemetry.RecordError(span, err)
+			slog.WarnContext(ctx, "server: failed to encode subscription snapshot",
+				logContextFields(ctx, n.storeID,
+					slog.String("space", args.Space),
+					slog.String("segment", args.Segment),
+					"err", err)...)
+			cleanup(err, true)
+			return
+		}
+	}
+	buffered := sortedBufferedStatuses(bufferedStatus)
+	for _, status := range buffered {
+		if err := bidi.Encode(status); err != nil {
+			snapshotMu.Unlock()
+			telemetry.RecordError(span, err)
+			slog.WarnContext(ctx, "server: failed to encode buffered subscription status",
+				logContextFields(ctx, n.storeID,
+					slog.String("space", args.Space),
+					slog.String("segment", args.Segment),
+					"err", err)...)
+			cleanup(err, true)
+			return
+		}
+	}
+	snapshotPending = false
+	snapshotMu.Unlock()
+
+	if heartbeatSeconds := clampSubscriptionHeartbeatIntervalSeconds(args.HeartbeatIntervalSeconds); heartbeatSeconds > 0 {
+		go n.streamSubscriptionHeartbeats(subCtx, args.Space, args.Segment, heartbeatSeconds, bidi)
+	}
+
 	// Clean up on bidi close or context cancellation
 	// Issue #6 FIX: Add panic recovery to cleanup goroutine
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.ErrorContext(ctx, "server: subscription cleanup goroutine panic",
-					logContextFields(ctx, n.storeID,
+				slog.ErrorContext(subCtx, "server: subscription cleanup goroutine panic",
+					logContextFields(subCtx, n.storeID,
 						slog.String("space", args.Space),
 						slog.String("segment", args.Segment),
 						slog.Any("panic", r))...)
@@ -370,12 +592,173 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		}()
 		select {
 		case <-bidi.Closed():
-			sub.Unsubscribe()
-		case <-ctx.Done():
-			sub.Unsubscribe()
-			bidi.Close(ctx.Err())
+			cleanup(nil, false)
+		case <-subCtx.Done():
+			cleanup(subCtx.Err(), true)
 		}
 	}()
+}
+
+func clampSubscriptionHeartbeatIntervalSeconds(seconds int64) int64 {
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds < minSubscriptionHeartbeatIntervalSeconds {
+		return minSubscriptionHeartbeatIntervalSeconds
+	}
+	if seconds > maxSubscriptionHeartbeatIntervalSeconds {
+		return maxSubscriptionHeartbeatIntervalSeconds
+	}
+	return seconds
+}
+
+func (n *defaultNode) streamSubscriptionHeartbeats(ctx context.Context, space, segment string, heartbeatSeconds int64, bidi api.BidiStream) {
+	interval := time.Duration(clampSubscriptionHeartbeatIntervalSeconds(heartbeatSeconds)) * time.Second
+	if interval <= 0 {
+		return
+	}
+
+	sendHeartbeat := func() error {
+		return bidi.Encode(&api.SegmentStatus{
+			Space:     space,
+			Segment:   segment,
+			Heartbeat: true,
+		})
+	}
+
+	if err := sendHeartbeat(); err != nil {
+		bidi.Close(err)
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-bidi.Closed():
+			return
+		case <-ticker.C:
+			if err := sendHeartbeat(); err != nil {
+				bidi.Close(err)
+				return
+			}
+		}
+	}
+}
+
+func (n *defaultNode) collectSubscriptionSnapshots(ctx context.Context, args *api.SubscribeToSegmentStatus) ([]*api.SegmentStatus, error) {
+	if args == nil {
+		return nil, nil
+	}
+	if args.Segment != "*" {
+		status, err := n.segmentSnapshot(ctx, args.Space, args.Segment)
+		if err != nil || status == nil {
+			return nil, err
+		}
+		return []*api.SegmentStatus{status}, nil
+	}
+
+	segments, err := enumerators.ToSlice(n.store.GetSegments(ctx, args.Space))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(segments)
+
+	statuses := make([]*api.SegmentStatus, 0, len(segments))
+	for _, segment := range segments {
+		status, err := n.segmentSnapshot(ctx, args.Space, segment)
+		if err != nil {
+			return nil, err
+		}
+		if status != nil {
+			statuses = append(statuses, status)
+		}
+	}
+	return statuses, nil
+}
+
+func (n *defaultNode) segmentSnapshot(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	if statusStore, ok := n.store.(storage.SegmentStatusStore); ok {
+		return statusStore.GetSegmentStatus(ctx, space, segment)
+	}
+
+	lastEntry, err := n.store.Peek(ctx, space, segment)
+	if err != nil {
+		return nil, err
+	}
+	if lastEntry == nil || lastEntry.Sequence == 0 {
+		return nil, nil
+	}
+
+	firstEntry, err := firstSegmentEntry(ctx, n.store, space, segment)
+	if err != nil {
+		return nil, err
+	}
+	if firstEntry == nil {
+		firstEntry = lastEntry
+	}
+
+	return &api.SegmentStatus{
+		Space:          space,
+		Segment:        segment,
+		FirstSequence:  firstEntry.Sequence,
+		FirstTimestamp: firstEntry.Timestamp,
+		LastSequence:   lastEntry.Sequence,
+		LastTimestamp:  lastEntry.Timestamp,
+	}, nil
+}
+
+func firstSegmentEntry(ctx context.Context, store storage.Store, space, segment string) (*api.Entry, error) {
+	if store == nil {
+		return nil, nil
+	}
+
+	enum := store.ConsumeSegment(ctx, &api.ConsumeSegment{
+		Space:       space,
+		Segment:     segment,
+		MinSequence: 1,
+	})
+	if enum == nil {
+		return nil, nil
+	}
+	defer enum.Dispose()
+
+	if !enum.MoveNext() {
+		if err := enum.Err(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	return enum.Current()
+}
+
+func cloneSegmentStatus(status *api.SegmentStatus) *api.SegmentStatus {
+	if status == nil {
+		return nil
+	}
+	cloned := *status
+	return &cloned
+}
+
+func sortedBufferedStatuses(buffered map[string]*api.SegmentStatus) []*api.SegmentStatus {
+	if len(buffered) == 0 {
+		return nil
+	}
+
+	segments := make([]string, 0, len(buffered))
+	for segment := range buffered {
+		segments = append(segments, segment)
+	}
+	sort.Strings(segments)
+
+	statuses := make([]*api.SegmentStatus, 0, len(segments))
+	for _, segment := range segments {
+		statuses = append(statuses, buffered[segment])
+	}
+	return statuses
 }
 
 func (n *defaultNode) getBus(ctx context.Context) bus.MessageBus {

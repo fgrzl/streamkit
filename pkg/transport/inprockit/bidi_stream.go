@@ -7,20 +7,25 @@ import (
 	"io"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/pkg/api"
 )
 
 type InProcBidiStream struct {
-	sendChan    chan any
-	recvChan    chan any
-	recvOwned   bool
-	sendClosed  sync.Once
-	sendCloseMu sync.Mutex
-	closeOnce   sync.Once
-	closeErr    error
-	closed      chan struct{}
+	sendChan       chan any
+	recvChan       chan any
+	recvOwned      bool
+	peer           *InProcBidiStream
+	sendCloseOnce  sync.Once
+	sendStateMu    sync.RWMutex
+	sendCloseMu    sync.Mutex
+	closeOnce      sync.Once
+	closeErr       error
+	closed         chan struct{}
+	sendClosedFlag atomic.Uint32
+	closedFlag     atomic.Uint32
 }
 
 var payloadBufPool = sync.Pool{
@@ -49,24 +54,52 @@ func NewInProcBidiStreamLoopback() *InProcBidiStream {
 }
 
 func (s *InProcBidiStream) Encode(m any) error {
-	// Issue #7: Removed closeErr check which had a data race (not synchronized).
-	// The closed channel select below is the correct synchronization mechanism.
-	// For in-process streams we can avoid serialization overhead by sending
-	// the object directly across the channel. The receiver will attempt a
-	// direct type assignment before falling back to JSON decoding when needed.
-	select {
-	case <-s.closed:
+	// Once a local or peer close has been observed, Encode must fail
+	// deterministically. A plain select on <-closed vs sendChan is insufficient
+	// because both cases can be ready and select may pick the send path.
+	if s.sendClosedFlag.Load() != 0 || s.closedFlag.Load() != 0 {
 		return io.ErrClosedPipe
+	}
+	s.sendStateMu.RLock()
+	defer s.sendStateMu.RUnlock()
+	if s.sendClosedFlag.Load() != 0 || s.closedFlag.Load() != 0 {
+		return io.ErrClosedPipe
+	}
+	select {
 	case s.sendChan <- m:
 		return nil
+	case <-s.closed:
+		return io.ErrClosedPipe
 	}
 }
 
 func (s *InProcBidiStream) Decode(v any) error {
-	msg, ok := <-s.recvChan
+	msg, ok, err := s.recv()
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return s.EndOfStreamError()
 	}
+	return s.decodeMessage(msg, v)
+}
+
+func (s *InProcBidiStream) recv() (any, bool, error) {
+	select {
+	case msg, ok := <-s.recvChan:
+		return msg, ok, nil
+	default:
+	}
+
+	select {
+	case msg, ok := <-s.recvChan:
+		return msg, ok, nil
+	case <-s.closed:
+		return nil, false, s.closedErr()
+	}
+}
+
+func (s *InProcBidiStream) decodeMessage(msg any, v any) error {
 	// Extract raw payloads (string/[]byte/*bytes.Buffer) and allow short-circuiting
 	// for string destinations.
 	payload, bufPtr, handled := extractRawPayload(msg, v)
@@ -104,6 +137,16 @@ func (s *InProcBidiStream) Decode(v any) error {
 		payloadBufPool.Put(bufPtr)
 	}
 	return err
+}
+
+func (s *InProcBidiStream) closedErr() error {
+	s.sendCloseMu.Lock()
+	err := s.closeErr
+	s.sendCloseMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return io.EOF
 }
 
 // extractRawPayload handles raw payload types (string, []byte, *bytes.Buffer)
@@ -389,10 +432,16 @@ func (s *InProcBidiStream) CloseSend(err error) error {
 }
 
 func (s *InProcBidiStream) Close(err error) {
-	s.closeSend(err)
+	peer := s.peer
 	s.closeOnce.Do(func() {
+		s.recordCloseErr(err)
+		s.closedFlag.Store(1)
 		close(s.closed)
 	})
+	if peer != nil {
+		peer.closeRemote(err)
+	}
+	s.closeSend(err)
 }
 
 func (s *InProcBidiStream) Closed() <-chan struct{} {
@@ -408,27 +457,42 @@ func LinkStreams(client, server *InProcBidiStream) {
 	// This avoids creating forwarding goroutines and an extra channel hop per message.
 	server.recvChan = client.sendChan
 	server.recvOwned = false
+	server.peer = client
 	client.recvChan = server.sendChan
 	client.recvOwned = false
+	client.peer = server
+}
+
+func (s *InProcBidiStream) closeRemote(err error) {
+	s.recordCloseErr(err)
+	s.closeOnce.Do(func() {
+		s.closedFlag.Store(1)
+		close(s.closed)
+	})
 }
 
 func (s *InProcBidiStream) closeSend(err error) {
 	var didClose bool
-	s.sendClosed.Do(func() {
-		s.sendCloseMu.Lock()
-		s.closeErr = err
-		s.sendCloseMu.Unlock()
+	s.sendCloseOnce.Do(func() {
+		s.sendClosedFlag.Store(1)
+		s.recordCloseErr(err)
+		s.sendStateMu.Lock()
+		defer s.sendStateMu.Unlock()
 		didClose = true
 		close(s.sendChan)
 	})
 	// If a later caller attempts to close with a non-nil error, prefer the non-nil error
 	// over a previously set nil to ensure remote-side errors are observable locally.
 	if !didClose && err != nil {
-		s.sendCloseMu.Lock()
-		if s.closeErr == nil {
-			s.closeErr = err
-		}
-		s.sendCloseMu.Unlock()
+		s.recordCloseErr(err)
+	}
+}
+
+func (s *InProcBidiStream) recordCloseErr(err error) {
+	s.sendCloseMu.Lock()
+	defer s.sendCloseMu.Unlock()
+	if s.closeErr == nil || err != nil {
+		s.closeErr = err
 	}
 }
 
