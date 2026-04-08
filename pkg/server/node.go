@@ -37,10 +37,12 @@ type Node interface {
 // NewNode creates a new Node instance with the specified store, optional message bus factory, and lease store.
 func NewNode(storeID uuid.UUID, store storage.Store, busFactory bus.MessageBusFactory, leaseStore *lease.Store) Node {
 	return &defaultNode{
-		storeID:    storeID,
-		store:      store,
-		busFactory: busFactory,
-		leaseStore: leaseStore,
+		storeID:                 storeID,
+		store:                   store,
+		busFactory:              busFactory,
+		leaseStore:              leaseStore,
+		notifyFailureThreshold:  defaultNotifyFailureThreshold,
+		notifyCircuitOpenWindow: defaultNotifyCircuitOpenWindow,
 	}
 }
 
@@ -49,9 +51,17 @@ type defaultNode struct {
 	store      storage.Store
 	busFactory bus.MessageBusFactory
 	leaseStore *lease.Store
+
+	notifyMu                sync.Mutex
+	notifyFailureCount      int
+	notifyCircuitOpenUntil  time.Time
+	notifyFailureThreshold  int
+	notifyCircuitOpenWindow time.Duration
 }
 
 const maxLeaseTTL = 24 * time.Hour
+const defaultNotifyFailureThreshold = 5
+const defaultNotifyCircuitOpenWindow = time.Minute
 
 func (n *defaultNode) Close() {
 	n.store.Close()
@@ -319,13 +329,8 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 					StoreID:       n.storeID,
 					SegmentStatus: result,
 				}
-				if err := bus.Notify(notification); err != nil {
-					slog.WarnContext(ctx, "server: failed to publish segment notification",
-						logContextFields(ctx, n.storeID,
-							slog.String("space", result.Space),
-							slog.String("segment", result.Segment),
-							slog.Uint64("last_sequence", result.LastSequence),
-							"err", err)...)
+				if err := n.publishSegmentNotification(ctx, bus, notification); err != nil {
+					return err
 				}
 			}
 			return nil
@@ -341,6 +346,94 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 
 		bidi.CloseSend(nil)
 	})
+}
+
+func (n *defaultNode) publishSegmentNotification(ctx context.Context, messageBus bus.MessageBus, notification *api.SegmentNotification) error {
+	if messageBus == nil || notification == nil || notification.SegmentStatus == nil {
+		return nil
+	}
+
+	now := time.Now()
+	if err := n.checkNotifyCircuit(now); err != nil {
+		slog.WarnContext(ctx, "server: segment notification circuit open",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", notification.SegmentStatus.Space),
+				slog.String("segment", notification.SegmentStatus.Segment),
+				slog.Uint64("last_sequence", notification.SegmentStatus.LastSequence),
+				"err", err)...)
+		return err
+	}
+
+	if err := messageBus.Notify(notification); err != nil {
+		telemetry.RecordError(trace.SpanFromContext(ctx), err)
+		count, opened, retryAfter := n.recordNotifyFailure(now)
+		fields := logContextFields(ctx, n.storeID,
+			slog.String("space", notification.SegmentStatus.Space),
+			slog.String("segment", notification.SegmentStatus.Segment),
+			slog.Uint64("last_sequence", notification.SegmentStatus.LastSequence),
+			slog.Int("consecutive_failures", count),
+			"err", err)
+		if opened {
+			circuitErr := fmt.Errorf("segment notification circuit open after %d consecutive failures; retry after %s: %w", count, retryAfter.Round(time.Second), err)
+			slog.ErrorContext(ctx, "server: failed to publish segment notification; circuit opened",
+				append(fields, slog.Duration("retry_after", retryAfter))...)
+			return circuitErr
+		}
+		slog.WarnContext(ctx, "server: failed to publish segment notification", fields...)
+		return nil
+	}
+
+	if recovered := n.recordNotifySuccess(); recovered {
+		slog.InfoContext(ctx, "server: segment notification publishing recovered",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", notification.SegmentStatus.Space),
+				slog.String("segment", notification.SegmentStatus.Segment),
+				slog.Uint64("last_sequence", notification.SegmentStatus.LastSequence))...)
+	}
+	return nil
+}
+
+func (n *defaultNode) checkNotifyCircuit(now time.Time) error {
+	n.notifyMu.Lock()
+	defer n.notifyMu.Unlock()
+	if n.notifyCircuitOpenUntil.After(now) {
+		return fmt.Errorf("segment notification circuit open: retry after %s", n.notifyCircuitOpenUntil.Sub(now).Round(time.Second))
+	}
+	if !n.notifyCircuitOpenUntil.IsZero() {
+		n.notifyCircuitOpenUntil = time.Time{}
+		n.notifyFailureCount = 0
+	}
+	return nil
+}
+
+func (n *defaultNode) recordNotifyFailure(now time.Time) (count int, opened bool, retryAfter time.Duration) {
+	n.notifyMu.Lock()
+	defer n.notifyMu.Unlock()
+	n.notifyFailureCount++
+	count = n.notifyFailureCount
+	threshold := n.notifyFailureThreshold
+	if threshold <= 0 {
+		threshold = defaultNotifyFailureThreshold
+	}
+	window := n.notifyCircuitOpenWindow
+	if window <= 0 {
+		window = defaultNotifyCircuitOpenWindow
+	}
+	if count >= threshold {
+		n.notifyCircuitOpenUntil = now.Add(window)
+		opened = true
+		retryAfter = window
+	}
+	return count, opened, retryAfter
+}
+
+func (n *defaultNode) recordNotifySuccess() bool {
+	n.notifyMu.Lock()
+	defer n.notifyMu.Unlock()
+	recovered := n.notifyFailureCount > 0 || !n.notifyCircuitOpenUntil.IsZero()
+	n.notifyFailureCount = 0
+	n.notifyCircuitOpenUntil = time.Time{}
+	return recovered
 }
 
 func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi api.BidiStream) {

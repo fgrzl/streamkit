@@ -89,10 +89,13 @@ type mockMessageBus struct {
 	route        bus.Route
 	handler      bus.MessageHandler
 	subscription *mockBusSubscription
+	notifyErr    error
+	notifyCalls  atomic.Int32
 }
 
 func (b *mockMessageBus) Notify(msg bus.Message) error {
-	return nil
+	b.notifyCalls.Add(1)
+	return b.notifyErr
 }
 
 func (b *mockMessageBus) NotifyWithContext(ctx context.Context, msg bus.Message) error {
@@ -255,6 +258,45 @@ func TestProduceNotifiesBus(t *testing.T) {
 	require.Len(t, bidi.encoded, 1, "expected 1 encoded status")
 	// we don't configure a message bus in this test; ensure we encoded status
 	// (notification behavior is exercised elsewhere with an actual bus)
+}
+
+func TestProduceOpensNotificationCircuitAfterRepeatedBusFailures(t *testing.T) {
+	statuses := []*api.SegmentStatus{{Space: "s", Segment: "seg", LastSequence: 1}}
+	store := &mockStore{statuses: statuses}
+	messageBus := &mockMessageBus{notifyErr: errors.New("notify failed")}
+	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore()).(*defaultNode)
+	node.notifyFailureThreshold = 2
+	node.notifyCircuitOpenWindow = time.Hour
+
+	first := newMockBidi(&polymorphic.Envelope{Content: &api.Produce{Space: "s", Segment: "seg"}})
+	node.Handle(context.Background(), first)
+	waitForClosed(t, first)
+	require.NoError(t, first.closeSendErr)
+	require.Equal(t, int32(1), messageBus.notifyCalls.Load())
+
+	second := newMockBidi(&polymorphic.Envelope{Content: &api.Produce{Space: "s", Segment: "seg"}})
+	node.Handle(context.Background(), second)
+	waitForClosed(t, second)
+	require.ErrorContains(t, second.closeSendErr, "segment notification circuit open after 2 consecutive failures")
+	require.Equal(t, int32(2), messageBus.notifyCalls.Load())
+
+	messageBus.notifyErr = nil
+	third := newMockBidi(&polymorphic.Envelope{Content: &api.Produce{Space: "s", Segment: "seg"}})
+	node.Handle(context.Background(), third)
+	waitForClosed(t, third)
+	require.ErrorContains(t, third.closeSendErr, "segment notification circuit open")
+	require.Equal(t, int32(2), messageBus.notifyCalls.Load(), "expected circuit-open produce to fail fast without notify call")
+
+	node.notifyMu.Lock()
+	node.notifyCircuitOpenUntil = time.Now().Add(-time.Second)
+	node.notifyMu.Unlock()
+
+	fourth := newMockBidi(&polymorphic.Envelope{Content: &api.Produce{Space: "s", Segment: "seg"}})
+	node.Handle(context.Background(), fourth)
+	waitForClosed(t, fourth)
+	require.NoError(t, fourth.closeSendErr)
+	require.Equal(t, int32(3), messageBus.notifyCalls.Load())
+	require.Equal(t, 0, node.notifyFailureCount)
 }
 
 func TestHandleInvalidMsgType(t *testing.T) {
