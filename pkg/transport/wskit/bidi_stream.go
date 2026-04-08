@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -42,7 +43,7 @@ func NewMuxerBidiStream(
 ) *MuxerBidiStream {
 	s := &MuxerBidiStream{
 		encode:   encode,
-		recvChan: make(chan any, 256),
+		recvChan: make(chan any, defaultStreamRecvQueueSize),
 		closed:   make(chan struct{}),
 		onClose:  onClose,
 	}
@@ -291,6 +292,37 @@ func (c *MuxerBidiStream) Offer(msg any) (ok bool) {
 	case <-c.closed:
 		return false
 	default:
+		return false
+	}
+}
+
+// OfferWithin attempts to deliver a message to the stream, waiting up to the
+// provided timeout for receive buffer headroom before giving up.
+func (c *MuxerBidiStream) OfferWithin(msg any, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return c.Offer(msg)
+	}
+	if atomic.LoadUint32(&c.closedFlag) != 0 {
+		return false
+	}
+
+	select {
+	case c.recvChan <- msg:
+		return true
+	case <-c.closed:
+		return false
+	default:
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case c.recvChan <- msg:
+		return true
+	case <-c.closed:
+		return false
+	case <-timer.C:
 		return false
 	}
 }

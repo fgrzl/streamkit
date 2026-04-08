@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -162,6 +163,35 @@ func TestOfferReturnsFalseWhenBufferIsFull(t *testing.T) {
 	}
 
 	assert.False(t, s.Offer([]byte(`"overflow"`)))
+}
+
+func TestOfferWithinWaitsForBufferHeadroom(t *testing.T) {
+	s, _ := newCapturingStream()
+	s.recvChan = make(chan any, 1)
+	require.True(t, s.Offer([]byte(`"blocked"`)))
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		<-s.recvChan
+	}()
+
+	start := time.Now()
+	require.True(t, s.OfferWithin([]byte(`"recovered"`), 100*time.Millisecond))
+	assert.GreaterOrEqual(t, time.Since(start), 10*time.Millisecond)
+
+	var value string
+	require.NoError(t, s.Decode(&value))
+	assert.Equal(t, "recovered", value)
+}
+
+func TestOfferWithinReturnsFalseWhenBufferStaysFull(t *testing.T) {
+	s, _ := newCapturingStream()
+	s.recvChan = make(chan any, 1)
+	require.True(t, s.Offer([]byte(`"blocked"`)))
+
+	start := time.Now()
+	assert.False(t, s.OfferWithin([]byte(`"overflow"`), 20*time.Millisecond))
+	assert.GreaterOrEqual(t, time.Since(start), 20*time.Millisecond)
 }
 
 func TestEndOfStreamError(t *testing.T) {

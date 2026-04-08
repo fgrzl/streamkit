@@ -130,6 +130,8 @@ const (
 	defaultMaxLogicalStreams                = 1024
 	defaultMaxFramePayloadBytes             = 8 << 20
 	defaultMaxMessagePayloadBytes           = 6 << 20
+	defaultStreamRecvQueueSize              = 512
+	defaultStreamRecvOfferTimeout           = 100 * time.Millisecond
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -850,9 +852,18 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		slog.DebugContext(ctx, "muxer: dropping message for closed stream", m.msgLogFields(msg)...)
 		return
 	}
+	if bidi.OfferWithin(msg.Payload, defaultStreamRecvOfferTimeout) {
+		return
+	}
+	if bidi.IsClosed() {
+		slog.DebugContext(ctx, "muxer: dropping message for closed stream after waiting", m.msgLogFields(msg)...)
+		return
+	}
 
 	slog.WarnContext(ctx, "muxer: stream receive buffer overloaded; closing channel",
-		m.msgLogFields(msg, slog.String("error_type", classifyTransportError(ErrStreamOverloaded)))...)
+		m.msgLogFields(msg,
+			slog.String("error_type", classifyTransportError(ErrStreamOverloaded)),
+			slog.Duration("offer_timeout", defaultStreamRecvOfferTimeout))...)
 	m.tombstoneStream(msg.ChannelID, ErrStreamOverloaded)
 
 	if msg == nil || msg.ChannelID == uuid.Nil {

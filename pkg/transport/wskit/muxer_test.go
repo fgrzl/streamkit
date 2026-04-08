@@ -565,6 +565,67 @@ func TestDeliverToStreamClosesOnlyOverloadedChannel(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]error),
+		done:       make(chan struct{}),
+		sendJSON:   func(_ *websocket.Conn, _ interface{}) error { return nil },
+	}
+
+	storeID := uuid.New()
+	slowID := uuid.New()
+	fastID := uuid.New()
+	slow := m.register(context.Background(), storeID, slowID)
+	fast := m.register(context.Background(), storeID, fastID)
+
+	slow.recvChan = make(chan any, 1)
+	require.True(t, slow.Offer([]byte(`"blocked"`)))
+
+	done := make(chan struct{})
+	go func() {
+		m.deliverToStream(slow, context.Background(), &MuxerMsg{
+			ControlType: ControlTypeData,
+			StoreID:     storeID,
+			ChannelID:   slowID,
+			Payload:     []byte(`"recovered"`),
+		})
+		close(done)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("deliverToStream should wait for headroom before returning")
+	default:
+	}
+
+	<-slow.recvChan
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("deliverToStream did not resume after temporary backpressure")
+	}
+
+	assert.False(t, slow.IsClosed())
+	var slowValue string
+	require.NoError(t, slow.Decode(&slowValue))
+	assert.Equal(t, "recovered", slowValue)
+
+	m.deliverToStream(fast, context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   fastID,
+		Payload:     []byte(`"ok"`),
+	})
+	var fastValue string
+	require.NoError(t, fast.Decode(&fastValue))
+	assert.Equal(t, "ok", fastValue)
+}
+
 func TestGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {
 	manager := &fakeNodeManager{}
 	channelID := uuid.New()

@@ -200,7 +200,7 @@ func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) e
 	// RowKey encodes timestamp + segment + sequence, so we filter on timestamp range
 	var rLower, rUpper string
 	if len(args.Offset) > 0 {
-		rLower = args.Offset.ToHexString()
+		rLower = normalizeSpaceOffsetRowKey(args.Space, args.Offset)
 	} else {
 		rLower = lexkey.EncodeFirst(bounds.Min).ToHexString()
 	}
@@ -220,6 +220,18 @@ func (s *AzureStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) e
 	return enumerators.TakeWhile(entries, func(e *api.Entry) bool {
 		return e.Timestamp > bounds.Min && e.Timestamp <= bounds.Max
 	})
+}
+
+func normalizeSpaceOffsetRowKey(space string, offset lexkey.LexKey) string {
+	if len(offset) == 0 {
+		return ""
+	}
+	rowKey := offset.ToHexString()
+	prefix := lexkey.Encode(api.DATA, api.SPACES, space).ToHexString()
+	if strings.HasPrefix(rowKey, prefix) {
+		return strings.TrimPrefix(rowKey[len(prefix):], "00")
+	}
+	return rowKey
 }
 
 func (s *AzureStore) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {

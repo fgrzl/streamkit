@@ -196,6 +196,29 @@ type activeSubscription struct {
 	retryCh            chan struct{}            // nudges an active stream to reconnect immediately
 }
 
+type storedSubscriptionError string
+
+func (e storedSubscriptionError) Error() string {
+	return string(e)
+}
+
+func (s *activeSubscription) setLastError(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.lastError.Store(storedSubscriptionError(err.Error()))
+}
+
+func (s *activeSubscription) loadLastError() error {
+	if s == nil {
+		return nil
+	}
+	if e, ok := s.lastError.Load().(storedSubscriptionError); ok && e != "" {
+		return e
+	}
+	return nil
+}
+
 // reconnectRequest is sent by a subscription goroutine to enqueue itself for reconnection.
 type reconnectRequest struct {
 	sub        *activeSubscription
@@ -305,6 +328,7 @@ type resilienceEnumerator struct {
 	innerEnum enumerators.Enumerator[*Entry]
 
 	lastEntry      *Entry
+	consumeOffsets map[string]lexkey.LexKey
 	lastErr        error
 	attemptCount   int
 	maxAttempts    int
@@ -750,6 +774,7 @@ func (e *resilienceEnumerator) MoveNext() bool {
 				continue
 			}
 			e.lastEntry = entry
+			e.recordResumePosition(entry)
 			// Metrics: record consume latency if available
 			if e.client != nil && e.client.metrics != nil {
 				e.client.metrics.RecordConsumeLatency(entry.Space, entry.Segment, time.Since(start))
@@ -798,6 +823,19 @@ func (e *resilienceEnumerator) Dispose() {
 	}
 }
 
+func (e *resilienceEnumerator) recordResumePosition(entry *Entry) {
+	if e == nil || entry == nil {
+		return
+	}
+	if _, ok := e.args.(*api.Consume); !ok {
+		return
+	}
+	if e.consumeOffsets == nil {
+		e.consumeOffsets = make(map[string]lexkey.LexKey)
+	}
+	e.consumeOffsets[entry.Space] = entry.GetSpaceOffset()
+}
+
 // createStream creates a new stream for the consume operation
 func (e *resilienceEnumerator) createStream() (api.BidiStream, error) {
 	// If we have consumed entries previously, update the args to resume from
@@ -834,7 +872,14 @@ func (e *resilienceEnumerator) updateConsumePosition() {
 	case *api.Consume:
 		// For Consume (multi-space), update the per-space offset so the next stream
 		// resumes strictly after the last delivered entry in that space.
-		if e.lastEntry != nil && args.Offsets != nil {
+		if args.Offsets == nil {
+			args.Offsets = make(map[string]lexkey.LexKey)
+		}
+		if len(e.consumeOffsets) > 0 {
+			for space, offset := range e.consumeOffsets {
+				args.Offsets[space] = offset
+			}
+		} else if e.lastEntry != nil {
 			args.Offsets[e.lastEntry.Space] = e.lastEntry.GetSpaceOffset()
 		}
 	}
@@ -858,10 +903,18 @@ func (e *resilienceEnumerator) updateArgsWithOffset() api.Routeable {
 		return &newArgs
 	case *api.Consume:
 		newArgs := *args
-		if newArgs.Offsets == nil {
-			newArgs.Offsets = make(map[string]lexkey.LexKey)
+		baseOffsets := args.Offsets
+		newArgs.Offsets = make(map[string]lexkey.LexKey, len(baseOffsets)+len(e.consumeOffsets))
+		for space, offset := range baseOffsets {
+			newArgs.Offsets[space] = offset
 		}
-		newArgs.Offsets[e.lastEntry.Space] = e.lastEntry.GetSpaceOffset()
+		if len(e.consumeOffsets) > 0 {
+			for space, offset := range e.consumeOffsets {
+				newArgs.Offsets[space] = offset
+			}
+		} else {
+			newArgs.Offsets[e.lastEntry.Space] = e.lastEntry.GetSpaceOffset()
+		}
 		return &newArgs
 	}
 
@@ -886,7 +939,7 @@ func newResilienceEnumerator(client *client, ctx context.Context, storeID uuid.U
 		case <-enumCtx.Done():
 		}
 	}()
-	return &resilienceEnumerator{
+	enum := &resilienceEnumerator{
 		client:       client,
 		storeID:      storeID,
 		args:         args,
@@ -895,6 +948,13 @@ func newResilienceEnumerator(client *client, ctx context.Context, storeID uuid.U
 		maxAttempts:  7, // Same as subscription retry logic
 		attemptCount: 0,
 	}
+	if consumeArgs, ok := args.(*api.Consume); ok && len(consumeArgs.Offsets) > 0 {
+		enum.consumeOffsets = make(map[string]lexkey.LexKey, len(consumeArgs.Offsets))
+		for space, offset := range consumeArgs.Offsets {
+			enum.consumeOffsets[space] = offset
+		}
+	}
+	return enum
 }
 
 func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*Entry, error) {
@@ -1411,7 +1471,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 				case <-timeoutCh:
 					timeoutErr := fmt.Errorf("%w after %s", errSubscriptionHeartbeatLost, heartbeatTimeout)
 					activeSub.failureCount.Add(1)
-					activeSub.lastError.Store(timeoutErr)
+					activeSub.setLastError(timeoutErr)
 					slog.WarnContext(subCtx, "client: subscription heartbeat timed out",
 						appendClientLogFields(subscriptionLogFields(activeSub),
 							slog.Int("failure_count", int(activeSub.failureCount.Load())),
@@ -1427,7 +1487,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 							streamErr = errSubscriptionReaderStopped
 						}
 						activeSub.failureCount.Add(1)
-						activeSub.lastError.Store(streamErr)
+						activeSub.setLastError(streamErr)
 						slog.WarnContext(subCtx, "client: subscription reader stopped unexpectedly",
 							appendClientLogFields(subscriptionLogFields(activeSub),
 								slog.Int("failure_count", int(activeSub.failureCount.Load())),
@@ -1437,7 +1497,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 					}
 					if result.err != nil {
 						activeSub.failureCount.Add(1)
-						activeSub.lastError.Store(result.err)
+						activeSub.setLastError(result.err)
 						slog.WarnContext(subCtx, "client: subscription stream decode failed",
 							appendClientLogFields(subscriptionLogFields(activeSub),
 								slog.Int("failure_count", int(activeSub.failureCount.Load())),
@@ -1572,7 +1632,7 @@ func (c *client) startReconnectDispatcher() {
 					stream, err := c.provider.CallStream(sub.ctx, sub.storeID, sub.initMsg)
 					if err != nil {
 						sub.failureCount.Add(1)
-						sub.lastError.Store(err)
+						sub.setLastError(err)
 						slog.WarnContext(sub.ctx, "client: subscription reconnect failed",
 							appendClientLogFields(subscriptionLogFields(sub),
 								slog.Int("failure_count", int(sub.failureCount.Load())),
@@ -1751,16 +1811,11 @@ func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
 		status = s
 	}
 
-	var lastErr error
-	if e, ok := sub.lastError.Load().(error); ok {
-		lastErr = e
-	}
-
 	return &SubscriptionStatus{
 		ID:               sub.id,
 		Status:           status,
 		FailureCount:     sub.failureCount.Load(),
-		LastError:        lastErr,
+		LastError:        sub.loadLastError(),
 		LastSequence:     sub.lastDelivered.Load(),
 		HandlerTimeouts:  sub.handlerTimeouts.Load(),
 		HandlerPanics:    sub.handlerPanics.Load(),

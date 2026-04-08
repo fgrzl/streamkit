@@ -132,6 +132,19 @@ func TestShouldCreateSegmentStatusFromFirstAndLastEntry(t *testing.T) {
 	assert.Equal(t, int64(1200), status.LastTimestamp)
 }
 
+func TestNormalizeSpaceOffsetRowKeyShouldStripSpacePrefix(t *testing.T) {
+	entry := &api.Entry{
+		Space:     "space-a",
+		Segment:   "segment-a",
+		Sequence:  7,
+		Timestamp: 1234,
+	}
+
+	rowKey := normalizeSpaceOffsetRowKey(entry.Space, entry.GetSpaceOffset())
+
+	assert.Equal(t, lexkey.Encode(entry.Timestamp, entry.Segment, entry.Sequence).ToHexString(), rowKey)
+}
+
 func TestShouldCreateTransactionAndEntityWithExpectedMetadata(t *testing.T) {
 	entries := []*api.Entry{
 		{TRX: api.TRX{ID: uuid.New(), Number: 4}, Space: "space-a", Segment: "segment-a", Sequence: 5, Timestamp: 100},

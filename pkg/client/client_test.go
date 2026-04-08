@@ -1424,6 +1424,24 @@ func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 	sub.Unsubscribe()
 }
 
+func TestSubscriptionStatusHandlesDifferentConcreteErrorTypes(t *testing.T) {
+	c := NewClient(&mockProvider{}).(*client)
+	sub := &activeSubscription{id: "sub-1"}
+	sub.status.Store("reconnecting")
+	sub.setLastError(errors.New("first failure"))
+	sub.setLastError(context.DeadlineExceeded)
+
+	c.subscriptionsMu.Lock()
+	c.subscriptions[sub.id] = sub
+	c.subscriptionsMu.Unlock()
+
+	status := c.GetSubscriptionStatus(sub.id)
+	require.NotNil(t, status)
+	require.NotNil(t, status.LastError)
+	assert.Equal(t, "reconnecting", status.Status)
+	assert.Equal(t, context.DeadlineExceeded.Error(), status.LastError.Error())
+}
+
 func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSaturate(t *testing.T) {
 	var decodeCount atomic.Int32
 	firstHandlerStarted := make(chan struct{})
@@ -2024,6 +2042,84 @@ func TestResilienceEnumeratorResumesConsume(t *testing.T) {
 	} else {
 		t.Fatalf("expected Consume, got %T", capturedArgs[len(capturedArgs)-1])
 	}
+}
+
+func TestResilienceEnumeratorResumesConsumeAcrossSpaces(t *testing.T) {
+	var calls int
+	var capturedArgs []api.Routeable
+
+	firstStreamEntries := []*api.Entry{
+		{Sequence: 1, Timestamp: 100, Space: "spaceA", Segment: "segA"},
+		{Sequence: 1, Timestamp: 200, Space: "spaceB", Segment: "segB"},
+	}
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			calls++
+			callNumber := calls
+			capturedArgs = append(capturedArgs, routeable)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			index := 0
+			stream.decodeFn = func(m any) error {
+				var entry *api.Entry
+				switch {
+				case callNumber == 1 && index < len(firstStreamEntries):
+					entry = firstStreamEntries[index]
+					index++
+				case callNumber == 2 && index == 0:
+					entry = &api.Entry{Sequence: 2, Timestamp: 300, Space: "spaceA", Segment: "segA"}
+					index++
+				}
+				if entry != nil {
+					switch v := m.(type) {
+					case *api.Entry:
+						*v = *entry
+						return nil
+					case **api.Entry:
+						copyEntry := *entry
+						*v = &copyEntry
+						return nil
+					}
+				}
+				return errors.New("simulated disconnect")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	ctx := context.Background()
+	storeID := uuid.New()
+	args := &Consume{
+		Offsets: map[string]lexkey.LexKey{
+			"spaceA": {},
+			"spaceB": {},
+		},
+	}
+	enum := c.Consume(ctx, storeID, args)
+	defer enum.Dispose()
+
+	assert.True(t, enum.MoveNext())
+	firstEntry, err := enum.Current()
+	require.NoError(t, err)
+	assert.Equal(t, "spaceA", firstEntry.Space)
+
+	assert.True(t, enum.MoveNext())
+	secondEntry, err := enum.Current()
+	require.NoError(t, err)
+	assert.Equal(t, "spaceB", secondEntry.Space)
+
+	_ = enum.MoveNext()
+
+	require.GreaterOrEqual(t, calls, 2)
+	consumeArgs, ok := capturedArgs[len(capturedArgs)-1].(*api.Consume)
+	if !ok {
+		t.Fatalf("expected Consume, got %T", capturedArgs[len(capturedArgs)-1])
+	}
+	require.Contains(t, consumeArgs.Offsets, "spaceA")
+	require.Contains(t, consumeArgs.Offsets, "spaceB")
+	assert.Equal(t, firstEntry.GetSpaceOffset(), consumeArgs.Offsets["spaceA"])
+	assert.Equal(t, secondEntry.GetSpaceOffset(), consumeArgs.Offsets["spaceB"])
 }
 
 func TestProduceLockEviction(t *testing.T) {
