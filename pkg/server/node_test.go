@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -588,6 +589,118 @@ func TestSubscribeSendsInitialSpaceSnapshots(t *testing.T) {
 	waitForClosed(t, bidi)
 }
 
+func TestSubscribeBuffersNotificationsUntilSnapshotCompletes(t *testing.T) {
+	store := &blockingSpaceSnapshotStore{
+		spaceSnapshotStore: &spaceSnapshotStore{
+			segments: []string{"seg-b", "seg-a"},
+			first: map[string]*api.Entry{
+				"seg-a": {Space: "s", Segment: "seg-a", Sequence: 1, Timestamp: 100},
+				"seg-b": {Space: "s", Segment: "seg-b", Sequence: 3, Timestamp: 300},
+			},
+			last: map[string]*api.Entry{
+				"seg-a": {Space: "s", Segment: "seg-a", Sequence: 2, Timestamp: 200},
+				"seg-b": {Space: "s", Segment: "seg-b", Sequence: 4, Timestamp: 400},
+			},
+		},
+		blockSegment: "seg-a",
+		blockStarted: make(chan struct{}),
+		releaseBlock: make(chan struct{}),
+	}
+	messageBus := &mockMessageBus{}
+	storeID := uuid.New()
+	node := NewNode(storeID, store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "*",
+	}})
+	bidi.encodedCh = make(chan any, 8)
+
+	handleDone := make(chan struct{})
+	go func() {
+		node.Handle(ctx, bidi)
+		close(handleDone)
+	}()
+
+	select {
+	case <-store.blockStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for snapshot collection to block")
+	}
+
+	require.NotNil(t, messageBus.handler)
+	require.NoError(t, messageBus.handler(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:         "s",
+			Segment:       "seg-a",
+			LastSequence:  6,
+			LastTimestamp: 600,
+		},
+	}))
+	require.NoError(t, messageBus.handler(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:         "s",
+			Segment:       "seg-a",
+			LastSequence:  7,
+			LastTimestamp: 700,
+		},
+	}))
+	require.NoError(t, messageBus.handler(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:         "s",
+			Segment:       "seg-b",
+			LastSequence:  9,
+			LastTimestamp: 900,
+		},
+	}))
+
+	close(store.releaseBlock)
+
+	select {
+	case <-handleDone:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscribe handler to return")
+	}
+
+	var statuses []*api.SegmentStatus
+	require.Eventually(t, func() bool {
+		for len(statuses) < 4 {
+			select {
+			case msg := <-bidi.encodedCh:
+				status, ok := msg.(*api.SegmentStatus)
+				if ok && !status.Heartbeat {
+					statuses = append(statuses, status)
+				}
+			default:
+				return false
+			}
+		}
+		return true
+	}, time.Second, 10*time.Millisecond)
+
+	require.Len(t, statuses, 4)
+	require.Equal(t, "seg-a", statuses[0].Segment)
+	require.Equal(t, uint64(2), statuses[0].LastSequence)
+	require.Equal(t, "seg-b", statuses[1].Segment)
+	require.Equal(t, uint64(4), statuses[1].LastSequence)
+	require.Equal(t, "seg-a", statuses[2].Segment)
+	require.Equal(t, uint64(7), statuses[2].LastSequence)
+	require.Equal(t, "seg-b", statuses[3].Segment)
+	require.Equal(t, uint64(9), statuses[3].LastSequence)
+	for _, status := range statuses {
+		require.Falsef(t, status.Segment == "seg-a" && status.LastSequence == 6, "older buffered state should be replaced")
+	}
+
+	cancel()
+	waitForClosed(t, bidi)
+}
+
 func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 	store := &mockStore{}
 	messageBus := &mockMessageBus{}
@@ -648,6 +761,27 @@ func (s *spaceSnapshotStore) Produce(context.Context, *api.Produce, enumerators.
 }
 
 func (s *spaceSnapshotStore) Close() {}
+
+type blockingSpaceSnapshotStore struct {
+	*spaceSnapshotStore
+	blockSegment string
+	blockStarted chan struct{}
+	releaseBlock chan struct{}
+	blockOnce    sync.Once
+}
+
+func (s *blockingSpaceSnapshotStore) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
+	if segment == s.blockSegment {
+		s.blockOnce.Do(func() {
+			close(s.blockStarted)
+			select {
+			case <-s.releaseBlock:
+			case <-ctx.Done():
+			}
+		})
+	}
+	return s.spaceSnapshotStore.Peek(ctx, space, segment)
+}
 
 // errorEnumerator returns an error from Current()
 type errorEnumerator[T any] struct {

@@ -172,28 +172,28 @@ func NewClientWithMetrics(provider api.BidiStreamProvider, handlerTimeout time.D
 // activeSubscription represents a subscription managed by a single goroutine.
 // The goroutine retries indefinitely with exponential backoff until canceled.
 type activeSubscription struct {
-	id               string               // unique subscription ID
-	storeID          uuid.UUID            // store being subscribed to
-	initMsg          api.Routeable        // initial subscription message
-	handler          func(*SegmentStatus) // handler to call for each status update
-	cancel           context.CancelFunc   // cancels the subscription goroutine
-	stopped          chan struct{}        // signals when the subscription loop has stopped and unregistered
-	done             <-chan struct{}      // signals when subscription has stopped
-	lastDelivered    atomic.Int64         // tracks last delivered sequence for offset resumption
-	ctx              context.Context      // subscription's own context
-	failureCount     atomic.Int32         // tracks consecutive failures for observability
-	status           atomic.Value         // current status: "active"|"reconnecting"
-	lastError        atomic.Value         // stores last error encountered
-	handlerTimeouts  atomic.Int32         // counts handler timeout occurrences
-	handlerPanics    atomic.Int32         // counts handler panic occurrences
-	coalescedUpdates atomic.Int64         // counts updates merged while handlers are saturated
-	handlerSlots     chan struct{}        // limits concurrent handler executions for the subscription
-	mailboxCh        chan struct{}        // signals that a latest status is ready for delivery
-	pendingMu        sync.Mutex           // guards pendingStatus and pending
-	pendingStatus    SegmentStatus        // latest queued status awaiting delivery
-	pending          bool                 // whether pendingStatus contains a queued update
-	streamCh         chan api.BidiStream  // receives a reconnected stream from the dispatcher
-	retryCh          chan struct{}        // nudges an active stream to reconnect immediately
+	id                 string                   // unique subscription ID
+	storeID            uuid.UUID                // store being subscribed to
+	initMsg            api.Routeable            // initial subscription message
+	handler            func(*SegmentStatus)     // handler to call for each status update
+	cancel             context.CancelFunc       // cancels the subscription goroutine
+	stopped            chan struct{}            // signals when the subscription loop has stopped and unregistered
+	done               <-chan struct{}          // signals when subscription has stopped
+	lastDelivered      atomic.Int64             // tracks last delivered sequence for offset resumption
+	ctx                context.Context          // subscription's own context
+	failureCount       atomic.Int32             // tracks consecutive failures for observability
+	status             atomic.Value             // current status: "active"|"reconnecting"
+	lastError          atomic.Value             // stores last error encountered
+	handlerTimeouts    atomic.Int32             // counts handler timeout occurrences
+	handlerPanics      atomic.Int32             // counts handler panic occurrences
+	coalescedUpdates   atomic.Int64             // counts updates merged while handlers are saturated
+	handlerSlots       chan struct{}            // limits concurrent handler executions for the subscription
+	mailboxCh          chan struct{}            // signals that a latest status is ready for delivery
+	pendingMu          sync.Mutex               // guards pendingStatusByKey and pendingOrder
+	pendingStatusByKey map[string]SegmentStatus // latest queued status per segment awaiting delivery
+	pendingOrder       []string                 // FIFO order for pending segment keys
+	streamCh           chan api.BidiStream      // receives a reconnected stream from the dispatcher
+	retryCh            chan struct{}            // nudges an active stream to reconnect immediately
 }
 
 // reconnectRequest is sent by a subscription goroutine to enqueue itself for reconnection.
@@ -541,27 +541,44 @@ func normalizeHandlerConcurrency(limit int) int {
 func (s *activeSubscription) queuePendingStatus(status SegmentStatus) bool {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	coalesced := s.pending
-	s.pendingStatus = status
-	s.pending = true
+	if s.pendingStatusByKey == nil {
+		s.pendingStatusByKey = make(map[string]SegmentStatus)
+	}
+
+	key := pendingStatusKey(status)
+	_, coalesced := s.pendingStatusByKey[key]
+	s.pendingStatusByKey[key] = status
+	if !coalesced {
+		s.pendingOrder = append(s.pendingOrder, key)
+	}
 	return coalesced
 }
 
 func (s *activeSubscription) hasPendingStatus() bool {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	return s.pending
+	return len(s.pendingOrder) > 0
 }
 
 func (s *activeSubscription) takePendingStatus() (SegmentStatus, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	if !s.pending {
-		return SegmentStatus{}, false
+	for len(s.pendingOrder) > 0 {
+		key := s.pendingOrder[0]
+		s.pendingOrder = s.pendingOrder[1:]
+
+		status, ok := s.pendingStatusByKey[key]
+		if !ok {
+			continue
+		}
+		delete(s.pendingStatusByKey, key)
+		return status, true
 	}
-	status := s.pendingStatus
-	s.pending = false
-	return status, true
+	return SegmentStatus{}, false
+}
+
+func pendingStatusKey(status SegmentStatus) string {
+	return status.Space + "\x00" + status.Segment
 }
 
 func (c *client) signalSubscriptionMailbox(sub *activeSubscription) {
@@ -1261,18 +1278,19 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 
 	// Create the activeSubscription for replaying on reconnect
 	activeSub := &activeSubscription{
-		id:           subID,
-		storeID:      storeID,
-		initMsg:      initMsg,
-		handler:      handler,
-		cancel:       cancel,
-		stopped:      make(chan struct{}),
-		done:         done,
-		ctx:          subCtx,
-		handlerSlots: make(chan struct{}, normalizeHandlerConcurrency(c.maxConcurrentHandlers)),
-		mailboxCh:    make(chan struct{}, 1),
-		streamCh:     make(chan api.BidiStream, 1),
-		retryCh:      make(chan struct{}, 1),
+		id:                 subID,
+		storeID:            storeID,
+		initMsg:            initMsg,
+		handler:            handler,
+		cancel:             cancel,
+		stopped:            make(chan struct{}),
+		done:               done,
+		ctx:                subCtx,
+		handlerSlots:       make(chan struct{}, normalizeHandlerConcurrency(c.maxConcurrentHandlers)),
+		mailboxCh:          make(chan struct{}, 1),
+		pendingStatusByKey: make(map[string]SegmentStatus),
+		streamCh:           make(chan api.BidiStream, 1),
+		retryCh:            make(chan struct{}, 1),
 	}
 
 	// Initialize health status
@@ -1699,12 +1717,13 @@ type SubscriptionStatus struct {
 //
 // The returned status contains the subscription's current state: "active"
 // (stream connected and delivering) or "reconnecting" (stream failed, retrying
-// with exponential backoff). Subscriptions never permanently fail — they keep
-// retrying until explicitly canceled via Unsubscribe().
+// with exponential backoff). Retryable failures keep reconnecting, but
+// permanent stream or dial errors cancel the subscription and remove it from
+// the registry.
 //
 // Failure counts and last errors are tracked for observability. The failure
 // count resets to zero on each successful reconnection. Returns nil if the
-// subscription id is not found.
+// subscription id is not found or the subscription has already terminated.
 func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
 	c.subscriptionsMu.RLock()
 	sub, exists := c.subscriptions[id]

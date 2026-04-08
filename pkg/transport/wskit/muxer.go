@@ -535,7 +535,7 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 			slog.String("muxer", m.name),
 			slog.String("error_type", classifyTransportError(err)),
 			slog.String("detail", err.Error()))
-		m.shutdown(nil)
+		m.shutdown(ErrMuxerClosed)
 		return
 	}
 	// Unwrap net errors for richer logs
@@ -635,7 +635,7 @@ func (m *WebSocketMuxer) handlePong(_ context.Context) {
 
 func (m *WebSocketMuxer) handleClose(ctx context.Context) {
 	slog.DebugContext(ctx, "muxer: received close", slog.String("muxer", m.name))
-	m.shutdown(nil)
+	m.shutdown(ErrMuxerClosed)
 }
 
 func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) {

@@ -67,13 +67,13 @@ The client includes production-grade resilience features but has documented limi
 
 2. **Deduplication**: While resilience enumerators resume from last consumed position, applications should implement sequence-based deduplication for exactly-once semantics in critical workflows.
 
-3. **Subscription Failures**: Failed subscriptions (after 2 consecutive replay failures) are removed from the client registry. Monitor subscription health using `GetSubscriptionStatus()` before failures occur.
+3. **Subscription Lifecycle**: Retryable subscription failures stay in the reconnect loop, but permanent errors stop the subscription and remove it from the client registry. `SubscribeToSpace()` is the wildcard form of `SubscribeToSegmentStatus` (`Segment: "*"`) and reconnects receive a latest-state snapshot before live updates resume.
 
 **Recommendations for Alpha Testing:**
 
-- ✅ Use `client.GetSubscriptionStatus(id)` to monitor subscription health
+- ✅ Treat subscription handlers as latest-state processors: reconnects deliver a fresh snapshot, then continue live updates
 - ✅ Implement application-level deduplication using `Entry.Sequence` numbers
 - ✅ Monitor segment churn if creating more than 10K unique segments
-- ✅ Handle subscription failure scenarios explicitly in application code
+- ✅ Handle permanent subscription failures explicitly in application code and logs
 
 For detailed changes and future roadmap, see [CHANGELOG.md](CHANGELOG.md).

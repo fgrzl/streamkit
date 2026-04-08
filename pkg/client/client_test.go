@@ -1424,6 +1424,112 @@ func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 	sub.Unsubscribe()
 }
 
+func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSaturate(t *testing.T) {
+	var decodeCount atomic.Int32
+	firstHandlerStarted := make(chan struct{})
+	releaseFirstHandler := make(chan struct{})
+	received := make(chan string, 8)
+	statuses := []SegmentStatus{
+		{Space: "space", Segment: "seg-a", LastSequence: 1},
+		{Space: "space", Segment: "seg-a", LastSequence: 2},
+		{Space: "space", Segment: "seg-b", LastSequence: 1},
+		{Space: "space", Segment: "seg-c", LastSequence: 1},
+		{Space: "space", Segment: "seg-b", LastSequence: 2},
+	}
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				status, ok := m.(*SegmentStatus)
+				if !ok {
+					return errors.New("unexpected decode target")
+				}
+
+				index := int(decodeCount.Add(1)) - 1
+				if index > 0 {
+					<-firstHandlerStarted
+				}
+				if index < len(statuses) {
+					*status = statuses[index]
+					return nil
+				}
+
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClientWithHandlerTimeout(provider, time.Second).(*client)
+	c.maxConcurrentHandlers = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handler := func(status *SegmentStatus) {
+		received <- fmt.Sprintf("%s:%d", status.Segment, status.LastSequence)
+		if status.Segment == "seg-a" && status.LastSequence == 1 {
+			select {
+			case <-firstHandlerStarted:
+			default:
+				close(firstHandlerStarted)
+			}
+			<-releaseFirstHandler
+		}
+	}
+
+	sub, err := c.SubscribeToSpace(ctx, uuid.New(), "space", handler)
+	require.NoError(t, err)
+
+	var subID string
+	require.Eventually(t, func() bool {
+		c.subscriptionsMu.RLock()
+		defer c.subscriptionsMu.RUnlock()
+		for id := range c.subscriptions {
+			subID = id
+			return true
+		}
+		return false
+	}, time.Second, 10*time.Millisecond)
+
+	select {
+	case <-firstHandlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for the first space-subscription handler invocation")
+	}
+
+	require.Eventually(t, func() bool {
+		return decodeCount.Load() >= int32(len(statuses))
+	}, time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		status := c.GetSubscriptionStatus(subID)
+		return status != nil && status.CoalescedUpdates > 0
+	}, time.Second, 10*time.Millisecond)
+
+	close(releaseFirstHandler)
+
+	var seen []string
+	require.Eventually(t, func() bool {
+		for len(seen) < 4 {
+			select {
+			case update := <-received:
+				seen = append(seen, update)
+			default:
+				return false
+			}
+		}
+		return true
+	}, time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, []string{"seg-a:1", "seg-a:2", "seg-b:2", "seg-c:1"}, seen[:4], "space subscription should retain the latest pending status for each segment")
+
+	cancel()
+	sub.Unsubscribe()
+}
+
 // TestConsumeSegmentResilient verifies that ConsumeSegment wraps with resilience (Issue 8)
 func TestConsumeSegmentResilient(t *testing.T) {
 	// Just verify that ConsumeSegment returns an enumerator

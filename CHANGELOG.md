@@ -33,12 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    - **Mitigation**: Applications should track sequence numbers and deduplicate at application 
      level for critical workflows.
 
-3. **Subscription Failure Cleanup**: After 2 consecutive replay failure batches, subscriptions 
-   are marked as "failed" and removed from the client registry.
-   - **Impact**: Applications lose visibility into failed subscriptions unless they monitor 
-     via `GetSubscriptionStatus()` before failure.
-   - **Best Practice**: Monitor subscription health proactively using `GetSubscriptionStatus()` 
-     and implement application-level alerting.
+3. **Subscription Lifecycle**: Retryable subscription failures stay in the reconnect loop, while
+   permanent errors stop the subscription and remove it from the client registry.
+   - **Impact**: Applications should treat permanent subscription errors as terminal unless they
+     explicitly resubscribe.
+   - **Best Practice**: Surface subscription lifecycle through application logs and metrics, and
+     treat reconnect deliveries as `latest snapshot -> live updates`.
 
 ---
 
@@ -51,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Batch API for high-throughput produces (Issue 10)
 
 ### Planned for RC
-- Comprehensive end-to-end resilience testing
+- Expand live reconnect coverage for consume paths and operational guidance
 - Performance benchmarks and optimization
 - Production deployment guide
 - Example applications and patterns
