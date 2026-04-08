@@ -15,6 +15,20 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+func newQueueTestMuxer(queueSize int) *WebSocketMuxer {
+	return &WebSocketMuxer{
+		Context:        context.Background(),
+		name:           "test",
+		done:           make(chan struct{}),
+		writeQueueSize: queueSize,
+		writeQueue:     make(chan *MuxerMsg, queueSize),
+		msgPool:        sync.Pool{New: func() any { return &MuxerMsg{} }},
+		bufPool:        sync.Pool{New: func() any { return make([]byte, 0, 1024) }},
+		writerDone:     make(chan struct{}),
+		sendJSON:       func(_ *websocket.Conn, _ interface{}) error { return nil },
+	}
+}
+
 func TestShouldRegisterChannelInMuxer(t *testing.T) {
 	// Arrange
 	m := &WebSocketMuxer{
@@ -239,6 +253,59 @@ func TestShouldShutdownOnSendDataError(t *testing.T) {
 			return false
 		}
 	}, time.Second, 10*time.Millisecond, "expected muxer to be shutdown after send error")
+}
+
+func TestShouldTrackWriteQueueDepthAcrossEnqueueAndDrain(t *testing.T) {
+	m := newQueueTestMuxer(2)
+
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("hello"), nil))
+	assert.Equal(t, int64(1), m.WriteQueueDepth())
+
+	go m.writePump()
+	require.Eventually(t, func() bool {
+		return m.WriteQueueDepth() == 0
+	}, time.Second, 10*time.Millisecond)
+
+	m.shutdown(nil)
+	select {
+	case <-m.writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for writer to stop")
+	}
+}
+
+func TestShouldCountDataQueueFallbackWhenQueueIsFull(t *testing.T) {
+	m := newQueueTestMuxer(1)
+
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("first"), nil))
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("second"), nil))
+
+	assert.Equal(t, int64(1), m.WriteQueueDepth())
+	assert.Equal(t, int64(1), m.WriteQueueFallbacks())
+	assert.Equal(t, int64(0), m.WriteQueueSaturationWarnings())
+}
+
+func TestShouldCountControlQueueSaturationWarningsWhenFallbackPersists(t *testing.T) {
+	m := newQueueTestMuxer(1)
+
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("seed"), nil))
+	for range writeQueueSaturationWarnThreshold {
+		require.NoError(t, m.sendControl(ControlTypePing, uuid.New(), uuid.New(), nil))
+	}
+
+	assert.Equal(t, writeQueueSaturationWarnThreshold, m.WriteQueueFallbacks())
+	assert.Equal(t, int64(1), m.WriteQueueSaturationWarnings())
+	assert.Equal(t, int64(1), m.WriteQueueDepth())
+}
+
+func TestShouldCountPingQueueFallbackWhenQueueIsFull(t *testing.T) {
+	m := newQueueTestMuxer(1)
+
+	require.NoError(t, m.sendData(uuid.New(), uuid.New(), []byte("seed"), nil))
+	require.NoError(t, m.sendPing())
+
+	assert.Equal(t, int64(1), m.WriteQueueFallbacks())
+	assert.Equal(t, int64(1), m.WriteQueueDepth())
 }
 
 func TestShouldSendAccessDeniedError(t *testing.T) {

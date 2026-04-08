@@ -73,6 +73,7 @@ type WebSocketMuxer struct {
 	// outbound write pump
 	writeQueue     chan *MuxerMsg
 	writeQueueSize int
+	queueMetrics   *telemetry.WSKitQueueMetrics
 	msgPool        sync.Pool
 	bufPool        sync.Pool
 	writerDone     chan struct{}
@@ -86,14 +87,18 @@ type WebSocketMuxer struct {
 	pingJitter    int64
 
 	// runtime counters
-	pingsSent     int64
-	pingsReceived int64
-	pongsReceived int64
-	missedPongs   int64
-	writeErrors   int64
-	activeStreams int64 // number of streams currently registered (in-flight)
-	logger        *slog.Logger
-	rng           *rand.Rand
+	pingsSent                    int64
+	pingsReceived                int64
+	pongsReceived                int64
+	missedPongs                  int64
+	writeErrors                  int64
+	activeStreams                int64 // number of streams currently registered (in-flight)
+	writeQueueDepth              int64
+	writeQueueFallbacks          int64
+	writeQueueSaturationStreak   int64
+	writeQueueSaturationWarnings int64
+	logger                       *slog.Logger
+	rng                          *rand.Rand
 	// JSON send/receive hooks (set to websocket.JSON.Send/Receive by default).
 	// Tests may override these to simulate network behavior.
 	sendJSON func(conn *websocket.Conn, v interface{}) error
@@ -104,6 +109,11 @@ type WebSocketMuxer struct {
 var (
 	ErrMuxerClosed      = errors.New("muxer closed")
 	ErrHeartbeatTimeout = errors.New("heartbeat timeout")
+)
+
+const (
+	writeQueueSaturationWarnThreshold int64 = 32
+	writeQueueSaturationWarnEvery     int64 = 256
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -124,6 +134,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		lastPongUnix:  timestamp.GetTimestamp(),
 		heartbeatStop: make(chan struct{}),
 		cancelFunc:    cancel,
+		queueMetrics:  telemetry.NewWSKitQueueMetrics(),
 	}
 
 	// write pump defaults
@@ -167,6 +178,7 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		lastPongUnix:  timestamp.GetTimestamp(),
 		heartbeatStop: make(chan struct{}),
 		cancelFunc:    cancel,
+		queueMetrics:  telemetry.NewWSKitQueueMetrics(),
 	}
 	m.Context = cctx
 	m.logger = slog.With(slog.String("muxer", m.name))
@@ -343,15 +355,84 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte, 
 		msg.Payload = nil
 	}
 
-	// try enqueue without blocking; fall back to synchronous write to preserve semantics
+	return m.enqueueWriteMessage(msg, func() error {
+		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload, TraceContext: traceContext}, true)
+	})
+}
+
+func (m *WebSocketMuxer) metricsContext() context.Context {
+	if m.Context != nil {
+		return m.Context
+	}
+	return context.Background()
+}
+
+func (m *WebSocketMuxer) writeQueueCapacity() int {
+	if m.writeQueueSize > 0 {
+		return m.writeQueueSize
+	}
+	if m.writeQueue != nil {
+		return cap(m.writeQueue)
+	}
+	return 0
+}
+
+func (m *WebSocketMuxer) snapshotWriteQueueDepth() int64 {
+	depth := int64(0)
+	if m.writeQueue != nil {
+		depth = int64(len(m.writeQueue))
+	}
+	atomic.StoreInt64(&m.writeQueueDepth, depth)
+	if m.queueMetrics != nil {
+		m.queueMetrics.RecordWriteQueueDepth(m.metricsContext(), m.name, depth)
+	}
+	return depth
+}
+
+func (m *WebSocketMuxer) recordWriteQueueEnqueue() {
+	atomic.StoreInt64(&m.writeQueueSaturationStreak, 0)
+	m.snapshotWriteQueueDepth()
+}
+
+func (m *WebSocketMuxer) recordWriteQueueDrain() {
+	depth := m.snapshotWriteQueueDepth()
+	capacity := m.writeQueueCapacity()
+	if capacity <= 0 || depth < int64(capacity) {
+		atomic.StoreInt64(&m.writeQueueSaturationStreak, 0)
+	}
+}
+
+func (m *WebSocketMuxer) recordWriteQueueFallback() {
+	depth := m.snapshotWriteQueueDepth()
+	fallbacks := atomic.AddInt64(&m.writeQueueFallbacks, 1)
+	streak := atomic.AddInt64(&m.writeQueueSaturationStreak, 1)
+	if m.queueMetrics != nil {
+		m.queueMetrics.RecordWriteQueueFallback(m.metricsContext(), m.name)
+	}
+	if streak == writeQueueSaturationWarnThreshold || (streak > writeQueueSaturationWarnThreshold && streak%writeQueueSaturationWarnEvery == 0) {
+		warnings := atomic.AddInt64(&m.writeQueueSaturationWarnings, 1)
+		if m.queueMetrics != nil {
+			m.queueMetrics.RecordWriteQueueSaturation(m.metricsContext(), m.name)
+		}
+		slog.WarnContext(m.metricsContext(), "muxer: write queue saturated; falling back to synchronous send",
+			m.logFields(m.metricsContext(),
+				slog.Int64("queue_depth", depth),
+				slog.Int("queue_capacity", m.writeQueueCapacity()),
+				slog.Int64("queue_fallbacks", fallbacks),
+				slog.Int64("saturation_streak", streak),
+				slog.Int64("saturation_warnings", warnings))...)
+	}
+}
+
+func (m *WebSocketMuxer) enqueueWriteMessage(msg *MuxerMsg, fallback func() error) error {
 	select {
 	case m.writeQueue <- msg:
+		m.recordWriteQueueEnqueue()
 		return nil
 	default:
-		// queue full; return msg to pool and perform synchronous send under lock
-		m.msgPool.Put(msg)
-		// perform synchronous send under lock (shutdown on error)
-		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload, TraceContext: traceContext}, true)
+		m.releaseMsg(msg)
+		m.recordWriteQueueFallback()
+		return fallback()
 	}
 }
 
@@ -712,14 +793,9 @@ func (m *WebSocketMuxer) sendControl(control ControlType, storeID, channelID uui
 		msg.Payload = nil
 	}
 
-	select {
-	case m.writeQueue <- msg:
-		return nil
-	default:
-		// queue full -> synchronous fallback that increments writeErrors on failure
-		m.msgPool.Put(msg)
+	return m.enqueueWriteMessage(msg, func() error {
 		return m.syncSendIncrementOnError(&MuxerMsg{ControlType: control, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
-	}
+	})
 }
 
 // sendPing sends a ping control frame under the write lock. Returns an error
@@ -741,9 +817,11 @@ func (m *WebSocketMuxer) sendPing() error {
 
 	select {
 	case m.writeQueue <- msg:
+		m.recordWriteQueueEnqueue()
 		return nil
 	default:
-		m.msgPool.Put(msg)
+		m.releaseMsg(msg)
+		m.recordWriteQueueFallback()
 		m.writeMu.Lock()
 		defer m.writeMu.Unlock()
 		if err := m.sendJSON(m.conn, &MuxerMsg{ControlType: ControlTypePing}); err != nil {
@@ -884,6 +962,7 @@ func (m *WebSocketMuxer) writePump() {
 					if msg == nil {
 						continue
 					}
+					m.recordWriteQueueDrain()
 					// ensure pooled resources are released regardless of send outcome
 					if ok := func(msg *MuxerMsg) bool {
 						defer m.releaseMsg(msg)
@@ -904,6 +983,7 @@ func (m *WebSocketMuxer) writePump() {
 			if msg == nil {
 				continue
 			}
+			m.recordWriteQueueDrain()
 			// ensure pooled resources are released regardless of send outcome
 			if ok := func(msg *MuxerMsg) bool {
 				defer m.releaseMsg(msg)
@@ -1025,3 +1105,12 @@ func (m *WebSocketMuxer) PingsSent() int64     { return atomic.LoadInt64(&m.ping
 func (m *WebSocketMuxer) PongsReceived() int64 { return atomic.LoadInt64(&m.pongsReceived) }
 func (m *WebSocketMuxer) MissedPongs() int64   { return atomic.LoadInt64(&m.missedPongs) }
 func (m *WebSocketMuxer) WriteErrors() int64   { return atomic.LoadInt64(&m.writeErrors) }
+func (m *WebSocketMuxer) WriteQueueDepth() int64 {
+	return atomic.LoadInt64(&m.writeQueueDepth)
+}
+func (m *WebSocketMuxer) WriteQueueFallbacks() int64 {
+	return atomic.LoadInt64(&m.writeQueueFallbacks)
+}
+func (m *WebSocketMuxer) WriteQueueSaturationWarnings() int64 {
+	return atomic.LoadInt64(&m.writeQueueSaturationWarnings)
+}

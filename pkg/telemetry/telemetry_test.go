@@ -127,6 +127,7 @@ func TestAttributeBuilders(t *testing.T) {
 	assert.NotPanics(t, func() { telemetry.WithRecordCount(42) })
 	assert.NotPanics(t, func() { telemetry.WithBatchSize(10) })
 	assert.NotPanics(t, func() { telemetry.WithTransportType("websocket") })
+	assert.NotPanics(t, func() { telemetry.WithMuxerRole("client") })
 	assert.NotPanics(t, func() { telemetry.WithBackendType("azure") })
 }
 
