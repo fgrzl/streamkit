@@ -73,6 +73,7 @@ func classifyTransportError(err error) string {
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "401") ||
 		strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "access denied") ||
 		strings.Contains(msg, "authentication failed") ||
 		strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "permission denied") {

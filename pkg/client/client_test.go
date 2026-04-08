@@ -337,6 +337,75 @@ func TestReconnectReplaysSubscriptions(t *testing.T) {
 	sub.Unsubscribe()
 }
 
+func TestReconnectSubscriptionDeliversInitialSnapshot(t *testing.T) {
+	var attempts atomic.Int32
+	updates := make(chan uint64, 4)
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			attempt := attempts.Add(1)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			emitted := false
+
+			stream.decodeFn = func(m any) error {
+				if emitted {
+					if attempt == 1 {
+						return errors.New("connection lost")
+					}
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				emitted = true
+
+				status, ok := m.(*SegmentStatus)
+				if !ok {
+					return errors.New("unexpected decode target")
+				}
+				*status = SegmentStatus{
+					Space:        "space",
+					Segment:      "segment",
+					LastSequence: uint64(attempt),
+				}
+				return nil
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "segment", func(status *SegmentStatus) {
+		select {
+		case updates <- status.LastSequence:
+		default:
+		}
+	})
+	require.NoError(t, err)
+
+	select {
+	case seq := <-updates:
+		assert.Equal(t, uint64(1), seq)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for initial subscription update")
+	}
+
+	require.Eventually(t, func() bool {
+		return attempts.Load() >= 2
+	}, 3*time.Second, 10*time.Millisecond)
+
+	select {
+	case seq := <-updates:
+		assert.Equal(t, uint64(2), seq)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for reconnect snapshot update")
+	}
+
+	cancel()
+	sub.Unsubscribe()
+}
+
 func TestOnReconnectedCallsAllSubscriptionHandlers(t *testing.T) {
 	// Arrange
 	provider := &mockProvider{
@@ -1813,6 +1882,53 @@ func TestProduceLockEviction(t *testing.T) {
 	assert.LessOrEqual(t, size, MaxProduceLocks)
 }
 
+func TestPeekReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			calls.Add(1)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(any) error {
+				return errors.New("remote error: access denied")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	_, err := c.Peek(context.Background(), uuid.New(), "space", "segment")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "access denied")
+	assert.Equal(t, int32(1), calls.Load(), "permanent remote errors should not trigger unary retries")
+}
+
+func TestConsumeSegmentReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			calls.Add(1)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(any) error {
+				return errors.New("remote error: access denied")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	enum := c.ConsumeSegment(context.Background(), uuid.New(), &ConsumeSegment{
+		Space:   "space",
+		Segment: "segment",
+	})
+	defer enum.Dispose()
+
+	assert.False(t, enum.MoveNext())
+	require.Error(t, enum.Err())
+	assert.ErrorContains(t, enum.Err(), "access denied")
+	assert.Equal(t, int32(1), calls.Load(), "permanent stream errors should not trigger consume retries")
+}
+
 func TestSubscriptionRetriesIndefinitely(t *testing.T) {
 	var attempts atomic.Int32
 
@@ -1868,6 +1984,46 @@ func TestSubscriptionRetriesIndefinitely(t *testing.T) {
 	_, stillExists := c.subscriptions[subID]
 	c.subscriptionsMu.RUnlock()
 	assert.False(t, stillExists, "subscription should be unregistered after Unsubscribe")
+}
+
+func TestSubscriptionStopsOnPermanentRemoteError(t *testing.T) {
+	var attempts atomic.Int32
+	handlerCalled := make(chan struct{}, 1)
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			attempts.Add(1)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(any) error {
+				return errors.New("remote error: access denied")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClientWithHandlerTimeout(provider, 50*time.Millisecond).(*client)
+	sub, err := c.SubscribeToSegment(context.Background(), uuid.New(), "space", "segment", func(*SegmentStatus) {
+		select {
+		case handlerCalled <- struct{}{}:
+		default:
+		}
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		c.subscriptionsMu.RLock()
+		defer c.subscriptionsMu.RUnlock()
+		return len(c.subscriptions) == 0
+	}, time.Second, 10*time.Millisecond, "permanent remote errors should stop the subscription loop")
+
+	assert.Equal(t, int32(1), attempts.Load(), "permanent remote errors should not trigger reconnect retries")
+	select {
+	case <-handlerCalled:
+		t.Fatal("handler should not run for permanent remote errors")
+	default:
+	}
+
+	sub.Unsubscribe()
 }
 
 func TestRetryFailedSubscriptionReconnectsActiveStream(t *testing.T) {

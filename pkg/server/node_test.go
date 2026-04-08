@@ -49,6 +49,7 @@ func (s *sliceEnumerator[T]) Err() error { return nil }
 // mockStore implements storage.Store for tests.
 type mockStore struct {
 	spaces    []string
+	segments  []string
 	entries   []*api.Entry
 	peekEntry *api.Entry
 	statuses  []*api.SegmentStatus
@@ -61,6 +62,9 @@ func (m *mockStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) en
 	return &sliceEnumerator[*api.Entry]{items: m.entries}
 }
 func (m *mockStore) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
+	if len(m.segments) > 0 {
+		return &sliceEnumerator[string]{items: m.segments}
+	}
 	return &sliceEnumerator[string]{items: m.spaces}
 }
 func (m *mockStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry] {
@@ -496,6 +500,94 @@ func TestSubscribeEmitsHeartbeats(t *testing.T) {
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
+func TestSubscribeSendsInitialSegmentSnapshot(t *testing.T) {
+	store := &mockStore{
+		entries: []*api.Entry{
+			{Space: "s", Segment: "seg", Sequence: 1, Timestamp: 100},
+		},
+		peekEntry: &api.Entry{Space: "s", Segment: "seg", Sequence: 3, Timestamp: 300},
+	}
+	messageBus := &mockMessageBus{}
+	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "seg",
+	}})
+	bidi.encodedCh = make(chan any, 4)
+
+	node.Handle(ctx, bidi)
+
+	select {
+	case msg := <-bidi.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok, "expected initial SegmentStatus snapshot")
+		require.False(t, status.Heartbeat)
+		require.Equal(t, "s", status.Space)
+		require.Equal(t, "seg", status.Segment)
+		require.Equal(t, uint64(1), status.FirstSequence)
+		require.Equal(t, int64(100), status.FirstTimestamp)
+		require.Equal(t, uint64(3), status.LastSequence)
+		require.Equal(t, int64(300), status.LastTimestamp)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscription snapshot")
+	}
+
+	cancel()
+	waitForClosed(t, bidi)
+}
+
+func TestSubscribeSendsInitialSpaceSnapshots(t *testing.T) {
+	store := &spaceSnapshotStore{
+		segments: []string{"seg-b", "seg-a"},
+		first: map[string]*api.Entry{
+			"seg-a": {Space: "s", Segment: "seg-a", Sequence: 1, Timestamp: 100},
+			"seg-b": {Space: "s", Segment: "seg-b", Sequence: 5, Timestamp: 500},
+		},
+		last: map[string]*api.Entry{
+			"seg-a": {Space: "s", Segment: "seg-a", Sequence: 2, Timestamp: 200},
+			"seg-b": {Space: "s", Segment: "seg-b", Sequence: 7, Timestamp: 700},
+		},
+	}
+	messageBus := &mockMessageBus{}
+	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "*",
+	}})
+	bidi.encodedCh = make(chan any, 8)
+
+	node.Handle(ctx, bidi)
+
+	var snapshots []*api.SegmentStatus
+	require.Eventually(t, func() bool {
+		for len(bidi.encodedCh) > 0 {
+			msg := <-bidi.encodedCh
+			status, ok := msg.(*api.SegmentStatus)
+			if ok && !status.Heartbeat {
+				snapshots = append(snapshots, status)
+			}
+		}
+		return len(snapshots) == 2
+	}, time.Second, 10*time.Millisecond)
+
+	require.Len(t, snapshots, 2)
+	require.Equal(t, "seg-a", snapshots[0].Segment)
+	require.Equal(t, uint64(2), snapshots[0].LastSequence)
+	require.Equal(t, "seg-b", snapshots[1].Segment)
+	require.Equal(t, uint64(7), snapshots[1].LastSequence)
+
+	cancel()
+	waitForClosed(t, bidi)
+}
+
 func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 	store := &mockStore{}
 	messageBus := &mockMessageBus{}
@@ -520,6 +612,42 @@ func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 }
 
 // (removed failingBusFactory - not used)
+
+type spaceSnapshotStore struct {
+	segments []string
+	first    map[string]*api.Entry
+	last     map[string]*api.Entry
+}
+
+func (s *spaceSnapshotStore) GetSpaces(context.Context) enumerators.Enumerator[string] {
+	return &sliceEnumerator[string]{items: []string{"s"}}
+}
+
+func (s *spaceSnapshotStore) ConsumeSpace(context.Context, *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
+	return &sliceEnumerator[*api.Entry]{}
+}
+
+func (s *spaceSnapshotStore) GetSegments(context.Context, string) enumerators.Enumerator[string] {
+	return &sliceEnumerator[string]{items: s.segments}
+}
+
+func (s *spaceSnapshotStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry] {
+	entry := s.first[args.Segment]
+	if entry == nil {
+		return &sliceEnumerator[*api.Entry]{}
+	}
+	return &sliceEnumerator[*api.Entry]{items: []*api.Entry{entry}}
+}
+
+func (s *spaceSnapshotStore) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
+	return s.last[segment], nil
+}
+
+func (s *spaceSnapshotStore) Produce(context.Context, *api.Produce, enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
+	return &sliceEnumerator[*api.SegmentStatus]{}
+}
+
+func (s *spaceSnapshotStore) Close() {}
 
 // errorEnumerator returns an error from Current()
 type errorEnumerator[T any] struct {

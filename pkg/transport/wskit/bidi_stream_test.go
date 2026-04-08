@@ -2,6 +2,7 @@ package wskit
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -154,6 +155,15 @@ func TestRecvChanAndOfferBehavior(t *testing.T) {
 	})
 }
 
+func TestOfferReturnsFalseWhenBufferIsFull(t *testing.T) {
+	s, _ := newCapturingStream()
+	for i := 0; i < cap(s.recvChan); i++ {
+		require.True(t, s.Offer([]byte(`"x"`)))
+	}
+
+	assert.False(t, s.Offer([]byte(`"overflow"`)))
+}
+
 func TestEndOfStreamError(t *testing.T) {
 	t.Run("EndOfStreamError returns io.EOF", func(t *testing.T) {
 		s, _ := newCapturingStream()
@@ -174,6 +184,16 @@ func TestCloseLocalDrainsBufferedMessages(t *testing.T) {
 
 	// Assert: after CloseLocal the channel should be empty
 	require.Equal(t, 0, len(s.recvChan), "expected recvChan to be drained by CloseLocal")
+}
+
+func TestDecodeReturnsLocalCloseError(t *testing.T) {
+	s, _ := newCapturingStream()
+
+	closeErr := errors.New("stream receive buffer overloaded")
+	s.CloseLocal(closeErr)
+
+	var v string
+	assert.ErrorIs(t, s.Decode(&v), closeErr)
 }
 
 func TestDecodeIgnoresDomainObjectWithTypeField(t *testing.T) {

@@ -64,6 +64,7 @@ type WebSocketMuxer struct {
 	name        string
 	conn        *websocket.Conn
 	channels    map[uuid.UUID]*MuxerBidiStream
+	tombstones  map[uuid.UUID]error
 	channelsMu  sync.RWMutex
 	writeMu     sync.Mutex
 	done        chan struct{}
@@ -82,7 +83,7 @@ type WebSocketMuxer struct {
 	// Heartbeat configuration (seconds)
 	pingInterval  int64
 	pongTimeout   int64
-	lastPongUnix  int64 // atomic
+	lastPongUnix  int64 // atomic; tracks the most recent inbound activity/pong
 	heartbeatStop chan struct{}
 	cancelFunc    context.CancelFunc
 	pingJitter    int64
@@ -111,6 +112,8 @@ type WebSocketMuxer struct {
 var (
 	ErrMuxerClosed      = errors.New("muxer closed")
 	ErrHeartbeatTimeout = errors.New("heartbeat timeout")
+	ErrStreamOverloaded = errors.New("stream receive buffer overloaded")
+	ErrStreamTombstoned = errors.New("stream closed locally")
 )
 
 const (
@@ -130,6 +133,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		name:                   "client",
 		conn:                   conn,
 		channels:               make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:             make(map[uuid.UUID]error),
 		done:                   make(chan struct{}),
 		pingInterval:           30,
 		pongTimeout:            90,
@@ -175,6 +179,7 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		conn:                   conn,
 		nodeManager:            nodeManager,
 		channels:               make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:             make(map[uuid.UUID]error),
 		done:                   make(chan struct{}),
 		pingInterval:           30,
 		pongTimeout:            90,
@@ -297,12 +302,33 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 	bidi.SetChannelID(channelID)
 
 	m.channelsMu.Lock()
+	delete(m.tombstones, channelID)
 	m.channels[channelID] = bidi
 	m.channelsMu.Unlock()
 
 	atomic.AddInt64(&m.activeStreams, 1)
 
 	return bidi
+}
+
+func (m *WebSocketMuxer) tombstoneStream(channelID uuid.UUID, reason error) {
+	if channelID == uuid.Nil {
+		return
+	}
+
+	m.channelsMu.Lock()
+	if m.tombstones == nil {
+		m.tombstones = make(map[uuid.UUID]error)
+	}
+	if existing, exists := m.tombstones[channelID]; !exists || existing == nil || reason != nil {
+		m.tombstones[channelID] = reason
+	}
+	bidi := m.channels[channelID]
+	m.channelsMu.Unlock()
+
+	if bidi != nil {
+		bidi.CloseLocal(reason)
+	}
 }
 
 // sendDataWithTrace injects trace context from ctx into the message and sends a data frame.
@@ -613,6 +639,21 @@ func (m *WebSocketMuxer) handleClose(ctx context.Context) {
 }
 
 func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) {
+	if msg != nil && msg.ChannelID != uuid.Nil {
+		m.channelsMu.RLock()
+		bidi, exists := m.channels[msg.ChannelID]
+		_, tombstoned := m.tombstones[msg.ChannelID]
+		m.channelsMu.RUnlock()
+		if exists {
+			m.deliverToStream(bidi, ctx, msg)
+			return
+		}
+		if tombstoned {
+			slog.DebugContext(ctx, "muxer: ignoring error control for closed channel", m.msgLogFields(msg)...)
+			return
+		}
+	}
+
 	slog.WarnContext(ctx, "muxer: received error control message",
 		m.msgLogFields(msg,
 			slog.String("payload", string(msg.Payload)))...,
@@ -638,7 +679,7 @@ func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, chan
 	if m.session.CanAccessStore(storeID) {
 		return true
 	}
-	payload, err := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "err", Err: "access denied"})
+	payload, err := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "error", Err: "access denied"})
 	if err != nil {
 		slog.WarnContext(ctx, "muxer: marshal access-denied error failed",
 			m.logFields(ctx, slog.String("store_id", storeID.String()), "err", err)...)
@@ -661,10 +702,15 @@ func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, chan
 func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (*MuxerBidiStream, error) {
 	m.channelsMu.RLock()
 	bidi, exists := m.channels[msg.ChannelID]
+	_, tombstoned := m.tombstones[msg.ChannelID]
 	m.channelsMu.RUnlock()
 
 	if exists {
 		return bidi, nil
+	}
+	if tombstoned {
+		slog.DebugContext(ctx, "muxer: ignoring late message for closed channel", m.msgLogFields(msg)...)
+		return nil, ErrStreamTombstoned
 	}
 
 	if m.nodeManager == nil {
@@ -726,7 +772,43 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", m.msgLogFields(msg)...)
 		return
 	}
-	bidi.Offer(msg.Payload)
+	if bidi.Offer(msg.Payload) {
+		return
+	}
+	if bidi.IsClosed() {
+		slog.DebugContext(ctx, "muxer: dropping message for closed stream", m.msgLogFields(msg)...)
+		return
+	}
+
+	slog.WarnContext(ctx, "muxer: stream receive buffer overloaded; closing channel",
+		m.msgLogFields(msg, slog.String("error_type", classifyTransportError(ErrStreamOverloaded)))...)
+	m.tombstoneStream(msg.ChannelID, ErrStreamOverloaded)
+
+	if msg == nil || msg.ChannelID == uuid.Nil {
+		return
+	}
+
+	go func(storeID, channelID uuid.UUID) {
+		payload, err := json.Marshal(&ErrorMessage{
+			Type: controlMsgSentinel + "error",
+			Err:  ErrStreamOverloaded.Error(),
+		})
+		if err != nil {
+			slog.WarnContext(m.Context, "muxer: marshal overload error failed",
+				m.logFields(m.Context,
+					slog.String("channel_id", channelID.String()),
+					"err", err)...)
+			return
+		}
+		if err := m.sendControl(ControlTypeError, storeID, channelID, payload); err != nil {
+			slog.WarnContext(m.Context, "muxer: send overload error failed",
+				m.logFields(m.Context,
+					slog.String("store_id", storeID.String()),
+					slog.String("channel_id", channelID.String()),
+					slog.String("error_type", classifyTransportError(err)),
+					"err", err)...)
+		}
+	}(msg.StoreID, msg.ChannelID)
 }
 
 // heartbeat periodically sends ping control frames and verifies a timely pong or activity.
@@ -880,8 +962,8 @@ func (m *WebSocketMuxer) sendPing() error {
 }
 
 // sendJSONWithLock performs a synchronous JSON send under m.writeMu and
-// optionally triggers m.shutdown on error. It also updates lastPongUnix on
-// success and increments writeErrors on failure. This consolidates repeated
+// optionally triggers m.shutdown on error. It increments writeErrors on
+// failure. This consolidates repeated
 // send+log+shutdown patterns used across the muxer.
 func (m *WebSocketMuxer) sendJSONWithLock(msg *MuxerMsg, shutdownOnErr bool) error {
 	m.writeMu.Lock()
@@ -910,7 +992,6 @@ func (m *WebSocketMuxer) sendJSONWithLock(msg *MuxerMsg, shutdownOnErr bool) err
 		return err
 	}
 
-	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	return nil
 }
 

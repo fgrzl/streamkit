@@ -291,11 +291,7 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 				var conn *websocket.Conn
 				var err error
 				var permanentErr bool
-				if p.dialFn != nil {
-					conn, err = p.dialFn()
-				} else {
-					conn, err = p.dial()
-				}
+				conn, err = p.dialOnce()
 				success := false
 				if err == nil {
 					// Check if provider was stopped during dial
@@ -336,9 +332,6 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 						}
 					}
 				} else {
-					if p.OnDialFailure != nil {
-						p.OnDialFailure(err)
-					}
 					permanentErr = p.isPermanentDialError(err)
 					slog.Warn("provider: reconnect dial failed",
 						slog.String("error", err.Error()),
@@ -411,7 +404,7 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 			return m, nil
 		}
 		p.dialing.Store(false)
-		// Inline attempt failed; fall through to wait on the background loop.
+		return nil, err
 	}
 
 	// Wait for the background reconnect loop to establish a healthy muxer.
@@ -444,10 +437,19 @@ func (p *WebSocketBidiStreamProvider) getOrCreateMuxer(ctx context.Context) (pro
 // dialOnce performs a single dial attempt. Extracted so getOrCreateMuxer can
 // make one quick inline try before falling back to the background loop.
 func (p *WebSocketBidiStreamProvider) dialOnce() (*websocket.Conn, error) {
+	var (
+		conn *websocket.Conn
+		err  error
+	)
 	if p.dialFn != nil {
-		return p.dialFn()
+		conn, err = p.dialFn()
+	} else {
+		conn, err = p.dial()
 	}
-	return p.dial()
+	if err != nil && p.OnDialFailure != nil {
+		p.OnDialFailure(err)
+	}
+	return conn, err
 }
 
 // replaceMuxer safely replaces the current muxer, closing the old one to prevent leaks.
@@ -543,7 +545,7 @@ func (p *WebSocketBidiStreamProvider) isPermanentDialError(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	permanent := []string{"401", "unauthorized", "authentication failed", "forbidden", "permission denied"}
+	permanent := []string{"401", "unauthorized", "authentication failed", "forbidden", "permission denied", "access denied"}
 	for _, sub := range permanent {
 		if strings.Contains(s, sub) {
 			// If RetryAuthFailures is enabled, treat auth errors as transient

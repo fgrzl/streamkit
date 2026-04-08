@@ -27,6 +27,8 @@ type MuxerBidiStream struct {
 	closeOnce  sync.Once
 	closed     chan struct{}
 	closedFlag uint32 // 0 == open, 1 == closed
+	closeErrMu sync.Mutex
+	closeErr   error
 	onClose    func()
 	channelID  uuid.UUID
 }
@@ -72,34 +74,65 @@ func (c *MuxerBidiStream) Encode(m any) error {
 
 // Decode blocks until a message is received or the stream is closed.
 func (c *MuxerBidiStream) Decode(v any) error {
+	msg, ok, err := c.recv()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return c.closedErr()
+	}
+
+	payload, err := c.payloadFromMsg(msg)
+	if err != nil {
+		return err
+	}
+
+	// Check whether payload represents a control ErrorMessage and handle it
+	if handled, err := c.handleErrorMessage(payload); handled {
+		return err
+	}
+
+	// Normal decode
+	if err := json.Unmarshal(payload, v); err != nil {
+		slog.Warn("bidi: decode unmarshal failed",
+			slog.String("channel_id", c.channelID.String()),
+			slog.String("error_type", "decode"),
+			slog.Int("bytes", len(payload)),
+			"err", err)
+		return err
+	}
+	return nil
+}
+
+func (c *MuxerBidiStream) recv() (any, bool, error) {
 	select {
+	case msg := <-c.recvChan:
+		return msg, true, nil
+	default:
+	}
+
+	select {
+	case msg := <-c.recvChan:
+		return msg, true, nil
 	case <-c.closed:
-		return io.EOF
+		return nil, false, c.closedErr()
+	}
+}
 
-	case msg, ok := <-c.recvChan:
-		if !ok {
-			return io.EOF
-		}
-		payload, err := c.payloadFromMsg(msg)
-		if err != nil {
-			return err
-		}
+func (c *MuxerBidiStream) closedErr() error {
+	c.closeErrMu.Lock()
+	defer c.closeErrMu.Unlock()
+	if c.closeErr != nil {
+		return c.closeErr
+	}
+	return io.EOF
+}
 
-		// Check whether payload represents a control ErrorMessage and handle it
-		if handled, err := c.handleErrorMessage(payload); handled {
-			return err
-		}
-
-		// Normal decode
-		if err := json.Unmarshal(payload, v); err != nil {
-			slog.Warn("bidi: decode unmarshal failed",
-				slog.String("channel_id", c.channelID.String()),
-				slog.String("error_type", "decode"),
-				slog.Int("bytes", len(payload)),
-				"err", err)
-			return err
-		}
-		return nil
+func (c *MuxerBidiStream) recordCloseErr(err error) {
+	c.closeErrMu.Lock()
+	defer c.closeErrMu.Unlock()
+	if c.closeErr == nil || err != nil {
+		c.closeErr = err
 	}
 }
 
@@ -185,6 +218,7 @@ func (c *MuxerBidiStream) Close(err error) {
 	c.closeOnce.Do(func() {
 		// Attempt to notify remote of close; on network errors this may fail.
 		_ = c.CloseSend(err)
+		c.recordCloseErr(err)
 		// mark closed and notify listeners; do not close recvChan to avoid send-on-closed panics
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
@@ -215,6 +249,7 @@ func (c *MuxerBidiStream) Close(err error) {
 func (c *MuxerBidiStream) CloseLocal(err error) {
 	c.closeOnce.Do(func() {
 		// Do not call CloseSend since network may be down.
+		c.recordCloseErr(err)
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
 
@@ -254,6 +289,8 @@ func (c *MuxerBidiStream) Offer(msg any) (ok bool) {
 	case c.recvChan <- msg:
 		return true
 	case <-c.closed:
+		return false
+	default:
 		return false
 	}
 }

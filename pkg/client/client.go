@@ -305,6 +305,7 @@ type resilienceEnumerator struct {
 	innerEnum enumerators.Enumerator[*Entry]
 
 	lastEntry      *Entry
+	lastErr        error
 	attemptCount   int
 	maxAttempts    int
 	disconnectedAt time.Time
@@ -672,6 +673,7 @@ func (e *resilienceEnumerator) MoveNext() bool {
 		if e.innerEnum == nil {
 			bidi, err := e.createStream()
 			if err != nil {
+				e.lastErr = err
 				slog.WarnContext(e.ctx, "resilience enumerator: failed to create stream",
 					appendClientLogFields(routeLogFields(e.storeID, e.args),
 						slog.Int("attempt", e.attemptCount+1),
@@ -694,6 +696,7 @@ func (e *resilienceEnumerator) MoveNext() bool {
 				continue
 			}
 			e.innerEnum = api.NewStreamEnumerator[*Entry](bidi)
+			e.lastErr = nil
 			e.disconnectedAt = time.Time{}
 			e.attemptCount = 0
 		}
@@ -716,6 +719,7 @@ func (e *resilienceEnumerator) MoveNext() bool {
 					e.innerEnum.Dispose()
 					e.innerEnum = nil
 				}
+				e.lastErr = err
 				e.attemptCount++
 				if e.attemptCount >= e.maxAttempts {
 					return false
@@ -737,9 +741,10 @@ func (e *resilienceEnumerator) MoveNext() bool {
 			e.innerEnum.Dispose()
 			e.innerEnum = nil
 		}
+		e.lastErr = streamErr
 
 		// Only retry if there was an actual error (disconnect), not on clean EOF
-		if streamErr != nil && e.lastEntry != nil {
+		if streamErr != nil && e.lastEntry != nil && IsRetryable(streamErr) {
 			if e.attemptCount < e.maxAttempts {
 				e.updateConsumePosition()
 				e.attemptCount++
@@ -847,7 +852,7 @@ func (e *resilienceEnumerator) Err() error {
 	if e.innerEnum != nil {
 		return e.innerEnum.Err()
 	}
-	return nil
+	return e.lastErr
 }
 
 // newResilienceEnumerator creates a resilience-wrapped enumerator (Issue 8)
@@ -1416,6 +1421,13 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 								slog.Int("failure_count", int(activeSub.failureCount.Load())),
 								"err", result.err)...)
 						stopSubscriptionReader(cancelStreamRead, stream, result.err, readerDone)
+						if !IsRetryable(result.err) {
+							slog.WarnContext(subCtx, "client: subscription stopped after permanent stream error",
+								appendClientLogFields(subscriptionLogFields(activeSub),
+									slog.String("error_type", classifyRetryError(result.err)),
+									"err", result.err)...)
+							return
+						}
 						break streamLoop // inner loop → re-enqueue for reconnection
 					}
 
@@ -1537,6 +1549,14 @@ func (c *client) startReconnectDispatcher() {
 								"err", err)...)
 						if c.metrics != nil {
 							c.metrics.RecordSubscriptionReplay(sub.id, false, time.Since(replayStart))
+						}
+						if !IsRetryable(err) {
+							slog.WarnContext(sub.ctx, "client: subscription reconnect stopped after permanent error",
+								appendClientLogFields(subscriptionLogFields(sub),
+									slog.String("error_type", classifyRetryError(err)),
+									"err", err)...)
+							sub.cancel()
+							continue
 						}
 
 						// Deliver nil so the goroutine re-enqueues itself

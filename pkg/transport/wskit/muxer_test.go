@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/server"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,6 +31,25 @@ func newQueueTestMuxer(queueSize int) *WebSocketMuxer {
 		sendJSON:               func(_ *websocket.Conn, _ interface{}) error { return nil },
 	}
 }
+
+type fakeNode struct{}
+
+func (f *fakeNode) Handle(context.Context, api.BidiStream) {}
+
+func (f *fakeNode) Close() {}
+
+type fakeNodeManager struct {
+	getCalls atomic.Int32
+}
+
+func (f *fakeNodeManager) GetOrCreate(context.Context, uuid.UUID) (server.Node, error) {
+	f.getCalls.Add(1)
+	return &fakeNode{}, nil
+}
+
+func (f *fakeNodeManager) Remove(context.Context, uuid.UUID) {}
+
+func (f *fakeNodeManager) Close() {}
 
 func TestShouldRegisterChannelInMuxer(t *testing.T) {
 	// Arrange
@@ -378,9 +399,10 @@ func TestShouldFallbackAfterBoundedQueueWaitExpires(t *testing.T) {
 func TestShouldSendAccessDeniedError(t *testing.T) {
 	// Arrange
 	m := &WebSocketMuxer{
-		Context:  context.Background(),
-		channels: make(map[uuid.UUID]*MuxerBidiStream),
-		done:     make(chan struct{}),
+		Context:    context.Background(),
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]error),
+		done:       make(chan struct{}),
 		// session that denies access
 		session: &muxerSession{allowAll: false, allowedStores: map[uuid.UUID]struct{}{}},
 	}
@@ -409,7 +431,134 @@ func TestShouldSendAccessDeniedError(t *testing.T) {
 
 	var em ErrorMessage
 	require.NoError(t, json.Unmarshal(captured.Payload, &em))
+	assert.Equal(t, controlMsgSentinel+"error", em.Type)
 	assert.Equal(t, "access denied", em.Err)
+}
+
+func TestShouldRouteErrorControlMessagesToExistingStream(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]error),
+		done:       make(chan struct{}),
+	}
+
+	storeID := uuid.New()
+	channelID := uuid.New()
+	bidi := m.register(context.Background(), storeID, channelID)
+
+	m.processMessage(&MuxerMsg{
+		ControlType: ControlTypeError,
+		StoreID:     storeID,
+		ChannelID:   channelID,
+		Payload:     []byte(`{"type":"mux::error","err":"access denied"}`),
+	})
+
+	var out string
+	assert.EqualError(t, bidi.Decode(&out), "remote error: access denied")
+}
+
+func TestDeliverToStreamClosesOnlyOverloadedChannel(t *testing.T) {
+	sent := make(chan MuxerMsg, 4)
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]error),
+		done:       make(chan struct{}),
+		sendJSON: func(_ *websocket.Conn, v interface{}) error {
+			if msg, ok := v.(*MuxerMsg); ok {
+				sent <- *msg
+			}
+			return nil
+		},
+	}
+
+	storeID := uuid.New()
+	slowID := uuid.New()
+	fastID := uuid.New()
+	slow := m.register(context.Background(), storeID, slowID)
+	fast := m.register(context.Background(), storeID, fastID)
+
+	for i := 0; i < cap(slow.recvChan); i++ {
+		require.True(t, slow.Offer([]byte(`"blocked"`)))
+	}
+
+	m.deliverToStream(slow, context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   slowID,
+		Payload:     []byte(`"overflow"`),
+	})
+
+	require.Eventually(t, slow.IsClosed, time.Second, 10*time.Millisecond)
+	assert.ErrorIs(t, slow.Decode(new(string)), ErrStreamOverloaded)
+
+	m.deliverToStream(fast, context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   fastID,
+		Payload:     []byte(`"ok"`),
+	})
+
+	var fastValue string
+	require.NoError(t, fast.Decode(&fastValue))
+	assert.Equal(t, "ok", fastValue)
+
+	m.processMessage(&MuxerMsg{ControlType: ControlTypePing})
+
+	foundError := false
+	foundPong := false
+	require.Eventually(t, func() bool {
+		for len(sent) > 0 {
+			msg := <-sent
+			if msg.ControlType == ControlTypeError && msg.ChannelID == slowID {
+				foundError = true
+			}
+			if msg.ControlType == ControlTypePong {
+				foundPong = true
+			}
+		}
+		return foundError && foundPong
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {
+	manager := &fakeNodeManager{}
+	channelID := uuid.New()
+	m := &WebSocketMuxer{
+		Context:     context.Background(),
+		name:        "server",
+		channels:    make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:  map[uuid.UUID]error{channelID: ErrStreamOverloaded},
+		done:        make(chan struct{}),
+		nodeManager: manager,
+		session:     &muxerSession{allowAll: true},
+	}
+
+	_, err := m.getOrCreateStream(context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     uuid.New(),
+		ChannelID:   channelID,
+		Payload:     []byte(`"late"`),
+	})
+
+	assert.ErrorIs(t, err, ErrStreamTombstoned)
+	assert.Equal(t, int32(0), manager.getCalls.Load())
+}
+
+func TestSuccessfulWritesDoNotRefreshHeartbeatTimeout(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:     context.Background(),
+		done:        make(chan struct{}),
+		pongTimeout: 1,
+		sendJSON:    func(_ *websocket.Conn, _ interface{}) error { return nil },
+	}
+	atomic.StoreInt64(&m.lastPongUnix, 0)
+
+	require.NoError(t, m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypePing}, false))
+	assert.True(t, m.checkHeartbeatTimeout())
 }
 
 func TestMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {

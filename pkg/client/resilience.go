@@ -84,11 +84,14 @@ func IsRetryable(err error) bool {
 		"not found",
 		"unauthorized",
 		"forbidden",
+		"access denied",
 		"authentication failed",
 		"invalid argument",
 		"invalid request",
 		"bad request",
 		"permission denied",
+		"stream receive buffer overloaded",
+		"stream overloaded",
 	}
 
 	for _, perm := range permanentErrors {

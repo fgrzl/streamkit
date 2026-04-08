@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -479,9 +480,28 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	}
 
 	route := api.GetSegmentNotificationRoute(n.storeID, args.Space)
+	var (
+		snapshotMu      sync.Mutex
+		snapshotPending = true
+		bufferedStatus  = make(map[string]*api.SegmentStatus)
+	)
+	bufferStatus := func(status *api.SegmentStatus) {
+		if status == nil {
+			return
+		}
+		bufferedStatus[status.Segment] = cloneSegmentStatus(status)
+	}
+	// Buffer live notifications until the current snapshot has been emitted so
+	// reconnects observe a stable "snapshot first, then live updates" sequence.
 	sub, err := bus.Subscribe(messageBus, route, func(ctx context.Context, msg *api.SegmentNotification) error {
 		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
 		if match {
+			snapshotMu.Lock()
+			defer snapshotMu.Unlock()
+			if snapshotPending {
+				bufferStatus(msg.SegmentStatus)
+				return nil
+			}
 			return bidi.Encode(msg.SegmentStatus)
 		}
 		return nil
@@ -505,6 +525,49 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 			}
 		})
 	}
+
+	snapshotStatuses, err := n.collectSubscriptionSnapshots(ctx, args)
+	if err != nil {
+		telemetry.RecordError(span, err)
+		slog.WarnContext(ctx, "server: failed to collect subscription snapshot",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment),
+				"err", err)...)
+		cleanup(err, true)
+		return
+	}
+
+	snapshotMu.Lock()
+	for _, status := range snapshotStatuses {
+		if err := bidi.Encode(status); err != nil {
+			snapshotMu.Unlock()
+			telemetry.RecordError(span, err)
+			slog.WarnContext(ctx, "server: failed to encode subscription snapshot",
+				logContextFields(ctx, n.storeID,
+					slog.String("space", args.Space),
+					slog.String("segment", args.Segment),
+					"err", err)...)
+			cleanup(err, true)
+			return
+		}
+	}
+	buffered := sortedBufferedStatuses(bufferedStatus)
+	for _, status := range buffered {
+		if err := bidi.Encode(status); err != nil {
+			snapshotMu.Unlock()
+			telemetry.RecordError(span, err)
+			slog.WarnContext(ctx, "server: failed to encode buffered subscription status",
+				logContextFields(ctx, n.storeID,
+					slog.String("space", args.Space),
+					slog.String("segment", args.Segment),
+					"err", err)...)
+			cleanup(err, true)
+			return
+		}
+	}
+	snapshotPending = false
+	snapshotMu.Unlock()
 
 	if args.HeartbeatIntervalSeconds > 0 {
 		go n.streamSubscriptionHeartbeats(subCtx, args, bidi)
@@ -566,6 +629,114 @@ func (n *defaultNode) streamSubscriptionHeartbeats(ctx context.Context, args *ap
 			}
 		}
 	}
+}
+
+func (n *defaultNode) collectSubscriptionSnapshots(ctx context.Context, args *api.SubscribeToSegmentStatus) ([]*api.SegmentStatus, error) {
+	if args == nil {
+		return nil, nil
+	}
+	if args.Segment != "*" {
+		status, err := n.segmentSnapshot(ctx, args.Space, args.Segment)
+		if err != nil || status == nil {
+			return nil, err
+		}
+		return []*api.SegmentStatus{status}, nil
+	}
+
+	segments, err := enumerators.ToSlice(n.store.GetSegments(ctx, args.Space))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(segments)
+
+	statuses := make([]*api.SegmentStatus, 0, len(segments))
+	for _, segment := range segments {
+		status, err := n.segmentSnapshot(ctx, args.Space, segment)
+		if err != nil {
+			return nil, err
+		}
+		if status != nil {
+			statuses = append(statuses, status)
+		}
+	}
+	return statuses, nil
+}
+
+func (n *defaultNode) segmentSnapshot(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	lastEntry, err := n.store.Peek(ctx, space, segment)
+	if err != nil {
+		return nil, err
+	}
+	if lastEntry == nil || lastEntry.Sequence == 0 {
+		return nil, nil
+	}
+
+	firstEntry, err := firstSegmentEntry(ctx, n.store, space, segment)
+	if err != nil {
+		return nil, err
+	}
+	if firstEntry == nil {
+		firstEntry = lastEntry
+	}
+
+	return &api.SegmentStatus{
+		Space:          space,
+		Segment:        segment,
+		FirstSequence:  firstEntry.Sequence,
+		FirstTimestamp: firstEntry.Timestamp,
+		LastSequence:   lastEntry.Sequence,
+		LastTimestamp:  lastEntry.Timestamp,
+	}, nil
+}
+
+func firstSegmentEntry(ctx context.Context, store storage.Store, space, segment string) (*api.Entry, error) {
+	if store == nil {
+		return nil, nil
+	}
+
+	enum := store.ConsumeSegment(ctx, &api.ConsumeSegment{
+		Space:       space,
+		Segment:     segment,
+		MinSequence: 1,
+	})
+	if enum == nil {
+		return nil, nil
+	}
+	defer enum.Dispose()
+
+	if !enum.MoveNext() {
+		if err := enum.Err(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	return enum.Current()
+}
+
+func cloneSegmentStatus(status *api.SegmentStatus) *api.SegmentStatus {
+	if status == nil {
+		return nil
+	}
+	cloned := *status
+	return &cloned
+}
+
+func sortedBufferedStatuses(buffered map[string]*api.SegmentStatus) []*api.SegmentStatus {
+	if len(buffered) == 0 {
+		return nil
+	}
+
+	segments := make([]string, 0, len(buffered))
+	for segment := range buffered {
+		segments = append(segments, segment)
+	}
+	sort.Strings(segments)
+
+	statuses := make([]*api.SegmentStatus, 0, len(segments))
+	for _, segment := range segments {
+		statuses = append(statuses, buffered[segment])
+	}
+	return statuses
 }
 
 func (n *defaultNode) getBus(ctx context.Context) bus.MessageBus {
