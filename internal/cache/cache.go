@@ -1,7 +1,10 @@
 package cache
 
 import (
+	"fmt"
+	"log/slog"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,20 +75,14 @@ func (c *ExpiringCache) Delete(key string) {
 	c.store.Delete(key)
 }
 
+// CleanupPanicCount returns the number of cleanup loop panics recovered so far.
+func (c *ExpiringCache) CleanupPanicCount() int32 {
+	return c.cleanupPanics.Load()
+}
+
 // cleanupExpiredEntries runs periodically to remove expired items
 func (c *ExpiringCache) cleanupExpiredEntries() {
-	defer func() {
-		if recover() != nil {
-			if c.cleanupPanics.Add(1) <= c.maxCleanupPanics {
-				select {
-				case <-c.stop:
-					return
-				default:
-				}
-				go c.cleanupExpiredEntries()
-			}
-		}
-	}()
+	defer c.recoverCleanupPanic()
 
 	runtime.Gosched()
 
@@ -116,6 +113,36 @@ func (c *ExpiringCache) cleanupExpiredEntries() {
 			return
 		}
 	}
+}
+
+func (c *ExpiringCache) recoverCleanupPanic() {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+
+	panicCount := c.cleanupPanics.Add(1)
+	willRestart := panicCount <= c.maxCleanupPanics
+	fields := []any{
+		slog.Int("cleanup_panic_count", int(panicCount)),
+		slog.Int("max_cleanup_panics", int(c.maxCleanupPanics)),
+		slog.String("panic_type", fmt.Sprintf("%T", recovered)),
+		slog.String("panic_value", fmt.Sprint(recovered)),
+		slog.String("stack", string(debug.Stack())),
+	}
+
+	if willRestart {
+		slog.Error("cache: cleanup panic recovered; restarting cleanup loop", fields...)
+		select {
+		case <-c.stop:
+			return
+		default:
+		}
+		go c.cleanupExpiredEntries()
+		return
+	}
+
+	slog.Error("cache: cleanup panic limit exceeded; cleanup loop stopped", fields...)
 }
 
 // Stop stops the cleanup goroutine
