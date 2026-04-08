@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -297,6 +298,14 @@ func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entr
 	return entry, nil
 }
 
+func (s *AzureStore) GetSegmentStatus(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	status, err := s.readStoredSegmentStatus(ctx, space, segment)
+	if err != nil || status != nil {
+		return status, err
+	}
+	return s.buildSegmentStatusFromData(ctx, space, segment)
+}
+
 func (s *AzureStore) Produce(ctx context.Context, args *api.Produce, records enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
 	if args == nil || args.Space == "" || args.Segment == "" {
 		return enumerators.Error[*api.SegmentStatus](errors.New(ErrInvalidProduceArgs))
@@ -473,8 +482,15 @@ func (s *AzureStore) processChunk(ctx context.Context, space, segment string, re
 	s.cache.Set(cacheKey, lastEntry)
 
 	status := createSegmentStatus(space, segment, entries)
+	mergedStatus, err := s.mergeStoredSegmentStatus(ctx, status)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.writeSegmentStatus(ctx, mergedStatus); err != nil {
+		return nil, &committedInventoryError{cause: err}
+	}
 
-	return status, nil
+	return mergedStatus, nil
 }
 
 func (s *AzureStore) beginTask() bool {
@@ -525,6 +541,16 @@ func (s *AzureStore) recoverWAL(ctx context.Context) error {
 			s.cache.Delete(invKey)
 			if err := s.retryInventoryUpdate(ctx, transaction.Space, transaction.Segment); err != nil {
 				return nil, err
+			}
+			if len(transaction.Entries) > 0 {
+				status := createSegmentStatus(transaction.Space, transaction.Segment, transaction.Entries)
+				mergedStatus, err := s.mergeStoredSegmentStatus(ctx, status)
+				if err != nil {
+					return nil, err
+				}
+				if err := s.writeSegmentStatus(ctx, mergedStatus); err != nil {
+					return nil, err
+				}
 			}
 			if err := s.cleanupWAL(ctx, e.PartitionKey, e.RowKey); err != nil {
 				slog.ErrorContext(ctx, LogErrorWALCleanup,
@@ -910,6 +936,124 @@ func (s *AzureStore) updateInventory(ctx context.Context, space, segment string)
 	return nil
 }
 
+func (s *AzureStore) readStoredSegmentStatus(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	resp, err := s.client.GetEntity(ctx, segmentStatusPartitionKey(space), segment)
+	if err != nil {
+		if isNotFoundError(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get segment status: %w", err)
+	}
+
+	var entity client.Entity
+	if err := json.Unmarshal(resp, &entity); err != nil {
+		return nil, fmt.Errorf("failed to decode segment status entity: %w", err)
+	}
+
+	status := &api.SegmentStatus{}
+	if err := json.Unmarshal(entity.Value, status); err != nil {
+		return nil, fmt.Errorf("failed to decode segment status: %w", err)
+	}
+	return status, nil
+}
+
+func (s *AzureStore) buildSegmentStatusFromData(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	lastEntry, err := s.Peek(ctx, space, segment)
+	if err != nil {
+		return nil, err
+	}
+	if lastEntry == nil || lastEntry.Sequence == 0 {
+		return nil, nil
+	}
+
+	enum := s.ConsumeSegment(ctx, &api.ConsumeSegment{
+		Space:   space,
+		Segment: segment,
+	})
+	defer enum.Dispose()
+	if !enum.MoveNext() {
+		return &api.SegmentStatus{
+			Space:          space,
+			Segment:        segment,
+			FirstSequence:  lastEntry.Sequence,
+			FirstTimestamp: lastEntry.Timestamp,
+			LastSequence:   lastEntry.Sequence,
+			LastTimestamp:  lastEntry.Timestamp,
+		}, enum.Err()
+	}
+
+	firstEntry, err := enum.Current()
+	if err != nil {
+		return nil, err
+	}
+	if firstEntry == nil {
+		firstEntry = lastEntry
+	}
+
+	return &api.SegmentStatus{
+		Space:          space,
+		Segment:        segment,
+		FirstSequence:  firstEntry.Sequence,
+		FirstTimestamp: firstEntry.Timestamp,
+		LastSequence:   lastEntry.Sequence,
+		LastTimestamp:  lastEntry.Timestamp,
+	}, nil
+}
+
+func (s *AzureStore) mergeStoredSegmentStatus(ctx context.Context, chunkStatus *api.SegmentStatus) (*api.SegmentStatus, error) {
+	if chunkStatus == nil {
+		return nil, nil
+	}
+	if chunkStatus.FirstSequence <= 1 {
+		return chunkStatus, nil
+	}
+	stored, err := s.readStoredSegmentStatus(ctx, chunkStatus.Space, chunkStatus.Segment)
+	if err != nil {
+		return nil, err
+	}
+	if stored == nil {
+		if chunkStatus.FirstSequence <= 1 {
+			return chunkStatus, nil
+		}
+		return s.buildSegmentStatusFromData(ctx, chunkStatus.Space, chunkStatus.Segment)
+	}
+
+	return &api.SegmentStatus{
+		Space:          chunkStatus.Space,
+		Segment:        chunkStatus.Segment,
+		FirstSequence:  stored.FirstSequence,
+		FirstTimestamp: stored.FirstTimestamp,
+		LastSequence:   chunkStatus.LastSequence,
+		LastTimestamp:  chunkStatus.LastTimestamp,
+	}, nil
+}
+
+func (s *AzureStore) writeSegmentStatus(ctx context.Context, status *api.SegmentStatus) error {
+	if status == nil {
+		return nil
+	}
+	value, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("failed to encode segment status: %w", err)
+	}
+	data, err := marshalEntity(client.Entity{
+		PartitionKey: segmentStatusPartitionKey(status.Space),
+		RowKey:       status.Segment,
+		Value:        value,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal segment status: %w", err)
+	}
+	if err := s.client.UpsertEntity(ctx, data, "Replace"); err != nil {
+		return fmt.Errorf("failed to write segment status: %w", err)
+	}
+	return nil
+}
+
+func segmentStatusPartitionKey(space string) string {
+	return lexkey.Encode(api.INVENTORY, api.SEGMENT_STATUSES, space).ToHexString()
+}
+
 func (s *AzureStore) retryInventoryUpdate(ctx context.Context, space, segment string) error {
 	const maxRetryAttempts = 3
 	const initialRetryDelay = 100 * time.Millisecond
@@ -1059,7 +1203,14 @@ func createSegmentStatus(space, segment string, entries []*api.Entry) *api.Segme
 }
 
 func isNotFoundError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "ResourceNotFound")
+	if err == nil {
+		return false
+	}
+	var azureErr *client.AzureError
+	if errors.As(err, &azureErr) && azureErr != nil {
+		return azureErr.StatusCode == http.StatusNotFound || azureErr.Code == "ResourceNotFound"
+	}
+	return strings.Contains(err.Error(), "ResourceNotFound") || strings.Contains(err.Error(), "status=404")
 }
 
 func isRetryableError(err error) bool {

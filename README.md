@@ -67,7 +67,7 @@ The client includes production-grade resilience features but has documented limi
 
 2. **Deduplication**: While resilience enumerators resume from last consumed position, applications should implement sequence-based deduplication for exactly-once semantics in critical workflows.
 
-3. **Subscription Lifecycle**: Retryable subscription failures stay in the reconnect loop, but permanent errors stop the subscription and remove it from the client registry. `SubscribeToSpace()` is the wildcard form of `SubscribeToSegmentStatus` (`Segment: "*"`) and reconnects receive a latest-state snapshot before live updates resume.
+3. **Subscription Lifecycle**: Retryable subscription failures stay in the reconnect loop, but permanent errors stop the subscription and remove it from the client registry. `SubscribeToSpace()` is the wildcard form of `SubscribeToSegmentStatus` (`Segment: "*"`) and reconnects receive a latest-state snapshot before live updates resume. Durable missed-update replay/cursors are not part of the current subscription contract.
 
 **Recommendations for Alpha Testing:**
 

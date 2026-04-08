@@ -77,6 +77,7 @@ type Client interface {
 - `IsRetryable(err)`: classifies errors — context errors and permanent errors are never retried
 - Auto-reconnect: disconnected subscriptions self-enqueue and replay serially via the reconnect dispatcher; `OnReconnected` is informational, not the replay trigger
 - `SubscribeToSpace()` is implemented as `SubscribeToSegmentStatus` with `Segment: "*"` and reconnects deliver a latest-state snapshot before live updates resume
+- Durable missed-update replay/cursors are not part of the current subscription contract; reconnect semantics are explicitly `latest snapshot -> live updates`
 
 ### Event Sourcing Layer (`pkg/eskit/`)
 

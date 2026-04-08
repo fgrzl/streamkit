@@ -560,6 +560,12 @@ func (s *activeSubscription) hasPendingStatus() bool {
 	return len(s.pendingOrder) > 0
 }
 
+func (s *activeSubscription) pendingStatusCount() int {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return len(s.pendingOrder)
+}
+
 func (s *activeSubscription) takePendingStatus() (SegmentStatus, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -1463,7 +1469,7 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 		}
 	}()
 
-	return &subscription{cancel: cancel, done: done}, nil
+	return &subscription{id: subID, cancel: cancel, done: done}, nil
 }
 
 // runHandler executes a subscription handler with timeout and panic recovery.
@@ -1509,8 +1515,16 @@ func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID 
 }
 
 type subscription struct {
+	id     string
 	cancel func()
 	done   <-chan struct{}
+}
+
+func (s *subscription) ID() string {
+	if s == nil {
+		return ""
+	}
+	return s.id
 }
 
 func (s *subscription) Unsubscribe() {
@@ -1709,6 +1723,7 @@ type SubscriptionStatus struct {
 	HandlerTimeouts  int32  // count of handler timeout occurrences
 	HandlerPanics    int32  // count of handler panic occurrences
 	CoalescedUpdates int64  // count of updates merged while handlers were saturated
+	PendingStatuses  int    // distinct latest statuses currently queued for delivery
 }
 
 // GetSubscriptionStatus returns the current health status of a subscription.
@@ -1750,5 +1765,6 @@ func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
 		HandlerTimeouts:  sub.handlerTimeouts.Load(),
 		HandlerPanics:    sub.handlerPanics.Load(),
 		CoalescedUpdates: sub.coalescedUpdates.Load(),
+		PendingStatuses:  sub.pendingStatusCount(),
 	}
 }

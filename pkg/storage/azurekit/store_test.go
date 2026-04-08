@@ -430,6 +430,7 @@ func TestShouldNotReplayFanoutWhenInventoryRetrySucceeds(t *testing.T) {
 	walCreates := 0
 	walDeletes := 0
 	lastEntryWrites := 0
+	statusWrites := 0
 	inventoryWrites := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -461,6 +462,14 @@ func TestShouldNotReplayFanoutWhenInventoryRetrySucceeds(t *testing.T) {
 			require.NoError(t, json.Unmarshal(body, &payload))
 
 			if _, hasValue := payload["Value"]; hasValue {
+				partitionKey, _ := payload["PartitionKey"].(string)
+				if partitionKey == segmentStatusPartitionKey("space-a") {
+					mu.Lock()
+					statusWrites++
+					mu.Unlock()
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				mu.Lock()
 				lastEntryWrites++
 				mu.Unlock()
@@ -514,6 +523,7 @@ func TestShouldNotReplayFanoutWhenInventoryRetrySucceeds(t *testing.T) {
 	assert.Equal(t, 1, walCreates, "inventory retries must not rewrite WAL")
 	assert.Equal(t, 1, walDeletes, "inventory retries must not rerun WAL cleanup")
 	assert.Equal(t, 1, lastEntryWrites, "inventory retries must not rewrite the last-entry marker")
+	assert.Equal(t, 1, statusWrites, "inventory retries should persist one segment-status snapshot")
 	assert.Equal(t, 3, inventoryWrites, "inventory retry should re-attempt the failed segment write and then complete the space write")
 }
 
@@ -542,6 +552,7 @@ func TestShouldRebuildInventoryWhenRecoveringWAL(t *testing.T) {
 	batchCalls := 0
 	walDeletes := 0
 	lastEntryWrites := 0
+	statusWrites := 0
 	inventoryWrites := 0
 	listCalls := 0
 
@@ -578,6 +589,14 @@ func TestShouldRebuildInventoryWhenRecoveringWAL(t *testing.T) {
 			require.NoError(t, json.Unmarshal(body, &payload))
 
 			if _, hasValue := payload["Value"]; hasValue {
+				partitionKey, _ := payload["PartitionKey"].(string)
+				if partitionKey == segmentStatusPartitionKey("space-a") {
+					mu.Lock()
+					statusWrites++
+					mu.Unlock()
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				mu.Lock()
 				lastEntryWrites++
 				mu.Unlock()
@@ -611,6 +630,7 @@ func TestShouldRebuildInventoryWhenRecoveringWAL(t *testing.T) {
 	assert.Equal(t, 2, batchCalls, "WAL recovery should replay both segment and space batches")
 	assert.Equal(t, 1, walDeletes, "WAL recovery should delete the recovered WAL record")
 	assert.Equal(t, 1, lastEntryWrites, "WAL recovery should restore the last-entry marker")
+	assert.Equal(t, 1, statusWrites, "WAL recovery should rebuild the segment-status snapshot")
 	assert.Equal(t, 2, inventoryWrites, "WAL recovery should rebuild segment and space inventory")
 }
 
@@ -634,6 +654,16 @@ func TestShouldRefreshPeekCacheWhenRecoveringWAL(t *testing.T) {
 	}
 	walEntity, err := createTransactionEntity(transaction)
 	require.NoError(t, err)
+	storedStatusJSON, err := json.Marshal(&api.SegmentStatus{
+		Space:          "space-a",
+		Segment:        "segment-a",
+		FirstSequence:  1,
+		FirstTimestamp: 1234,
+		LastSequence:   1,
+		LastTimestamp:  1234,
+	})
+	require.NoError(t, err)
+	statusWrites := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -644,6 +674,17 @@ func TestShouldRefreshPeekCacheWhenRecoveringWAL(t *testing.T) {
 			require.NoError(t, marshalErr)
 			_, _ = w.Write(response)
 
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/TestTable("):
+			entityResponse, marshalErr := json.Marshal(client.Entity{
+				PartitionKey: segmentStatusPartitionKey("space-a"),
+				RowKey:       "segment-a",
+				Value:        storedStatusJSON,
+			})
+			require.NoError(t, marshalErr)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(entityResponse)
+
 		case r.Method == http.MethodPost && r.URL.Path == "/$batch":
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte("HTTP/1.1 204 No Content\r\n\r\n"))
@@ -652,6 +693,15 @@ func TestShouldRefreshPeekCacheWhenRecoveringWAL(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/TestTable("):
+			body, readErr := io.ReadAll(r.Body)
+			require.NoError(t, readErr)
+
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(body, &payload))
+
+			if partitionKey, _ := payload["PartitionKey"].(string); partitionKey == segmentStatusPartitionKey("space-a") {
+				statusWrites++
+			}
 			w.WriteHeader(http.StatusNoContent)
 
 		default:
@@ -684,6 +734,7 @@ func TestShouldRefreshPeekCacheWhenRecoveringWAL(t *testing.T) {
 	peeked, err := store.Peek(context.Background(), "space-a", "segment-a")
 	require.NoError(t, err)
 	require.NotNil(t, peeked)
+	assert.Equal(t, 1, statusWrites, "WAL recovery should refresh the persisted segment-status snapshot")
 	assert.Equal(t, uint64(2), peeked.Sequence, "WAL recovery should replace stale peek cache entries")
 	assert.Equal(t, []byte("recovered"), peeked.Payload)
 }

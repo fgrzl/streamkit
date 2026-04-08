@@ -45,3 +45,10 @@ type Store interface {
 	// Close releases all resources associated with the store.
 	Close()
 }
+
+// SegmentStatusStore is an optional capability for stores that can fetch the
+// current first/last metadata for a segment without replaying the segment data
+// through the server layer.
+type SegmentStatusStore interface {
+	GetSegmentStatus(ctx context.Context, space, segment string) (*api.SegmentStatus, error)
+}

@@ -18,7 +18,8 @@ import (
 // SubscribeToSegmentStatus represents a subscription request for segment status
 // updates. When Segment is "*", the subscription receives updates for all
 // segments in the space. On reconnect, subscriptions receive a latest-state
-// snapshot before live updates resume.
+// snapshot before live updates resume. Durable missed-update replay/cursors are
+// not part of the current subscription contract.
 type SubscribeToSegmentStatus struct {
 	Space                    string `json:"space"`
 	Segment                  string `json:"segment"`

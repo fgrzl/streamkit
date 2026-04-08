@@ -92,6 +92,8 @@ func IsRetryable(err error) bool {
 		"permission denied",
 		"stream receive buffer overloaded",
 		"stream overloaded",
+		"payload too large",
+		"frame payload size exceeds limit",
 	}
 
 	for _, perm := range permanentErrors {

@@ -104,6 +104,39 @@ func TestShouldRemoveChannelOnOnClose(t *testing.T) {
 	assert.False(t, ok, "expected channel to be removed after onClose")
 }
 
+func TestGetOrCreateStreamRejectsWhenStreamLimitExceeded(t *testing.T) {
+	manager := &fakeNodeManager{}
+	m := &WebSocketMuxer{
+		Context:     context.Background(),
+		name:        "server",
+		done:        make(chan struct{}),
+		channels:    make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:  make(map[uuid.UUID]error),
+		maxStreams:  1,
+		nodeManager: manager,
+		sendJSON: func(_ *websocket.Conn, _ interface{}) error {
+			return nil
+		},
+	}
+	atomic.StoreInt64(&m.activeStreams, 1)
+
+	msg := &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     uuid.New(),
+		ChannelID:   uuid.New(),
+		Payload:     []byte(`{}`),
+	}
+
+	bidi, err := m.getOrCreateStream(context.Background(), msg)
+
+	require.Nil(t, bidi)
+	require.ErrorIs(t, err, ErrTooManyStreams)
+	assert.Equal(t, int32(0), manager.getCalls.Load(), "node manager should not be consulted once the stream cap is hit")
+	m.channelsMu.RLock()
+	defer m.channelsMu.RUnlock()
+	assert.ErrorIs(t, m.tombstones[msg.ChannelID], ErrTooManyStreams)
+}
+
 func TestShouldOverwriteExistingRegistration(t *testing.T) {
 	// Arrange
 	m := &WebSocketMuxer{
@@ -150,6 +183,14 @@ func TestShouldRejectOfferAfterClose(t *testing.T) {
 
 	// Assert
 	assert.False(t, ok)
+}
+
+func TestValidateInboundMessageRejectsOversizedPayload(t *testing.T) {
+	m := &WebSocketMuxer{maxMessagePayloadBytes: 4}
+
+	err := m.validateInboundMessage(&MuxerMsg{Payload: []byte("12345")})
+
+	require.ErrorIs(t, err, ErrPayloadTooLarge)
 }
 
 func TestRegisterStoresAndCleanupRemovesChannel(t *testing.T) {

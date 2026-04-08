@@ -571,36 +571,6 @@ func waitForSubscriptionSegmentsAtLeast(t *testing.T, updates <-chan client.Segm
 	}
 }
 
-func requireEventuallySubscriptionSequenceAtLeast(t *testing.T, c client.Client, storeID uuid.UUID, space, segment string, updates <-chan client.SegmentStatus, minSequence uint64) {
-	t.Helper()
-
-	var lastSeen uint64
-	publishAttempt := 0
-	require.Eventually(t, func() bool {
-		for {
-			select {
-			case status := <-updates:
-				if status.LastSequence > lastSeen {
-					lastSeen = status.LastSequence
-				}
-			default:
-				goto drained
-			}
-		}
-
-	drained:
-		if lastSeen >= minSequence {
-			return true
-		}
-
-		publishAttempt++
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		err := c.Publish(ctx, storeID, space, segment, []byte(fmt.Sprintf("subscription-replay-%d", publishAttempt)), nil)
-		cancel()
-		return err == nil && lastSeen >= minSequence
-	}, 10*time.Second, 100*time.Millisecond)
-}
-
 func waitForLiveSubscriptionRegistration(t *testing.T, bus *liveMessageBus, storeID uuid.UUID, space string, minSubscribeCalls int32) {
 	t.Helper()
 	route := api.GetSegmentNotificationRoute(storeID, space)
@@ -1027,6 +997,103 @@ func TestLiveSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T)
 
 	second := waitForSubscriptionSequenceAtLeast(t, updates, 2, 10*time.Second)
 	assert.Equal(t, uint64(2), second.LastSequence)
+}
+
+func TestLiveSpaceSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T) {
+	secretA := []byte("space-subscription-rotate-secret-a")
+	secretB := []byte("space-subscription-rotate-secret-b")
+	validator := &jwtkit.HMAC256Validator{Secret: secretA}
+	server := newLivePebbleWebSocketServer(t, t.TempDir(), validator)
+
+	tokenA := signWebSocketToken(t, secretA, ScopeAllStores)
+	tokenB := signWebSocketToken(t, secretB, ScopeAllStores)
+
+	var currentToken atomic.Value
+	currentToken.Store(tokenA)
+
+	provider := NewBidiStreamProvider(webSocketBaseURL(server.URL()), func() (string, error) {
+		return currentToken.Load().(string), nil
+	}).(*WebSocketBidiStreamProvider)
+	provider.RetryAuthFailures = true
+
+	var dialFailures atomic.Int32
+	provider.OnDialFailure = func(err error) {
+		if err != nil {
+			dialFailures.Add(1)
+			currentToken.Store(tokenB)
+		}
+	}
+
+	listener := &testReconnectListener{}
+	provider.RegisterReconnectListener(listener)
+
+	clientInstance := client.NewClientWithRetryPolicy(provider, liveRetryPolicy())
+	t.Cleanup(func() {
+		assert.NoError(t, clientInstance.Close())
+		assert.NoError(t, provider.Close())
+	})
+
+	storeID := uuid.New()
+	updates := make(chan client.SegmentStatus, 128)
+	sub, err := clientInstance.SubscribeToSpace(context.Background(), storeID, "space", func(status *client.SegmentStatus) {
+		if status == nil || status.Heartbeat {
+			return
+		}
+		select {
+		case updates <- *status:
+		default:
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(sub.Unsubscribe)
+	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 1)
+
+	writerClient := newLiveClientWithRetry(t, server.URL(), func() (string, error) {
+		return tokenA, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, writerClient.Publish(ctx, storeID, "space", "seg-a", []byte("first-a"), nil))
+
+	initial := waitForSubscriptionSegmentsAtLeast(t, updates, map[string]uint64{
+		"seg-a": 1,
+	}, 10*time.Second)
+	assert.Equal(t, uint64(1), initial["seg-a"].LastSequence)
+
+	allowReconnect := make(chan struct{})
+	provider.dialFn = func() (*websocket.Conn, error) {
+		<-allowReconnect
+		return dialAuthorizedWebSocket(server.URL(), currentToken.Load().(string))
+	}
+
+	validator.Secret = secretB
+	closeCurrentConn(t, provider)
+
+	writerAfterRotate := newLiveClientWithRetry(t, server.URL(), func() (string, error) {
+		return tokenB, nil
+	})
+	publishCtx, publishCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer publishCancel()
+	require.NoError(t, writerAfterRotate.Publish(publishCtx, storeID, "space", "seg-a", []byte("second-a"), nil))
+	require.NoError(t, writerAfterRotate.Publish(publishCtx, storeID, "space", "seg-b", []byte("first-b"), nil))
+
+	close(allowReconnect)
+
+	require.Eventually(t, func() bool {
+		return dialFailures.Load() >= 1
+	}, 10*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return listener.count() >= 1
+	}, 10*time.Second, 50*time.Millisecond)
+	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 2)
+
+	recovered := waitForSubscriptionSegmentsAtLeast(t, updates, map[string]uint64{
+		"seg-a": 2,
+		"seg-b": 1,
+	}, 10*time.Second)
+	assert.Equal(t, uint64(2), recovered["seg-a"].LastSequence)
+	assert.Equal(t, uint64(1), recovered["seg-b"].LastSequence)
 }
 
 func TestLiveSubscriptionRecoversAfterWebSocketDrop(t *testing.T) {

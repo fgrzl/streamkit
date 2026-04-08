@@ -11,6 +11,7 @@ import (
 
 	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/transport/wskit"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1373,17 +1374,9 @@ func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 
 	sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "segment", handler)
 	require.NoError(t, err)
-
-	var subID string
-	require.Eventually(t, func() bool {
-		c.subscriptionsMu.RLock()
-		defer c.subscriptionsMu.RUnlock()
-		for id := range c.subscriptions {
-			subID = id
-			return true
-		}
-		return false
-	}, time.Second, 10*time.Millisecond)
+	subID := sub.ID()
+	require.NotEmpty(t, subID)
+	pendingStatuses := 0
 
 	select {
 	case <-firstHandlerStarted:
@@ -1393,8 +1386,13 @@ func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		status := c.GetSubscriptionStatus(subID)
-		return status != nil && status.CoalescedUpdates > 0
+		if status == nil {
+			return false
+		}
+		pendingStatuses = status.PendingStatuses
+		return status.CoalescedUpdates > 0 && status.PendingStatuses > 0
 	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, 1, pendingStatuses, "single-segment subscriptions should expose one pending latest status while saturated")
 
 	require.Eventually(t, func() bool {
 		return decodeCount.Load() >= 20
@@ -1420,6 +1418,7 @@ func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 	status := c.GetSubscriptionStatus(subID)
 	require.NotNil(t, status)
 	assert.Greater(t, status.CoalescedUpdates, int64(0), "subscription status should report coalesced updates")
+	assert.Equal(t, 0, status.PendingStatuses, "pending status count should drain after handlers catch up")
 
 	cancel()
 	sub.Unsubscribe()
@@ -1483,17 +1482,9 @@ func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSatura
 
 	sub, err := c.SubscribeToSpace(ctx, uuid.New(), "space", handler)
 	require.NoError(t, err)
-
-	var subID string
-	require.Eventually(t, func() bool {
-		c.subscriptionsMu.RLock()
-		defer c.subscriptionsMu.RUnlock()
-		for id := range c.subscriptions {
-			subID = id
-			return true
-		}
-		return false
-	}, time.Second, 10*time.Millisecond)
+	subID := sub.ID()
+	require.NotEmpty(t, subID)
+	pendingStatuses := 0
 
 	select {
 	case <-firstHandlerStarted:
@@ -1507,8 +1498,13 @@ func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSatura
 
 	require.Eventually(t, func() bool {
 		status := c.GetSubscriptionStatus(subID)
-		return status != nil && status.CoalescedUpdates > 0
+		if status == nil {
+			return false
+		}
+		pendingStatuses = status.PendingStatuses
+		return status.CoalescedUpdates > 0 && status.PendingStatuses >= 3
 	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, 3, pendingStatuses, "space subscriptions should expose one pending latest status per segment while saturated")
 
 	close(releaseFirstHandler)
 
@@ -1526,6 +1522,10 @@ func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSatura
 	}, time.Second, 10*time.Millisecond)
 
 	assert.Equal(t, []string{"seg-a:1", "seg-a:2", "seg-b:2", "seg-c:1"}, seen[:4], "space subscription should retain the latest pending status for each segment")
+
+	status := c.GetSubscriptionStatus(subID)
+	require.NotNil(t, status)
+	assert.Equal(t, 0, status.PendingStatuses, "pending status count should drain after handlers catch up")
 
 	cancel()
 	sub.Unsubscribe()
@@ -2187,6 +2187,82 @@ func TestSubscriptionStopsOnPermanentRemoteError(t *testing.T) {
 	select {
 	case <-handlerCalled:
 		t.Fatal("handler should not run for permanent remote errors")
+	default:
+	}
+
+	sub.Unsubscribe()
+}
+
+func TestSubscriptionCancelsOnPermanentCallStreamError(t *testing.T) {
+	var attempts atomic.Int32
+	handlerCalled := make(chan struct{}, 1)
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			attempts.Add(1)
+			return nil, errors.New("access denied")
+		},
+	}
+
+	c := NewClientWithHandlerTimeout(provider, 50*time.Millisecond).(*client)
+	sub, err := c.SubscribeToSegment(context.Background(), uuid.New(), "space", "segment", func(*SegmentStatus) {
+		select {
+		case handlerCalled <- struct{}{}:
+		default:
+		}
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		c.subscriptionsMu.RLock()
+		defer c.subscriptionsMu.RUnlock()
+		return len(c.subscriptions) == 0
+	}, time.Second, 10*time.Millisecond, "permanent CallStream errors should cancel the subscription")
+
+	assert.Equal(t, int32(1), attempts.Load(), "permanent CallStream errors should not trigger reconnect retries")
+	select {
+	case <-handlerCalled:
+		t.Fatal("handler should not run when CallStream fails permanently")
+	default:
+	}
+
+	sub.Unsubscribe()
+}
+
+func TestSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
+	var attempts atomic.Int32
+	handlerCalled := make(chan struct{}, 1)
+
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			attempts.Add(1)
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(any) error {
+				return fmt.Errorf("remote error: %s", wskit.ErrStreamOverloaded)
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClientWithHandlerTimeout(provider, 50*time.Millisecond).(*client)
+	sub, err := c.SubscribeToSegment(context.Background(), uuid.New(), "space", "segment", func(*SegmentStatus) {
+		select {
+		case handlerCalled <- struct{}{}:
+		default:
+		}
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		c.subscriptionsMu.RLock()
+		defer c.subscriptionsMu.RUnlock()
+		return len(c.subscriptions) == 0
+	}, time.Second, 10*time.Millisecond, "stream overload should stop the subscription loop")
+
+	assert.Equal(t, int32(1), attempts.Load(), "stream overload should not trigger reconnect retries")
+	select {
+	case <-handlerCalled:
+		t.Fatal("handler should not run after stream overload")
 	default:
 	}
 

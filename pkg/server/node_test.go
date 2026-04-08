@@ -15,6 +15,7 @@ import (
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/bus"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -722,6 +723,12 @@ func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 	require.NotNil(t, messageBus.subscription)
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
+}
+
+func TestClampSubscriptionHeartbeatIntervalSeconds(t *testing.T) {
+	assert.Equal(t, int64(0), clampSubscriptionHeartbeatIntervalSeconds(0))
+	assert.Equal(t, int64(1), clampSubscriptionHeartbeatIntervalSeconds(1))
+	assert.Equal(t, int64(maxSubscriptionHeartbeatIntervalSeconds), clampSubscriptionHeartbeatIntervalSeconds(3600))
 }
 
 // (removed failingBusFactory - not used)

@@ -87,6 +87,11 @@ type WebSocketMuxer struct {
 	heartbeatStop chan struct{}
 	cancelFunc    context.CancelFunc
 	pingJitter    int64
+	maxStreams    int64
+
+	// frame/message size guardrails
+	maxFramePayloadBytes   int
+	maxMessagePayloadBytes int
 
 	// runtime counters
 	pingsSent                    int64
@@ -114,12 +119,17 @@ var (
 	ErrHeartbeatTimeout = errors.New("heartbeat timeout")
 	ErrStreamOverloaded = errors.New("stream receive buffer overloaded")
 	ErrStreamTombstoned = errors.New("stream closed locally")
+	ErrTooManyStreams   = errors.New("too many active streams")
+	ErrPayloadTooLarge  = errors.New("muxer payload too large")
 )
 
 const (
 	writeQueueSaturationWarnThreshold int64 = 32
 	writeQueueSaturationWarnEvery     int64 = 256
 	defaultWriteQueueOfferTimeout           = 5 * time.Millisecond
+	defaultMaxLogicalStreams                = 1024
+	defaultMaxFramePayloadBytes             = 8 << 20
+	defaultMaxMessagePayloadBytes           = 6 << 20
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -138,6 +148,9 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		pingInterval:           30,
 		pongTimeout:            90,
 		pingJitter:             5,
+		maxStreams:             defaultMaxLogicalStreams,
+		maxFramePayloadBytes:   defaultMaxFramePayloadBytes,
+		maxMessagePayloadBytes: defaultMaxMessagePayloadBytes,
 		lastPongUnix:           timestamp.GetTimestamp(),
 		heartbeatStop:          make(chan struct{}),
 		cancelFunc:             cancel,
@@ -161,6 +174,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	// default send/recv use websocket.JSON
 	m.sendJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Send(conn, v) }
 	m.recvJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Receive(conn, v) }
+	m.applyConnectionLimits()
 	go m.readLoop()
 	go m.heartbeat()
 	go m.writePump()
@@ -184,6 +198,9 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		pingInterval:           30,
 		pongTimeout:            90,
 		pingJitter:             5,
+		maxStreams:             defaultMaxLogicalStreams,
+		maxFramePayloadBytes:   defaultMaxFramePayloadBytes,
+		maxMessagePayloadBytes: defaultMaxMessagePayloadBytes,
 		lastPongUnix:           timestamp.GetTimestamp(),
 		heartbeatStop:          make(chan struct{}),
 		cancelFunc:             cancel,
@@ -196,6 +213,7 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	m.sendJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Send(conn, v) }
 	m.recvJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Receive(conn, v) }
+	m.applyConnectionLimits()
 	// Initialize write pump infrastructure like the client muxer so server
 	// behavior is symmetric and safe for concurrent use.
 	m.writeQueueSize = 1024
@@ -240,6 +258,13 @@ func (m *WebSocketMuxer) Ping() bool {
 	return false
 }
 
+func (m *WebSocketMuxer) applyConnectionLimits() {
+	if m == nil || m.conn == nil || m.maxFramePayloadBytes <= 0 {
+		return
+	}
+	m.conn.MaxPayloadBytes = m.maxFramePayloadBytes
+}
+
 // Serve blocks until the WebSocket connection is closed or an error occurs.
 func (m *WebSocketMuxer) Serve() {
 	<-m.done
@@ -279,6 +304,14 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 		bidi.SetChannelID(channelID)
 		return bidi
 	default:
+	}
+	if m.maxStreams > 0 && atomic.LoadInt64(&m.activeStreams) >= m.maxStreams {
+		bidi := NewMuxerBidiStream(
+			func([]byte) error { return ErrTooManyStreams },
+			func() {},
+		)
+		bidi.SetChannelID(channelID)
+		return bidi
 	}
 
 	sendFn := func(payload []byte) error {
@@ -349,6 +382,9 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte, 
 	case <-m.done:
 		return ErrMuxerClosed
 	default:
+	}
+	if m.maxMessagePayloadBytes > 0 && len(payload) > m.maxMessagePayloadBytes {
+		return ErrPayloadTooLarge
 	}
 
 	// prepare pooled message (if available)
@@ -518,6 +554,10 @@ func (m *WebSocketMuxer) readLoop() {
 			m.handleReceiveError(err)
 			return
 		}
+		if err := m.validateInboundMessage(&msg); err != nil {
+			m.handleReceiveError(err)
+			return
+		}
 
 		// refresh activity time on any received message
 		atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
@@ -616,6 +656,16 @@ func (m *WebSocketMuxer) processMessage(msg *MuxerMsg) {
 	}
 }
 
+func (m *WebSocketMuxer) validateInboundMessage(msg *MuxerMsg) error {
+	if msg == nil {
+		return nil
+	}
+	if m.maxMessagePayloadBytes > 0 && len(msg.Payload) > m.maxMessagePayloadBytes {
+		return ErrPayloadTooLarge
+	}
+	return nil
+}
+
 func (m *WebSocketMuxer) handlePing(_ context.Context) {
 	atomic.AddInt64(&m.pingsReceived, 1)
 	if err := m.sendControl(ControlTypePong, uuid.Nil, uuid.Nil, nil); err != nil {
@@ -711,6 +761,27 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 	if tombstoned {
 		slog.DebugContext(ctx, "muxer: ignoring late message for closed channel", m.msgLogFields(msg)...)
 		return nil, ErrStreamTombstoned
+	}
+	if m.maxStreams > 0 && atomic.LoadInt64(&m.activeStreams) >= m.maxStreams {
+		err := ErrTooManyStreams
+		slog.WarnContext(ctx, "muxer: active stream limit reached",
+			m.msgLogFields(msg,
+				slog.Int64("active_streams", atomic.LoadInt64(&m.activeStreams)),
+				slog.Int64("max_streams", m.maxStreams),
+				slog.String("error_type", classifyTransportError(err)),
+				"err", err)...)
+		m.tombstoneStream(msg.ChannelID, err)
+		payload, marshalErr := json.Marshal(&ErrorMessage{Type: controlMsgSentinel + "error", Err: err.Error()})
+		if marshalErr != nil {
+			slog.WarnContext(ctx, "muxer: marshal stream-limit error failed",
+				m.msgLogFields(msg, "err", marshalErr)...)
+		} else if sendErr := m.sendControl(ControlTypeError, msg.StoreID, msg.ChannelID, payload); sendErr != nil {
+			slog.WarnContext(ctx, "muxer: send stream-limit error failed",
+				m.msgLogFields(msg,
+					slog.String("error_type", classifyTransportError(sendErr)),
+					"err", sendErr)...)
+		}
+		return nil, err
 	}
 
 	if m.nodeManager == nil {

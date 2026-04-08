@@ -26,6 +26,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const (
+	minSubscriptionHeartbeatIntervalSeconds = 1
+	maxSubscriptionHeartbeatIntervalSeconds = 300
+)
+
 // Node represents a request handler that processes streaming operations
 // and coordinates with storage backends.
 type Node interface {
@@ -569,8 +574,8 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	snapshotPending = false
 	snapshotMu.Unlock()
 
-	if args.HeartbeatIntervalSeconds > 0 {
-		go n.streamSubscriptionHeartbeats(subCtx, args, bidi)
+	if heartbeatSeconds := clampSubscriptionHeartbeatIntervalSeconds(args.HeartbeatIntervalSeconds); heartbeatSeconds > 0 {
+		go n.streamSubscriptionHeartbeats(subCtx, args.Space, args.Segment, heartbeatSeconds, bidi)
 	}
 
 	// Clean up on bidi close or context cancellation
@@ -594,16 +599,29 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 	}()
 }
 
-func (n *defaultNode) streamSubscriptionHeartbeats(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
-	interval := time.Duration(args.HeartbeatIntervalSeconds) * time.Second
+func clampSubscriptionHeartbeatIntervalSeconds(seconds int64) int64 {
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds < minSubscriptionHeartbeatIntervalSeconds {
+		return minSubscriptionHeartbeatIntervalSeconds
+	}
+	if seconds > maxSubscriptionHeartbeatIntervalSeconds {
+		return maxSubscriptionHeartbeatIntervalSeconds
+	}
+	return seconds
+}
+
+func (n *defaultNode) streamSubscriptionHeartbeats(ctx context.Context, space, segment string, heartbeatSeconds int64, bidi api.BidiStream) {
+	interval := time.Duration(clampSubscriptionHeartbeatIntervalSeconds(heartbeatSeconds)) * time.Second
 	if interval <= 0 {
 		return
 	}
 
 	sendHeartbeat := func() error {
 		return bidi.Encode(&api.SegmentStatus{
-			Space:     args.Space,
-			Segment:   args.Segment,
+			Space:     space,
+			Segment:   segment,
 			Heartbeat: true,
 		})
 	}
@@ -663,6 +681,10 @@ func (n *defaultNode) collectSubscriptionSnapshots(ctx context.Context, args *ap
 }
 
 func (n *defaultNode) segmentSnapshot(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	if statusStore, ok := n.store.(storage.SegmentStatusStore); ok {
+		return statusStore.GetSegmentStatus(ctx, space, segment)
+	}
+
 	lastEntry, err := n.store.Peek(ctx, space, segment)
 	if err != nil {
 		return nil, err

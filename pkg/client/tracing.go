@@ -77,6 +77,13 @@ type tracedSubscription struct {
 	cancelOnce sync.Once
 }
 
+func (s *tracedSubscription) ID() string {
+	if s == nil || s.inner == nil {
+		return ""
+	}
+	return s.inner.ID()
+}
+
 func (s *tracedSubscription) Unsubscribe() {
 	s.cancelOnce.Do(s.cancel)
 	if s.inner != nil {

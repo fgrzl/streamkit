@@ -58,6 +58,12 @@ func classifyTransportError(err error) string {
 	if errors.Is(err, ErrHeartbeatTimeout) {
 		return "heartbeat_timeout"
 	}
+	if errors.Is(err, ErrTooManyStreams) {
+		return "stream_limit"
+	}
+	if errors.Is(err, ErrPayloadTooLarge) {
+		return "payload_too_large"
+	}
 	if benignDisconnect(err) {
 		return "disconnect"
 	}

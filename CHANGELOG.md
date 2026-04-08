@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    - **Impact**: Applications should treat permanent subscription errors as terminal unless they
      explicitly resubscribe.
    - **Best Practice**: Surface subscription lifecycle through application logs and metrics, and
-     treat reconnect deliveries as `latest snapshot -> live updates`.
+     treat reconnect deliveries as `latest snapshot -> live updates`. Durable replay/cursors
+     remain out of scope for the current subscription API contract.
 
 ---
 
