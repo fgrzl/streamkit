@@ -588,6 +588,7 @@ type liveConsumeCase struct {
 	expected       []string
 	gateAfterIndex int
 	openEnum       func(client.Client, context.Context, uuid.UUID) enumerators.Enumerator[*client.Entry]
+	retryEnum      func(client.Client, context.Context, uuid.UUID, *client.Entry) enumerators.Enumerator[*client.Entry]
 }
 
 func liveConsumeCases() []liveConsumeCase {
@@ -611,6 +612,13 @@ func liveConsumeCases() []liveConsumeCase {
 					Segment: "segment",
 				})
 			},
+			retryEnum: func(c client.Client, ctx context.Context, storeID uuid.UUID, last *client.Entry) enumerators.Enumerator[*client.Entry] {
+				return c.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{
+					Space:       "space",
+					Segment:     "segment",
+					MinSequence: last.Sequence + 1,
+				})
+			},
 		},
 		{
 			name: "consume-space",
@@ -628,6 +636,12 @@ func liveConsumeCases() []liveConsumeCase {
 			openEnum: func(c client.Client, ctx context.Context, storeID uuid.UUID) enumerators.Enumerator[*client.Entry] {
 				return c.ConsumeSpace(ctx, storeID, &client.ConsumeSpace{
 					Space: "space",
+				})
+			},
+			retryEnum: func(c client.Client, ctx context.Context, storeID uuid.UUID, last *client.Entry) enumerators.Enumerator[*client.Entry] {
+				return c.ConsumeSpace(ctx, storeID, &client.ConsumeSpace{
+					Space:  "space",
+					Offset: last.GetSpaceOffset(),
 				})
 			},
 		},
@@ -651,6 +665,13 @@ func liveConsumeCases() []liveConsumeCase {
 					},
 				})
 			},
+			retryEnum: func(c client.Client, ctx context.Context, storeID uuid.UUID, last *client.Entry) enumerators.Enumerator[*client.Entry] {
+				return c.Consume(ctx, storeID, &client.Consume{
+					Offsets: map[string]lexkey.LexKey{
+						last.Space: last.GetSpaceOffset(),
+					},
+				})
+			},
 		},
 	}
 }
@@ -671,7 +692,7 @@ func liveEntryLabel(entry *client.Entry) string {
 	return fmt.Sprintf("%s/%s:%d", entry.Space, entry.Segment, entry.Sequence)
 }
 
-func runLiveConsumeResumeScenario(t *testing.T, tc liveConsumeCase, disruption string) {
+func runLiveConsumeRetryScenario(t *testing.T, tc liveConsumeCase, disruption string) {
 	t.Helper()
 
 	store := newLiveConsumeStore(tc.entries, tc.gateAfterIndex)
@@ -725,7 +746,8 @@ func runLiveConsumeResumeScenario(t *testing.T, tc liveConsumeCase, disruption s
 	enum := tc.openEnum(clientInstance, ctx, storeID)
 	defer enum.Dispose()
 
-	got := []string{liveEntryLabel(readNextLiveEntry(t, enum))}
+	first := readNextLiveEntry(t, enum)
+	got := []string{liveEntryLabel(first)}
 
 	select {
 	case <-store.gateStarted:
@@ -750,13 +772,8 @@ func runLiveConsumeResumeScenario(t *testing.T, tc liveConsumeCase, disruption s
 
 	close(store.releaseGate)
 
-	for len(got) < len(tc.expected) {
-		got = append(got, liveEntryLabel(readNextLiveEntry(t, enum)))
-	}
-
-	assert.Equal(t, tc.expected, got)
 	assert.False(t, enum.MoveNext())
-	assert.NoError(t, enum.Err())
+	require.Error(t, enum.Err())
 	require.Eventually(t, func() bool {
 		return listener.count() >= 1
 	}, 10*time.Second, 50*time.Millisecond)
@@ -765,28 +782,41 @@ func runLiveConsumeResumeScenario(t *testing.T, tc liveConsumeCase, disruption s
 			return dialFailures.Load() >= 1
 		}, 10*time.Second, 50*time.Millisecond)
 	}
+
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer retryCancel()
+	retryEnum := tc.retryEnum(clientInstance, retryCtx, storeID, first)
+	defer retryEnum.Dispose()
+
+	for retryEnum.MoveNext() {
+		entry, err := retryEnum.Current()
+		require.NoError(t, err)
+		got = append(got, liveEntryLabel(entry))
+	}
+	require.NoError(t, retryEnum.Err())
+	assert.Equal(t, tc.expected, got)
 }
 
-func TestLiveConsumeEnumeratorsRecoverAfterWebSocketDrop(t *testing.T) {
+func TestLiveConsumeEnumeratorsRequireRetryAfterWebSocketDrop(t *testing.T) {
 	for _, tc := range liveConsumeCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			runLiveConsumeResumeScenario(t, tc, "websocket-drop")
+			runLiveConsumeRetryScenario(t, tc, "websocket-drop")
 		})
 	}
 }
 
-func TestLiveConsumeEnumeratorsRecoverAfterServerRestart(t *testing.T) {
+func TestLiveConsumeEnumeratorsRequireRetryAfterServerRestart(t *testing.T) {
 	for _, tc := range liveConsumeCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			runLiveConsumeResumeScenario(t, tc, "server-restart")
+			runLiveConsumeRetryScenario(t, tc, "server-restart")
 		})
 	}
 }
 
-func TestLiveConsumeEnumeratorsRefreshTokenAfterAuthFailureOnReconnect(t *testing.T) {
+func TestLiveConsumeEnumeratorsRequireRetryAfterAuthFailureOnReconnect(t *testing.T) {
 	for _, tc := range liveConsumeCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			runLiveConsumeResumeScenario(t, tc, "auth-refresh")
+			runLiveConsumeRetryScenario(t, tc, "auth-refresh")
 		})
 	}
 }
@@ -913,7 +943,7 @@ func TestLiveClientRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond)
 }
 
-func TestLiveSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T) {
+func TestLiveSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *testing.T) {
 	secretA := []byte("subscription-rotate-secret-a")
 	secretB := []byte("subscription-rotate-secret-b")
 	validator := &jwtkit.HMAC256Validator{Secret: secretA}
@@ -977,6 +1007,10 @@ func TestLiveSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T)
 
 	validator.Secret = secretB
 	closeCurrentConn(t, provider)
+	route := api.GetSegmentNotificationRoute(storeID, "space")
+	require.Eventually(t, func() bool {
+		return server.bus.subscriberCount(route) == 0
+	}, 10*time.Second, 25*time.Millisecond)
 
 	writerAfterRotate := newLiveClientWithRetry(t, server.URL(), func() (string, error) {
 		return tokenB, nil
@@ -993,13 +1027,23 @@ func TestLiveSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T)
 	require.Eventually(t, func() bool {
 		return listener.count() >= 1
 	}, 10*time.Second, 50*time.Millisecond)
+
+	recreatedUpdates := make(chan client.SegmentStatus, 32)
+	recreatedSub, err := clientInstance.SubscribeToSegment(context.Background(), storeID, "space", "segment", func(status *client.SegmentStatus) {
+		select {
+		case recreatedUpdates <- *status:
+		default:
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 2)
 
-	second := waitForSubscriptionSequenceAtLeast(t, updates, 2, 10*time.Second)
+	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2, 10*time.Second)
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
-func TestLiveSpaceSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T) {
+func TestLiveSpaceSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *testing.T) {
 	secretA := []byte("space-subscription-rotate-secret-a")
 	secretB := []byte("space-subscription-rotate-secret-b")
 	validator := &jwtkit.HMAC256Validator{Secret: secretA}
@@ -1069,6 +1113,10 @@ func TestLiveSpaceSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testi
 
 	validator.Secret = secretB
 	closeCurrentConn(t, provider)
+	route := api.GetSegmentNotificationRoute(storeID, "space")
+	require.Eventually(t, func() bool {
+		return server.bus.subscriberCount(route) == 0
+	}, 10*time.Second, 25*time.Millisecond)
 
 	writerAfterRotate := newLiveClientWithRetry(t, server.URL(), func() (string, error) {
 		return tokenB, nil
@@ -1086,9 +1134,22 @@ func TestLiveSpaceSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testi
 	require.Eventually(t, func() bool {
 		return listener.count() >= 1
 	}, 10*time.Second, 50*time.Millisecond)
+
+	recreatedUpdates := make(chan client.SegmentStatus, 128)
+	recreatedSub, err := clientInstance.SubscribeToSpace(context.Background(), storeID, "space", func(status *client.SegmentStatus) {
+		if status == nil || status.Heartbeat {
+			return
+		}
+		select {
+		case recreatedUpdates <- *status:
+		default:
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 2)
 
-	recovered := waitForSubscriptionSegmentsAtLeast(t, updates, map[string]uint64{
+	recovered := waitForSubscriptionSegmentsAtLeast(t, recreatedUpdates, map[string]uint64{
 		"seg-a": 2,
 		"seg-b": 1,
 	}, 10*time.Second)
@@ -1096,7 +1157,7 @@ func TestLiveSpaceSubscriptionRefreshesTokenAfterAuthFailureOnReconnect(t *testi
 	assert.Equal(t, uint64(1), recovered["seg-b"].LastSequence)
 }
 
-func TestLiveSubscriptionRecoversAfterWebSocketDrop(t *testing.T) {
+func TestLiveSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) {
 	secret := []byte("subscription-drop-secret")
 	server := newLivePebbleWebSocketServer(t, t.TempDir(), &jwtkit.HMAC256Validator{Secret: secret})
 	token := signWebSocketToken(t, secret, ScopeAllStores)
@@ -1142,6 +1203,10 @@ func TestLiveSubscriptionRecoversAfterWebSocketDrop(t *testing.T) {
 	}
 
 	closeCurrentConn(t, provider)
+	route := api.GetSegmentNotificationRoute(storeID, "space")
+	require.Eventually(t, func() bool {
+		return server.bus.subscriberCount(route) == 0
+	}, 10*time.Second, 25*time.Millisecond)
 	publishCtx, publishCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer publishCancel()
 	require.NoError(t, writerClient.Publish(publishCtx, storeID, "space", "segment", []byte("second"), nil))
@@ -1149,13 +1214,23 @@ func TestLiveSubscriptionRecoversAfterWebSocketDrop(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return listener.count() >= 1
 	}, 10*time.Second, 50*time.Millisecond)
+
+	recreatedUpdates := make(chan client.SegmentStatus, 32)
+	recreatedSub, err := clientInstance.SubscribeToSegment(context.Background(), storeID, "space", "segment", func(status *client.SegmentStatus) {
+		select {
+		case recreatedUpdates <- *status:
+		default:
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 2)
 
-	second := waitForSubscriptionSequenceAtLeast(t, updates, 2, 10*time.Second)
+	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2, 10*time.Second)
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
-func TestLiveSubscriptionRecoversAfterServerRestart(t *testing.T) {
+func TestLiveSubscriptionRequiresRecreateAfterServerRestart(t *testing.T) {
 	path := t.TempDir()
 	secret := []byte("subscription-restart-secret")
 	server := newLivePebbleWebSocketServer(t, path, &jwtkit.HMAC256Validator{Secret: secret})
@@ -1222,13 +1297,23 @@ func TestLiveSubscriptionRecoversAfterServerRestart(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return listener.count() >= 1
 	}, 10*time.Second, 50*time.Millisecond)
+
+	recreatedUpdates := make(chan client.SegmentStatus, 32)
+	recreatedSub, err := clientInstance.SubscribeToSegment(context.Background(), storeID, "space", "segment", func(status *client.SegmentStatus) {
+		select {
+		case recreatedUpdates <- *status:
+		default:
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, restarted.bus, storeID, "space", 1)
 
-	second := waitForSubscriptionSequenceAtLeast(t, updates, 2, 10*time.Second)
+	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2, 10*time.Second)
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
-func TestLiveSpaceSubscriptionRecoversLatestSnapshotsAfterWebSocketDrop(t *testing.T) {
+func TestLiveSpaceSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) {
 	secret := []byte("space-subscription-drop-secret")
 	server := newLivePebbleWebSocketServer(t, t.TempDir(), &jwtkit.HMAC256Validator{Secret: secret})
 	token := signWebSocketToken(t, secret, ScopeAllStores)
@@ -1298,9 +1383,22 @@ func TestLiveSpaceSubscriptionRecoversLatestSnapshotsAfterWebSocketDrop(t *testi
 	require.Eventually(t, func() bool {
 		return listener.count() >= 1
 	}, 10*time.Second, 50*time.Millisecond)
+
+	recreatedUpdates := make(chan client.SegmentStatus, 128)
+	recreatedSub, err := clientInstance.SubscribeToSpace(context.Background(), storeID, "space", func(status *client.SegmentStatus) {
+		if status == nil || status.Heartbeat {
+			return
+		}
+		select {
+		case recreatedUpdates <- *status:
+		default:
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 2)
 
-	recovered := waitForSubscriptionSegmentsAtLeast(t, updates, map[string]uint64{
+	recovered := waitForSubscriptionSegmentsAtLeast(t, recreatedUpdates, map[string]uint64{
 		"seg-a": 2,
 		"seg-b": 2,
 		"seg-c": 1,

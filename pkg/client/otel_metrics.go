@@ -37,26 +37,6 @@ func NewOTelClientMetrics() ClientMetrics {
 		metric.WithDescription("Subscription replay duration"),
 		metric.WithUnit("ms"),
 	)
-	reconnectQueueDepth, _ := meter.Int64Gauge(
-		"streamkit.client.subscription.reconnect.queue.depth",
-		metric.WithDescription("Current reconnect dispatcher queue depth"),
-		metric.WithUnit("1"),
-	)
-	reconnectQueueBlockedTotal, _ := meter.Int64Counter(
-		"streamkit.client.subscription.reconnect.queue.blocked.total",
-		metric.WithDescription("Reconnect requests that had to block because the reconnect queue was full"),
-		metric.WithUnit("1"),
-	)
-	reconnectQueueBlockedDuration, _ := meter.Float64Histogram(
-		"streamkit.client.subscription.reconnect.queue.blocked.duration",
-		metric.WithDescription("Time spent waiting to enqueue reconnect requests when the reconnect queue was full"),
-		metric.WithUnit("ms"),
-	)
-	reconnectQueueWaitDuration, _ := meter.Float64Histogram(
-		"streamkit.client.subscription.reconnect.queue.wait.duration",
-		metric.WithDescription("Time reconnect requests spent waiting in the reconnect dispatcher queue before processing"),
-		metric.WithUnit("ms"),
-	)
 	handlerTimeoutTotal, _ := meter.Int64Counter(
 		"streamkit.client.subscription.handler.timeout.total",
 		metric.WithDescription("Subscription handler timeout count"),
@@ -70,34 +50,26 @@ func NewOTelClientMetrics() ClientMetrics {
 		metric.WithDescription("Subscription updates coalesced while handlers were saturated"),
 	)
 	return &otelClientMetrics{
-		produceLatency:                produceLatency,
-		consumeLatency:                consumeLatency,
-		replayTotal:                   replayTotal,
-		replaySuccess:                 replaySuccess,
-		replayDuration:                replayDuration,
-		reconnectQueueDepth:           reconnectQueueDepth,
-		reconnectQueueBlockedTotal:    reconnectQueueBlockedTotal,
-		reconnectQueueBlockedDuration: reconnectQueueBlockedDuration,
-		reconnectQueueWaitDuration:    reconnectQueueWaitDuration,
-		handlerTimeoutTotal:           handlerTimeoutTotal,
-		handlerPanicTotal:             handlerPanicTotal,
-		coalescedTotal:                coalescedTotal,
+		produceLatency:      produceLatency,
+		consumeLatency:      consumeLatency,
+		replayTotal:         replayTotal,
+		replaySuccess:       replaySuccess,
+		replayDuration:      replayDuration,
+		handlerTimeoutTotal: handlerTimeoutTotal,
+		handlerPanicTotal:   handlerPanicTotal,
+		coalescedTotal:      coalescedTotal,
 	}
 }
 
 type otelClientMetrics struct {
-	produceLatency                metric.Float64Histogram
-	consumeLatency                metric.Float64Histogram
-	replayTotal                   metric.Int64Counter
-	replaySuccess                 metric.Int64Counter
-	replayDuration                metric.Float64Histogram
-	reconnectQueueDepth           metric.Int64Gauge
-	reconnectQueueBlockedTotal    metric.Int64Counter
-	reconnectQueueBlockedDuration metric.Float64Histogram
-	reconnectQueueWaitDuration    metric.Float64Histogram
-	handlerTimeoutTotal           metric.Int64Counter
-	handlerPanicTotal             metric.Int64Counter
-	coalescedTotal                metric.Int64Counter
+	produceLatency      metric.Float64Histogram
+	consumeLatency      metric.Float64Histogram
+	replayTotal         metric.Int64Counter
+	replaySuccess       metric.Int64Counter
+	replayDuration      metric.Float64Histogram
+	handlerTimeoutTotal metric.Int64Counter
+	handlerPanicTotal   metric.Int64Counter
+	coalescedTotal      metric.Int64Counter
 }
 
 func (o *otelClientMetrics) RecordProduceLatency(space, segment string, duration time.Duration) {
@@ -150,26 +122,5 @@ func (o *otelClientMetrics) RecordHandlerPanic(id string) {
 func (o *otelClientMetrics) RecordSubscriptionCoalesced(id string) {
 	if o.coalescedTotal != nil {
 		o.coalescedTotal.Add(context.Background(), 1)
-	}
-}
-
-func (o *otelClientMetrics) RecordReconnectQueueDepth(depth int) {
-	if o.reconnectQueueDepth != nil {
-		o.reconnectQueueDepth.Record(context.Background(), int64(depth))
-	}
-}
-
-func (o *otelClientMetrics) RecordReconnectQueueBlocked(duration time.Duration) {
-	if o.reconnectQueueBlockedTotal != nil {
-		o.reconnectQueueBlockedTotal.Add(context.Background(), 1)
-	}
-	if o.reconnectQueueBlockedDuration != nil {
-		o.reconnectQueueBlockedDuration.Record(context.Background(), float64(duration.Milliseconds()))
-	}
-}
-
-func (o *otelClientMetrics) RecordReconnectQueueWait(duration time.Duration) {
-	if o.reconnectQueueWaitDuration != nil {
-		o.reconnectQueueWaitDuration.Record(context.Background(), float64(duration.Milliseconds()))
 	}
 }

@@ -216,6 +216,18 @@ func TestCloseLocalDrainsBufferedMessages(t *testing.T) {
 	require.Equal(t, 0, len(s.recvChan), "expected recvChan to be drained by CloseLocal")
 }
 
+func TestCloseRemotePreservesBufferedMessages(t *testing.T) {
+	s, _ := newCapturingStream()
+	require.True(t, s.Offer([]byte(`"kept"`)))
+
+	s.CloseRemote(nil)
+
+	var value string
+	require.NoError(t, s.Decode(&value))
+	assert.Equal(t, "kept", value)
+	assert.Equal(t, io.EOF, s.Decode(&value))
+}
+
 func TestDecodeReturnsLocalCloseError(t *testing.T) {
 	s, _ := newCapturingStream()
 

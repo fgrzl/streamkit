@@ -127,7 +127,7 @@ const (
 	writeQueueSaturationWarnThreshold int64 = 32
 	writeQueueSaturationWarnEvery     int64 = 256
 	defaultWriteQueueOfferTimeout           = 5 * time.Millisecond
-	defaultMaxLogicalStreams                = 1024
+	defaultMaxLogicalStreams                = 0
 	defaultMaxFramePayloadBytes             = 8 << 20
 	defaultMaxMessagePayloadBytes           = 6 << 20
 	defaultStreamRecvQueueSize              = 512
@@ -692,6 +692,9 @@ func (m *WebSocketMuxer) handleClose(ctx context.Context) {
 
 func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) {
 	if msg != nil && msg.ChannelID != uuid.Nil {
+		if m.handlePeerStreamControl(ctx, msg) {
+			return
+		}
 		m.channelsMu.RLock()
 		bidi, exists := m.channels[msg.ChannelID]
 		_, tombstoned := m.tombstones[msg.ChannelID]
@@ -716,6 +719,9 @@ func (m *WebSocketMuxer) handleDataMessage(ctx context.Context, msg *MuxerMsg) {
 	if !m.canAccessOrSendError(ctx, msg.StoreID, msg.ChannelID) {
 		return
 	}
+	if m.handlePeerStreamControl(ctx, msg) {
+		return
+	}
 
 	bidi, err := m.getOrCreateStream(ctx, msg)
 	if err != nil {
@@ -724,6 +730,66 @@ func (m *WebSocketMuxer) handleDataMessage(ctx context.Context, msg *MuxerMsg) {
 	}
 
 	m.deliverToStream(bidi, ctx, msg)
+}
+
+func (m *WebSocketMuxer) handlePeerStreamControl(ctx context.Context, msg *MuxerMsg) bool {
+	errMsg, ok := parsePeerStreamControl(msg)
+	if !ok {
+		return false
+	}
+
+	m.channelsMu.RLock()
+	bidi, exists := m.channels[msg.ChannelID]
+	_, tombstoned := m.tombstones[msg.ChannelID]
+	m.channelsMu.RUnlock()
+
+	if !exists {
+		if tombstoned {
+			slog.DebugContext(ctx, "muxer: ignoring peer stream control for closed channel", m.msgLogFields(msg)...)
+		} else {
+			slog.DebugContext(ctx, "muxer: ignoring peer stream control for unknown channel", m.msgLogFields(msg)...)
+		}
+		return true
+	}
+
+	bidi.CloseRemote(peerStreamControlErr(errMsg))
+	return true
+}
+
+func parsePeerStreamControl(msg *MuxerMsg) (*ErrorMessage, bool) {
+	if msg == nil || len(msg.Payload) == 0 {
+		return nil, false
+	}
+
+	var errMsg ErrorMessage
+	if err := json.Unmarshal(msg.Payload, &errMsg); err != nil {
+		return nil, false
+	}
+
+	switch errMsg.Type {
+	case controlMsgSentinel + "close", controlMsgSentinel + "error":
+		return &errMsg, true
+	default:
+		return nil, false
+	}
+}
+
+func peerStreamControlErr(errMsg *ErrorMessage) error {
+	if errMsg == nil {
+		return nil
+	}
+
+	switch errMsg.Type {
+	case controlMsgSentinel + "close":
+		if errMsg.Err == "" {
+			return nil
+		}
+		return errors.New("remote closed stream: " + errMsg.Err)
+	case controlMsgSentinel + "error":
+		return errors.New("remote error: " + errMsg.Err)
+	default:
+		return nil
+	}
 }
 
 // canAccessOrSendError checks store access and sends an error control frame on denial.

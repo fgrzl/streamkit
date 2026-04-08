@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -498,6 +499,51 @@ func TestShouldRouteErrorControlMessagesToExistingStream(t *testing.T) {
 
 	var out string
 	assert.EqualError(t, bidi.Decode(&out), "remote error: access denied")
+	assert.Equal(t, int64(0), atomic.LoadInt64(&m.activeStreams))
+	m.channelsMu.RLock()
+	_, exists := m.channels[channelID]
+	m.channelsMu.RUnlock()
+	assert.False(t, exists, "expected channel to be removed after remote error")
+}
+
+func TestShouldReleaseStreamOnPeerCloseWithoutDroppingBufferedMessages(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]error),
+		done:       make(chan struct{}),
+		session:    &muxerSession{allowAll: true},
+	}
+
+	storeID := uuid.New()
+	channelID := uuid.New()
+	bidi := m.register(context.Background(), storeID, channelID)
+	require.Equal(t, int64(1), atomic.LoadInt64(&m.activeStreams))
+
+	m.processMessage(&MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   channelID,
+		Payload:     []byte(`"ok"`),
+	})
+	m.processMessage(&MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   channelID,
+		Payload:     []byte(`{"type":"mux::close"}`),
+	})
+
+	m.channelsMu.RLock()
+	_, exists := m.channels[channelID]
+	m.channelsMu.RUnlock()
+	assert.False(t, exists, "expected channel to be removed after peer close")
+	assert.Equal(t, int64(0), atomic.LoadInt64(&m.activeStreams))
+
+	var value string
+	require.NoError(t, bidi.Decode(&value))
+	assert.Equal(t, "ok", value)
+	assert.Equal(t, io.EOF, bidi.Decode(&value))
 }
 
 func TestDeliverToStreamClosesOnlyOverloadedChannel(t *testing.T) {

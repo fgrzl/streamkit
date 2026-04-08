@@ -216,31 +216,7 @@ func (c *MuxerBidiStream) CloseSend(err error) error {
 
 // Close tears down the stream and invokes the onClose hook.
 func (c *MuxerBidiStream) Close(err error) {
-	c.closeOnce.Do(func() {
-		// Attempt to notify remote of close; on network errors this may fail.
-		_ = c.CloseSend(err)
-		c.recordCloseErr(err)
-		// mark closed and notify listeners; do not close recvChan to avoid send-on-closed panics
-		atomic.StoreUint32(&c.closedFlag, 1)
-		close(c.closed)
-
-		// Issue #21: Drain buffered messages to prevent memory leak.
-		// Messages buffered in recvChan would leak until GC collects this struct.
-		for {
-			select {
-			case <-c.recvChan:
-				// Continue draining
-			default:
-				// Channel is empty, we can stop
-				goto drainDone
-			}
-		}
-	drainDone:
-
-		if c.onClose != nil {
-			c.onClose()
-		}
-	})
+	c.close(true, true, err)
 }
 
 // CloseLocal marks the stream as closed and runs the onClose hook, but
@@ -248,21 +224,36 @@ func (c *MuxerBidiStream) Close(err error) {
 // this when the network is unavailable and you still need to tear down
 // local resources without triggering additional network I/O.
 func (c *MuxerBidiStream) CloseLocal(err error) {
+	c.close(false, true, err)
+}
+
+// CloseRemote marks the stream as closed because the peer ended the logical
+// stream. Buffered messages are preserved so callers can finish draining any
+// payloads that arrived before the terminal signal.
+func (c *MuxerBidiStream) CloseRemote(err error) {
+	c.close(false, false, err)
+}
+
+func (c *MuxerBidiStream) close(notifyRemote, drainBuffered bool, err error) {
 	c.closeOnce.Do(func() {
-		// Do not call CloseSend since network may be down.
+		if notifyRemote {
+			// Attempt to notify remote of close; on network errors this may fail.
+			_ = c.CloseSend(err)
+		}
 		c.recordCloseErr(err)
 		atomic.StoreUint32(&c.closedFlag, 1)
 		close(c.closed)
 
-		// Drain buffered messages to prevent memory leak (mirrors Close drain).
-		for {
-			select {
-			case <-c.recvChan:
-			default:
-				goto drainDone
+		if drainBuffered {
+			for {
+				select {
+				case <-c.recvChan:
+				default:
+					goto drainDone
+				}
 			}
+		drainDone:
 		}
-	drainDone:
 
 		if c.onClose != nil {
 			c.onClose()

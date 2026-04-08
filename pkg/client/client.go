@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/fgrzl/enumerators"
-	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
@@ -47,10 +46,10 @@ type (
 )
 
 var (
-	subscriptionHeartbeatInterval = 15 * time.Second
-	subscriptionHeartbeatTimeout  = 45 * time.Second
-	subscriptionReconnectBackoff  = 100 * time.Millisecond
-	maxSubscriptionReconnectWait  = 30 * time.Second
+	// Application-level subscription heartbeats are opt-in. By default the
+	// client relies on transport closure rather than synthetic keepalive frames.
+	subscriptionHeartbeatInterval = time.Duration(0)
+	subscriptionHeartbeatTimeout  = time.Duration(0)
 	errSubscriptionHeartbeatLost  = errors.New("subscription heartbeat lost")
 	errSubscriptionReaderStopped  = errors.New("subscription stream reader stopped unexpectedly")
 )
@@ -109,8 +108,8 @@ type Client interface {
 }
 
 // NewClient creates a new Client instance using the provided BidiStreamProvider.
-// The client includes built-in resilience for transient failures and automatic
-// subscription replay on provider reconnection.
+// The client retries transient failures while opening a new stream, but once a
+// logical stream is established it is not resumed after a disconnect.
 // Handler timeout is set to 30 seconds by default (Issue 7 - prevents slow handlers from blocking).
 func NewClient(provider api.BidiStreamProvider) Client {
 	return NewClientWithHandlerTimeout(provider, 30*time.Second)
@@ -118,21 +117,15 @@ func NewClient(provider api.BidiStreamProvider) Client {
 
 // NewClientWithRetryPolicy creates a new Client with a custom retry policy.
 func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolicy) Client {
-	ctx, cancel := context.WithCancel(context.Background())
 	c := &client{
 		provider:              provider,
 		policy:                policy,
 		handlerTimeout:        30 * time.Second,
 		maxConcurrentHandlers: 50,
-		subscriptions:         make(map[string]*activeSubscription),
-		reconnectQueue:        make(chan *reconnectRequest, 8192),
-		reconnectDone:         make(chan struct{}),
-		reconnectCtx:          ctx,
-		reconnectCancel:       cancel,
+		subscriptionShards:    newSubscriptionRegistryShards(),
 		produceLocks:          make(map[string]*sync.Mutex),
 	}
-	c.startReconnectDispatcher()
-	provider.RegisterReconnectListener(c)
+	c.startHandlerWorkers()
 	return c
 }
 
@@ -140,60 +133,143 @@ func NewClientWithRetryPolicy(provider api.BidiStreamProvider, policy RetryPolic
 // Prevents slow handlers from blocking the subscription loop and starving other subscriptions.
 // If a handler takes longer than the specified timeout, it is interrupted and execution continues
 // with the next message. The timeout event is logged and tracked in subscription metrics.
+// Set handlerTimeout <= 0 to disable timeout enforcement and run handlers inline.
 func NewClientWithHandlerTimeout(provider api.BidiStreamProvider, handlerTimeout time.Duration) Client {
 	return NewClientWithMetrics(provider, handlerTimeout, nil)
 }
 
 // NewClientWithMetrics creates a new Client with optional metrics. Pass nil for metrics to disable.
 // Use NewOTelClientMetrics() for OpenTelemetry-backed produce/consume latency and
-// subscription replay/timeout/panic metrics.
+// subscription lifecycle/timeout/panic metrics. Set handlerTimeout <= 0 to disable
+// timeout enforcement and run handlers inline.
 func NewClientWithMetrics(provider api.BidiStreamProvider, handlerTimeout time.Duration, metrics ClientMetrics) Client {
-	ctx, cancel := context.WithCancel(context.Background())
 	c := &client{
 		provider:              provider,
 		policy:                DefaultRetryPolicy(),
 		handlerTimeout:        handlerTimeout,
 		maxConcurrentHandlers: 50,
-		subscriptions:         make(map[string]*activeSubscription),
-		reconnectQueue:        make(chan *reconnectRequest, 8192),
-		reconnectDone:         make(chan struct{}),
-		reconnectCtx:          ctx,
-		reconnectCancel:       cancel,
+		subscriptionShards:    newSubscriptionRegistryShards(),
 		produceLocks:          make(map[string]*sync.Mutex),
 		metrics:               metrics,
 	}
-
-	c.startReconnectDispatcher()
-	provider.RegisterReconnectListener(c)
+	c.startHandlerWorkers()
 
 	return c
 }
 
-// activeSubscription represents a subscription managed by a single goroutine.
-// The goroutine retries indefinitely with exponential backoff until canceled.
+// activeSubscription tracks one live logical subscription and its delivery state.
 type activeSubscription struct {
-	id                 string                   // unique subscription ID
-	storeID            uuid.UUID                // store being subscribed to
-	initMsg            api.Routeable            // initial subscription message
-	handler            func(*SegmentStatus)     // handler to call for each status update
-	cancel             context.CancelFunc       // cancels the subscription goroutine
-	stopped            chan struct{}            // signals when the subscription loop has stopped and unregistered
-	done               <-chan struct{}          // signals when subscription has stopped
-	lastDelivered      atomic.Int64             // tracks last delivered sequence for offset resumption
-	ctx                context.Context          // subscription's own context
-	failureCount       atomic.Int32             // tracks consecutive failures for observability
-	status             atomic.Value             // current status: "active"|"reconnecting"
-	lastError          atomic.Value             // stores last error encountered
-	handlerTimeouts    atomic.Int32             // counts handler timeout occurrences
-	handlerPanics      atomic.Int32             // counts handler panic occurrences
-	coalescedUpdates   atomic.Int64             // counts updates merged while handlers are saturated
-	handlerSlots       chan struct{}            // limits concurrent handler executions for the subscription
-	mailboxCh          chan struct{}            // signals that a latest status is ready for delivery
-	pendingMu          sync.Mutex               // guards pendingStatusByKey and pendingOrder
-	pendingStatusByKey map[string]SegmentStatus // latest queued status per segment awaiting delivery
-	pendingOrder       []string                 // FIFO order for pending segment keys
-	streamCh           chan api.BidiStream      // receives a reconnected stream from the dispatcher
-	retryCh            chan struct{}            // nudges an active stream to reconnect immediately
+	id                  string                   // unique subscription ID
+	storeID             uuid.UUID                // store being subscribed to
+	initMsg             api.Routeable            // initial subscription message
+	handler             func(*SegmentStatus)     // handler to call for each status update
+	cancel              context.CancelFunc       // cancels the subscription goroutine
+	stopped             chan struct{}            // signals when the subscription loop has stopped and unregistered
+	done                <-chan struct{}          // signals when subscription has stopped
+	lastDelivered       atomic.Int64             // tracks last delivered sequence for offset resumption
+	ctx                 context.Context          // subscription's own context
+	failureCount        atomic.Int32             // tracks consecutive failures for observability
+	status              atomic.Value             // current status: "active"|"failed"
+	lastError           atomic.Value             // stores last error encountered
+	handlerTimeouts     atomic.Int32             // counts handler timeout occurrences
+	handlerPanics       atomic.Int32             // counts handler panic occurrences
+	coalescedUpdates    atomic.Int64             // counts updates merged while handlers are saturated
+	inFlightHandlers    atomic.Int32             // current concurrent handler executions for the subscription
+	mailboxCh           chan struct{}            // signals that a latest status is ready for delivery
+	pendingMu           sync.Mutex               // guards pending delivery state
+	pendingPerSegment   bool                     // wildcard subscriptions keep one latest status per segment
+	pendingSingleSet    bool                     // whether the exact-segment pending slot is populated
+	pendingSingleStatus SegmentStatus            // latest queued status for exact-segment subscriptions
+	pendingStatusByKey  map[string]SegmentStatus // latest queued status per segment awaiting delivery
+	pendingOrder        []string                 // FIFO order for pending segment keys
+}
+
+type subscriptionHandlerTask struct {
+	ctx     context.Context
+	sub     *activeSubscription
+	subID   string
+	handler func(*SegmentStatus)
+	status  SegmentStatus
+	wg      *sync.WaitGroup
+}
+
+const subscriptionRegistryShardCount = 32
+
+type subscriptionRegistryShard struct {
+	mu            sync.RWMutex
+	subscriptions map[string]*activeSubscription
+}
+
+func newSubscriptionRegistryShards() []subscriptionRegistryShard {
+	shards := make([]subscriptionRegistryShard, subscriptionRegistryShardCount)
+	for i := range shards {
+		shards[i].subscriptions = make(map[string]*activeSubscription)
+	}
+	return shards
+}
+
+func subscriptionShardIndex(id string, shardCount int) int {
+	if shardCount <= 1 {
+		return 0
+	}
+
+	var hash uint32 = 2166136261
+	for i := 0; i < len(id); i++ {
+		hash ^= uint32(id[i])
+		hash *= 16777619
+	}
+
+	return int(hash % uint32(shardCount))
+}
+
+func (c *client) subscriptionShard(id string) *subscriptionRegistryShard {
+	return &c.subscriptionShards[subscriptionShardIndex(id, len(c.subscriptionShards))]
+}
+
+func (c *client) getSubscription(id string) (*activeSubscription, bool) {
+	shard := c.subscriptionShard(id)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	sub, exists := shard.subscriptions[id]
+	return sub, exists
+}
+
+func (c *client) snapshotSubscriptions() []*activeSubscription {
+	subs := make([]*activeSubscription, 0)
+	for i := range c.subscriptionShards {
+		shard := &c.subscriptionShards[i]
+		shard.mu.RLock()
+		for _, sub := range shard.subscriptions {
+			subs = append(subs, sub)
+		}
+		shard.mu.RUnlock()
+	}
+	return subs
+}
+
+func (c *client) snapshotSubscriptionIDs() []string {
+	ids := make([]string, 0)
+	for i := range c.subscriptionShards {
+		shard := &c.subscriptionShards[i]
+		shard.mu.RLock()
+		for id := range shard.subscriptions {
+			ids = append(ids, id)
+		}
+		shard.mu.RUnlock()
+	}
+	return ids
+}
+
+func (c *client) subscriptionCount() int {
+	count := 0
+	for i := range c.subscriptionShards {
+		shard := &c.subscriptionShards[i]
+		shard.mu.RLock()
+		count += len(shard.subscriptions)
+		shard.mu.RUnlock()
+	}
+	return count
 }
 
 type storedSubscriptionError string
@@ -219,12 +295,6 @@ func (s *activeSubscription) loadLastError() error {
 	return nil
 }
 
-// reconnectRequest is sent by a subscription goroutine to enqueue itself for reconnection.
-type reconnectRequest struct {
-	sub        *activeSubscription
-	enqueuedAt time.Time
-}
-
 // ClientMetrics provides instrumentation hooks for external observability systems.
 // Implementations may be nil when metrics are not required.
 type ClientMetrics interface {
@@ -239,32 +309,19 @@ type subscriptionOverloadMetrics interface {
 	RecordSubscriptionCoalesced(id string)
 }
 
-type reconnectQueueMetrics interface {
-	RecordReconnectQueueDepth(depth int)
-	RecordReconnectQueueBlocked(duration time.Duration)
-	RecordReconnectQueueWait(duration time.Duration)
-}
-
 type client struct {
 	provider              api.BidiStreamProvider
 	policy                RetryPolicy
 	handlerTimeout        time.Duration // max time allowed for handler to execute (Issue 7)
 	maxConcurrentHandlers int           // max concurrent handler executions tracked per subscription
+	handlerWorkerCount    int           // number of shared workers processing subscription handlers
+	handlerTaskQueue      chan subscriptionHandlerTask
+	handlerWorkersCancel  context.CancelFunc
+	handlerWorkersWg      sync.WaitGroup
 
 	// subscription registry for tracking active subscriptions
-	subscriptionsMu sync.RWMutex
-	subscriptions   map[string]*activeSubscription
-
-	// Single-threaded reconnection: subscription goroutines enqueue themselves here
-	// and a single dispatcher loop calls CallStream serially for each one.
-	reconnectQueue  chan *reconnectRequest
-	reconnectDepth  atomic.Int64
-	reconnectBlocks atomic.Int64
-	reconnectLoop   sync.Once
-	reconnectDone   chan struct{}
-	reconnectCtx    context.Context
-	reconnectCancel context.CancelFunc
-	shutdownOnce    sync.Once
+	subscriptionShards []subscriptionRegistryShard
+	shutdownOnce       sync.Once
 
 	// Issue 9: Per-segment locks for atomic Peek+Produce
 	produceLocksLock sync.RWMutex
@@ -302,37 +359,32 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
 	ctx = ensureRequestIDContext(ctx)
-	return newResilienceEnumerator(c, ctx, storeID, args)
+	return newConsumeEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
 	ctx = ensureRequestIDContext(ctx)
-	return newResilienceEnumerator(c, ctx, storeID, args)
+	return newConsumeEnumerator(c, ctx, storeID, args)
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
 	ctx = ensureRequestIDContext(ctx)
-	return newResilienceEnumerator(c, ctx, storeID, args)
+	return newConsumeEnumerator(c, ctx, storeID, args)
 }
 
-// resilienceEnumerator wraps a consume enumerator with transparent reconnection (Issue 8).
-// On reconnect, the enumerator will resume from the last consumed position to provide
-// at-least-once semantics. It updates Consume arguments to precisely resume using
-// lexicographic offsets when available to avoid duplicate deliveries on reconnect.
-type resilienceEnumerator struct {
+// consumeEnumerator opens a consume stream lazily on first MoveNext and keeps
+// it for the lifetime of the logical stream. If that stream fails later, the
+// error is surfaced directly and callers decide whether to retry from a saved
+// offset or recreate the subscription.
+type consumeEnumerator struct {
 	client    *client
 	storeID   uuid.UUID
 	args      api.Routeable // ConsumeSegment or ConsumeSpace request
 	ctx       context.Context
 	cancel    context.CancelFunc
 	innerEnum enumerators.Enumerator[*Entry]
-
-	lastEntry      *Entry
-	consumeOffsets map[string]lexkey.LexKey
-	lastErr        error
-	attemptCount   int
-	maxAttempts    int
-	disconnectedAt time.Time
+	current   *Entry
+	err       error
 }
 
 func detachLongLivedContext(ctx context.Context) context.Context {
@@ -344,6 +396,15 @@ func detachLongLivedContext(ctx context.Context) context.Context {
 		detached = trace.ContextWithSpanContext(detached, spanContext)
 	}
 	return detached
+}
+
+func newDetachedCancelableContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, baseCancel := context.WithCancel(detachLongLivedContext(parent))
+	stopParentCancel := context.AfterFunc(parent, baseCancel)
+	return ctx, func() {
+		stopParentCancel()
+		baseCancel()
+	}
 }
 
 func appendClientLogFields(fields []any, extras ...any) []any {
@@ -452,57 +513,20 @@ func configuredSubscriptionHeartbeatSeconds() int64 {
 	return seconds
 }
 
-func effectiveSubscriptionHeartbeatTimeout() time.Duration {
+func subscriptionUsesPerSegmentPending(msg api.Routeable) bool {
+	args, ok := msg.(*api.SubscribeToSegmentStatus)
+	return ok && args != nil && args.Segment == "*"
+}
+
+func effectiveSubscriptionHeartbeatTimeout(msg api.Routeable) time.Duration {
+	args, ok := msg.(*api.SubscribeToSegmentStatus)
+	if !ok || args == nil || args.HeartbeatIntervalSeconds <= 0 {
+		return 0
+	}
 	if subscriptionHeartbeatTimeout > 0 {
 		return subscriptionHeartbeatTimeout
 	}
-	if subscriptionHeartbeatInterval > 0 {
-		return 3 * subscriptionHeartbeatInterval
-	}
-	return 0
-}
-
-func subscriptionReconnectDelay(failureCount int32) time.Duration {
-	if failureCount <= 0 || subscriptionReconnectBackoff <= 0 {
-		return 0
-	}
-
-	delay := subscriptionReconnectBackoff
-	for attempt := int32(1); attempt < failureCount; attempt++ {
-		if delay >= maxSubscriptionReconnectWait {
-			return maxSubscriptionReconnectWait
-		}
-		nextDelay := delay * 2
-		if nextDelay > maxSubscriptionReconnectWait {
-			delay = maxSubscriptionReconnectWait
-			break
-		}
-		delay = nextDelay
-	}
-
-	if delay > maxSubscriptionReconnectWait {
-		delay = maxSubscriptionReconnectWait
-	}
-	return applyBackoffJitter(delay)
-}
-
-func waitForSubscriptionReconnect(ctx context.Context, sub *activeSubscription) bool {
-	delay := subscriptionReconnectDelay(sub.failureCount.Load())
-	if delay <= 0 {
-		return true
-	}
-
-	timer := time.NewTimer(delay)
-	defer stopTimer(timer)
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-sub.retryCh:
-		return true
-	case <-timer.C:
-		return true
-	}
+	return 3 * time.Duration(args.HeartbeatIntervalSeconds) * time.Second
 }
 
 func stopTimer(timer *time.Timer) {
@@ -562,9 +586,77 @@ func normalizeHandlerConcurrency(limit int) int {
 	return limit
 }
 
+func defaultHandlerWorkerCount(limit int) int {
+	workers := normalizeHandlerConcurrency(limit) * 4
+	if workers < 16 {
+		workers = 16
+	}
+	if workers > 256 {
+		workers = 256
+	}
+	return workers
+}
+
+func (c *client) startHandlerWorkers() {
+	workerCount := defaultHandlerWorkerCount(c.maxConcurrentHandlers)
+	c.handlerWorkerCount = workerCount
+	c.handlerTaskQueue = make(chan subscriptionHandlerTask, workerCount*4)
+	workerCtx, cancel := context.WithCancel(context.Background())
+	c.handlerWorkersCancel = cancel
+
+	for range workerCount {
+		c.handlerWorkersWg.Add(1)
+		go func() {
+			defer c.handlerWorkersWg.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case task := <-c.handlerTaskQueue:
+					c.runHandler(task.ctx, task.sub, task.subID, task.handler, &task.status)
+					task.sub.releaseHandlerSlot()
+					c.signalSubscriptionMailbox(task.sub)
+					task.wg.Done()
+				}
+			}
+		}()
+	}
+}
+
+func (s *activeSubscription) tryAcquireHandlerSlot(limit int) bool {
+	maxInFlight := int32(normalizeHandlerConcurrency(limit))
+	for {
+		current := s.inFlightHandlers.Load()
+		if current >= maxInFlight {
+			return false
+		}
+		if s.inFlightHandlers.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (s *activeSubscription) releaseHandlerSlot() {
+	for {
+		current := s.inFlightHandlers.Load()
+		if current <= 0 {
+			return
+		}
+		if s.inFlightHandlers.CompareAndSwap(current, current-1) {
+			return
+		}
+	}
+}
+
 func (s *activeSubscription) queuePendingStatus(status SegmentStatus) bool {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
+	if !s.pendingPerSegment {
+		coalesced := s.pendingSingleSet
+		s.pendingSingleStatus = status
+		s.pendingSingleSet = true
+		return coalesced
+	}
 	if s.pendingStatusByKey == nil {
 		s.pendingStatusByKey = make(map[string]SegmentStatus)
 	}
@@ -581,18 +673,36 @@ func (s *activeSubscription) queuePendingStatus(status SegmentStatus) bool {
 func (s *activeSubscription) hasPendingStatus() bool {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
+	if !s.pendingPerSegment {
+		return s.pendingSingleSet
+	}
 	return len(s.pendingOrder) > 0
 }
 
 func (s *activeSubscription) pendingStatusCount() int {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
+	if !s.pendingPerSegment {
+		if s.pendingSingleSet {
+			return 1
+		}
+		return 0
+	}
 	return len(s.pendingOrder)
 }
 
 func (s *activeSubscription) takePendingStatus() (SegmentStatus, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
+	if !s.pendingPerSegment {
+		if !s.pendingSingleSet {
+			return SegmentStatus{}, false
+		}
+		status := s.pendingSingleStatus
+		s.pendingSingleSet = false
+		s.pendingSingleStatus = SegmentStatus{}
+		return status, true
+	}
 	for len(s.pendingOrder) > 0 {
 		key := s.pendingOrder[0]
 		s.pendingOrder = s.pendingOrder[1:]
@@ -605,6 +715,25 @@ func (s *activeSubscription) takePendingStatus() (SegmentStatus, bool) {
 		return status, true
 	}
 	return SegmentStatus{}, false
+}
+
+func (s *activeSubscription) restorePendingStatus(status SegmentStatus) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if !s.pendingPerSegment {
+		s.pendingSingleStatus = status
+		s.pendingSingleSet = true
+		return
+	}
+	if s.pendingStatusByKey == nil {
+		s.pendingStatusByKey = make(map[string]SegmentStatus)
+	}
+
+	key := pendingStatusKey(status)
+	if _, exists := s.pendingStatusByKey[key]; !exists {
+		s.pendingOrder = append([]string{key}, s.pendingOrder...)
+	}
+	s.pendingStatusByKey[key] = status
 }
 
 func pendingStatusKey(status SegmentStatus) string {
@@ -621,26 +750,6 @@ func (c *client) signalSubscriptionMailbox(sub *activeSubscription) {
 func (c *client) recordSubscriptionCoalesced(id string) {
 	if recorder, ok := c.metrics.(subscriptionOverloadMetrics); ok {
 		recorder.RecordSubscriptionCoalesced(id)
-	}
-}
-
-func (c *client) recordReconnectQueueDepth(depth int) {
-	c.reconnectDepth.Store(int64(depth))
-	if recorder, ok := c.metrics.(reconnectQueueMetrics); ok {
-		recorder.RecordReconnectQueueDepth(depth)
-	}
-}
-
-func (c *client) recordReconnectQueueBlocked(duration time.Duration) {
-	c.reconnectBlocks.Add(1)
-	if recorder, ok := c.metrics.(reconnectQueueMetrics); ok {
-		recorder.RecordReconnectQueueBlocked(duration)
-	}
-}
-
-func (c *client) recordReconnectQueueWait(duration time.Duration) {
-	if recorder, ok := c.metrics.(reconnectQueueMetrics); ok {
-		recorder.RecordReconnectQueueWait(duration)
 	}
 }
 
@@ -664,156 +773,110 @@ func (c *client) tryStartSubscriptionHandler(ctx context.Context, sub *activeSub
 	select {
 	case <-ctx.Done():
 		return true
-	case sub.handlerSlots <- struct{}{}:
-		wg.Add(1)
-		go func(status SegmentStatus) {
-			defer wg.Done()
-			defer func() { <-sub.handlerSlots }()
-			c.runHandler(ctx, sub, subID, handler, &status)
-		}(status)
+	default:
+	}
+
+	if !sub.tryAcquireHandlerSlot(c.maxConcurrentHandlers) {
+		return false
+	}
+
+	wg.Add(1)
+	task := subscriptionHandlerTask{
+		ctx:     ctx,
+		sub:     sub,
+		subID:   subID,
+		handler: handler,
+		status:  status,
+		wg:      wg,
+	}
+
+	select {
+	case <-ctx.Done():
+		sub.releaseHandlerSlot()
+		wg.Done()
+		return true
+	case c.handlerTaskQueue <- task:
 		return true
 	default:
+		sub.releaseHandlerSlot()
+		wg.Done()
 		return false
 	}
 }
 
-func (c *client) startSubscriptionHandlerDispatcher(ctx context.Context, sub *activeSubscription, subID string, handler func(*SegmentStatus), wg *sync.WaitGroup) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-sub.mailboxCh:
-			}
-
-			for sub.hasPendingStatus() {
-				select {
-				case <-ctx.Done():
-					return
-				case sub.handlerSlots <- struct{}{}:
-				}
-
-				status, ok := sub.takePendingStatus()
-				if !ok {
-					<-sub.handlerSlots
-					break
-				}
-
-				wg.Add(1)
-				go func(status SegmentStatus) {
-					defer wg.Done()
-					defer func() { <-sub.handlerSlots }()
-					c.runHandler(ctx, sub, subID, handler, &status)
-				}(status)
-			}
-		}
-	}()
-}
-
-func (e *resilienceEnumerator) MoveNext() bool {
-	start := time.Now()
+func (c *client) drainPendingSubscriptionStatuses(ctx context.Context, sub *activeSubscription, subID string, handler func(*SegmentStatus), wg *sync.WaitGroup) {
 	for {
-		// Create inner enumerator if not exists
-		if e.innerEnum == nil {
-			bidi, err := e.createStream()
-			if err != nil {
-				e.lastErr = err
-				slog.WarnContext(e.ctx, "resilience enumerator: failed to create stream",
-					appendClientLogFields(routeLogFields(e.storeID, e.args),
-						slog.Int("attempt", e.attemptCount+1),
-						slog.Int("max_attempts", e.maxAttempts),
-						"err", err)...)
-				e.attemptCount++
-				if e.attemptCount >= e.maxAttempts {
-					return false
-				}
-				// Issue #8 FIX: Check context before backoff sleep to respect cancellation
-				if err := e.ctx.Err(); err != nil {
-					return false
-				}
-				// Backoff before retrying
-				select {
-				case <-e.ctx.Done():
-					return false
-				case <-time.After(time.Second * time.Duration(e.attemptCount)):
-				}
-				continue
-			}
-			e.innerEnum = api.NewStreamEnumerator[*Entry](bidi)
-			e.lastErr = nil
-			e.disconnectedAt = time.Time{}
-			e.attemptCount = 0
+		if ctx.Err() != nil {
+			return
 		}
 
-		// Try to read next entry
-		if e.innerEnum.MoveNext() {
-			entry, err := e.innerEnum.Current()
-			if err != nil {
-				fields := routeLogFields(e.storeID, e.args)
-				if e.lastEntry != nil {
-					fields = append(fields,
-						slog.String("space", e.lastEntry.Space),
-						slog.String("segment", e.lastEntry.Segment),
-						slog.Uint64("last_sequence", e.lastEntry.Sequence))
-				}
-				slog.WarnContext(e.ctx, "resilience enumerator: failed to get current entry",
-					appendClientLogFields(fields, "err", err)...)
-				// Close this enumerator and retry
-				if e.innerEnum != nil {
-					e.innerEnum.Dispose()
-					e.innerEnum = nil
-				}
-				e.lastErr = err
-				e.attemptCount++
-				if e.attemptCount >= e.maxAttempts {
-					return false
-				}
-				continue
-			}
-			e.lastEntry = entry
-			e.recordResumePosition(entry)
-			// Metrics: record consume latency if available
-			if e.client != nil && e.client.metrics != nil {
-				e.client.metrics.RecordConsumeLatency(entry.Space, entry.Segment, time.Since(start))
-			}
-			return true
+		status, ok := sub.takePendingStatus()
+		if !ok {
+			return
 		}
 
-		// Stream ended - check if it was an error or clean EOF
-		var streamErr error
-		if e.innerEnum != nil {
-			streamErr = e.innerEnum.Err()
-			e.innerEnum.Dispose()
-			e.innerEnum = nil
-		}
-		e.lastErr = streamErr
-
-		// Only retry if there was an actual error (disconnect), not on clean EOF
-		if streamErr != nil && e.lastEntry != nil && IsRetryable(streamErr) {
-			if e.attemptCount < e.maxAttempts {
-				e.updateConsumePosition()
-				e.attemptCount++
-				e.disconnectedAt = time.Now()
-				continue
-			}
+		if c.tryStartSubscriptionHandler(ctx, sub, subID, handler, status, wg) {
+			continue
 		}
 
-		// No more data or max attempts reached
-		return false
+		sub.restorePendingStatus(status)
+		return
 	}
 }
 
-func (e *resilienceEnumerator) Current() (*Entry, error) {
-	if e.lastEntry == nil {
+func (e *consumeEnumerator) MoveNext() bool {
+	if e == nil {
+		return false
+	}
+
+	if e.innerEnum == nil {
+		bidi, err := e.createStream()
+		if err != nil {
+			e.err = err
+			slog.WarnContext(e.ctx, "consume enumerator: failed to create stream",
+				appendClientLogFields(routeLogFields(e.storeID, e.args), "err", err)...)
+			return false
+		}
+		e.innerEnum = api.NewStreamEnumerator[*Entry](bidi)
+	}
+
+	start := time.Now()
+	if !e.innerEnum.MoveNext() {
+		e.err = e.innerEnum.Err()
+		e.current = nil
+		e.innerEnum.Dispose()
+		e.innerEnum = nil
+		return false
+	}
+
+	entry, err := e.innerEnum.Current()
+	if err != nil {
+		e.err = err
+		e.current = nil
+		fields := routeLogFields(e.storeID, e.args)
+		slog.WarnContext(e.ctx, "consume enumerator: failed to get current entry",
+			appendClientLogFields(fields, "err", err)...)
+		e.innerEnum.Dispose()
+		e.innerEnum = nil
+		return false
+	}
+
+	e.current = entry
+	e.err = nil
+	if e.client != nil && e.client.metrics != nil {
+		e.client.metrics.RecordConsumeLatency(entry.Space, entry.Segment, time.Since(start))
+	}
+	return true
+}
+
+func (e *consumeEnumerator) Current() (*Entry, error) {
+	if e == nil || e.current == nil {
 		return nil, errors.New("no current entry")
 	}
-	return e.lastEntry, nil
+	return e.current, nil
 }
 
-func (e *resilienceEnumerator) Dispose() {
+func (e *consumeEnumerator) Dispose() {
 	if e.cancel != nil {
 		e.cancel()
 	}
@@ -821,140 +884,42 @@ func (e *resilienceEnumerator) Dispose() {
 		e.innerEnum.Dispose()
 		e.innerEnum = nil
 	}
+	e.current = nil
 }
 
-func (e *resilienceEnumerator) recordResumePosition(entry *Entry) {
-	if e == nil || entry == nil {
-		return
-	}
-	if _, ok := e.args.(*api.Consume); !ok {
-		return
-	}
-	if e.consumeOffsets == nil {
-		e.consumeOffsets = make(map[string]lexkey.LexKey)
-	}
-	e.consumeOffsets[entry.Space] = entry.GetSpaceOffset()
-}
-
-// createStream creates a new stream for the consume operation
-func (e *resilienceEnumerator) createStream() (api.BidiStream, error) {
-	// If we have consumed entries previously, update the args to resume from
-	// the position after the last consumed entry to prevent duplicates.
-	argsToUse := e.args
-	if e.lastEntry != nil {
-		argsToUse = e.updateArgsWithOffset()
-	}
-
+func (e *consumeEnumerator) createStream() (api.BidiStream, error) {
 	var bidi api.BidiStream
 	err := RetryWithBackoff(e.ctx, e.client.policy, func(retryCtx context.Context) error {
 		var err error
-		bidi, err = e.client.provider.CallStream(retryCtx, e.storeID, argsToUse)
+		bidi, err = e.client.provider.CallStream(retryCtx, e.storeID, e.args)
 		return err
 	})
 	return bidi, err
 }
 
-// updateConsumePosition updates the consume arguments with the position after last entry
-func (e *resilienceEnumerator) updateConsumePosition() {
-	// Update based on type of consume argument
-	switch args := e.args.(type) {
-	case *api.ConsumeSegment:
-		// Resume from next sequence after last consumed (Issue 8)
-		if e.lastEntry != nil && e.lastEntry.Sequence > 0 {
-			args.MinSequence = e.lastEntry.Sequence + 1
-		}
-	case *api.ConsumeSpace:
-		// For ConsumeSpace, we need to resume past the last timestamp
-		// Add 1 nanosecond to avoid re-receiving entries with same timestamp
-		if e.lastEntry != nil && e.lastEntry.Timestamp > 0 {
-			args.MinTimestamp = e.lastEntry.Timestamp + 1
-		}
-	case *api.Consume:
-		// For Consume (multi-space), update the per-space offset so the next stream
-		// resumes strictly after the last delivered entry in that space.
-		if args.Offsets == nil {
-			args.Offsets = make(map[string]lexkey.LexKey)
-		}
-		if len(e.consumeOffsets) > 0 {
-			for space, offset := range e.consumeOffsets {
-				args.Offsets[space] = offset
-			}
-		} else if e.lastEntry != nil {
-			args.Offsets[e.lastEntry.Space] = e.lastEntry.GetSpaceOffset()
-		}
+func (e *consumeEnumerator) Err() error {
+	if e == nil {
+		return nil
 	}
-}
-
-// build a new args object that resumes from the last consumed position. This is
-// used when reconnecting so a fresh stream starts from the correct offset.
-func (e *resilienceEnumerator) updateArgsWithOffset() api.Routeable {
-	if e.lastEntry == nil {
-		return e.args
+	if e.err != nil {
+		return e.err
 	}
-
-	switch args := e.args.(type) {
-	case *api.ConsumeSegment:
-		newArgs := *args
-		newArgs.MinSequence = e.lastEntry.Sequence + 1
-		return &newArgs
-	case *api.ConsumeSpace:
-		newArgs := *args
-		newArgs.Offset = e.lastEntry.GetSpaceOffset()
-		return &newArgs
-	case *api.Consume:
-		newArgs := *args
-		baseOffsets := args.Offsets
-		newArgs.Offsets = make(map[string]lexkey.LexKey, len(baseOffsets)+len(e.consumeOffsets))
-		for space, offset := range baseOffsets {
-			newArgs.Offsets[space] = offset
-		}
-		if len(e.consumeOffsets) > 0 {
-			for space, offset := range e.consumeOffsets {
-				newArgs.Offsets[space] = offset
-			}
-		} else {
-			newArgs.Offsets[e.lastEntry.Space] = e.lastEntry.GetSpaceOffset()
-		}
-		return &newArgs
-	}
-
-	return e.args
-}
-
-// Err returns any error that occurred during enumeration
-func (e *resilienceEnumerator) Err() error {
 	if e.innerEnum != nil {
 		return e.innerEnum.Err()
 	}
-	return e.lastErr
+	return nil
 }
 
-// newResilienceEnumerator creates a resilience-wrapped enumerator (Issue 8)
-func newResilienceEnumerator(client *client, ctx context.Context, storeID uuid.UUID, args api.Routeable) enumerators.Enumerator[*Entry] {
-	enumCtx, cancel := context.WithCancel(detachLongLivedContext(ctx))
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancel()
-		case <-enumCtx.Done():
-		}
-	}()
-	enum := &resilienceEnumerator{
-		client:       client,
-		storeID:      storeID,
-		args:         args,
-		ctx:          enumCtx,
-		cancel:       cancel,
-		maxAttempts:  7, // Same as subscription retry logic
-		attemptCount: 0,
+func newConsumeEnumerator(client *client, ctx context.Context, storeID uuid.UUID, args api.Routeable) enumerators.Enumerator[*Entry] {
+	enumCtx, cancel := newDetachedCancelableContext(ctx)
+
+	return &consumeEnumerator{
+		client:  client,
+		storeID: storeID,
+		args:    args,
+		ctx:     enumCtx,
+		cancel:  cancel,
 	}
-	if consumeArgs, ok := args.(*api.Consume); ok && len(consumeArgs.Offsets) > 0 {
-		enum.consumeOffsets = make(map[string]lexkey.LexKey, len(consumeArgs.Offsets))
-		for space, offset := range consumeArgs.Offsets {
-			enum.consumeOffsets[space] = offset
-		}
-	}
-	return enum
 }
 
 func (c *client) Peek(ctx context.Context, storeID uuid.UUID, space, segment string) (*Entry, error) {
@@ -1038,16 +1003,10 @@ func (c *client) WithLease(ctx context.Context, storeID uuid.UUID, key string, t
 	}
 	defer lease.Release()
 
-	runCtx, runCancel := context.WithCancel(detachLongLivedContext(ctx))
+	runCtx, runCancel := newDetachedCancelableContext(ctx)
+	stopLeaseCancel := context.AfterFunc(lease.Context(), runCancel)
+	defer stopLeaseCancel()
 	defer runCancel()
-	go func() {
-		select {
-		case <-ctx.Done():
-			runCancel()
-		case <-lease.Context().Done():
-			runCancel()
-		}
-	}()
 	return fn(runCtx)
 }
 
@@ -1321,49 +1280,41 @@ func (c *client) SubscribeToSegment(ctx context.Context, storeID uuid.UUID, spac
 }
 
 func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg api.Routeable, handler func(*SegmentStatus)) (api.Subscription, error) {
-	subCtx, cancel := context.WithCancel(detachLongLivedContext(ctx))
-	// Tie subscription lifecycle to client shutdown so subscription goroutines exit before
-	// Close() closes reconnectQueue (avoids send on closed channel panic), and
-	// parent ctx still controls cancellation without retaining a live recording span forever.
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancel()
-		case <-subCtx.Done():
-			return
-		case <-c.reconnectCtx.Done():
-			cancel()
-		}
-	}()
+	subCtx, cancel := newDetachedCancelableContext(ctx)
+
+	var stream api.BidiStream
+	err := RetryWithBackoff(subCtx, c.policy, func(retryCtx context.Context) error {
+		var err error
+		stream, err = c.provider.CallStream(retryCtx, storeID, initMsg)
+		return err
+	})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	done := make(chan struct{})
 
 	// Generate unique subscription ID for tracking
 	subID := uuid.New().String()
 
-	// Create the activeSubscription for replaying on reconnect
 	activeSub := &activeSubscription{
-		id:                 subID,
-		storeID:            storeID,
-		initMsg:            initMsg,
-		handler:            handler,
-		cancel:             cancel,
-		stopped:            make(chan struct{}),
-		done:               done,
-		ctx:                subCtx,
-		handlerSlots:       make(chan struct{}, normalizeHandlerConcurrency(c.maxConcurrentHandlers)),
-		mailboxCh:          make(chan struct{}, 1),
-		pendingStatusByKey: make(map[string]SegmentStatus),
-		streamCh:           make(chan api.BidiStream, 1),
-		retryCh:            make(chan struct{}, 1),
+		id:                subID,
+		storeID:           storeID,
+		initMsg:           initMsg,
+		handler:           handler,
+		cancel:            cancel,
+		stopped:           make(chan struct{}),
+		done:              done,
+		ctx:               subCtx,
+		mailboxCh:         make(chan struct{}, 1),
+		pendingPerSegment: subscriptionUsesPerSegmentPending(initMsg),
 	}
 
-	// Initialize health status
 	activeSub.status.Store("active")
-
-	// Register subscription for replay on reconnect
 	c.registerSubscription(subID, activeSub)
 
-	go func() {
+	go func(stream api.BidiStream) {
 		subCtx := activeSub.ctx
 		defer close(done)
 		defer func() {
@@ -1377,165 +1328,116 @@ func (c *client) subscribeStream(ctx context.Context, storeID uuid.UUID, initMsg
 		defer handlerWg.Wait()
 		defer close(activeSub.stopped)
 		defer c.unregisterSubscription(subID)
-		c.startSubscriptionHandlerDispatcher(subCtx, activeSub, subID, handler, &handlerWg)
+
+		heartbeatTimeout := effectiveSubscriptionHeartbeatTimeout(activeSub.initMsg)
+		lastFrameAt := time.Now()
+		streamReadCtx, cancelStreamRead := context.WithCancel(subCtx)
+		decodeCh, readerDone := startSubscriptionReader(streamReadCtx, stream)
 
 		for {
-			select {
-			case <-subCtx.Done():
-				return
-			default:
-			}
-
-			// Enqueue ourselves for reconnection — the dispatcher calls CallStream serially.
-			activeSub.status.Store("reconnecting")
-			if !waitForSubscriptionReconnect(subCtx, activeSub) {
-				return
-			}
-			req := &reconnectRequest{sub: activeSub, enqueuedAt: time.Now()}
-			select {
-			case <-subCtx.Done():
-				return
-			case c.reconnectQueue <- req:
-				c.recordReconnectQueueDepth(len(c.reconnectQueue))
-			default:
-				blockedAt := time.Now()
-				select {
-				case <-subCtx.Done():
-					return
-				case c.reconnectQueue <- req:
-					c.recordReconnectQueueBlocked(time.Since(blockedAt))
-					c.recordReconnectQueueDepth(len(c.reconnectQueue))
+			var (
+				timer     *time.Timer
+				timeoutCh <-chan time.Time
+			)
+			if heartbeatTimeout > 0 {
+				wait := time.Until(lastFrameAt.Add(heartbeatTimeout))
+				if wait < 0 {
+					wait = 0
 				}
+				timer = time.NewTimer(wait)
+				timeoutCh = timer.C
 			}
 
-			// Wait for the dispatcher to hand us a stream (or cancellation).
-			var stream api.BidiStream
 			select {
 			case <-subCtx.Done():
+				stopTimer(timer)
+				stopSubscriptionReader(cancelStreamRead, stream, subCtx.Err(), readerDone)
 				return
-			case stream = <-activeSub.streamCh:
-			}
-
-			if stream == nil {
-				// Dispatcher could not create stream; loop back to re-enqueue.
+			case <-activeSub.mailboxCh:
+				stopTimer(timer)
+				c.drainPendingSubscriptionStatuses(subCtx, activeSub, subID, handler, &handlerWg)
 				continue
-			}
-
-			// Connected successfully — reset failure state
-			if activeSub.failureCount.Load() > 0 {
-				slog.DebugContext(subCtx, "client: subscription stream reconnected",
+			case <-timeoutCh:
+				stopTimer(timer)
+				timeoutErr := fmt.Errorf("%w after %s", errSubscriptionHeartbeatLost, heartbeatTimeout)
+				activeSub.failureCount.Add(1)
+				activeSub.status.Store("failed")
+				activeSub.setLastError(timeoutErr)
+				slog.WarnContext(subCtx, "client: subscription heartbeat timed out",
 					appendClientLogFields(subscriptionLogFields(activeSub),
-						slog.Int("previous_failure_count", int(activeSub.failureCount.Load())))...)
-			}
-			activeSub.failureCount.Store(0)
-			activeSub.status.Store("active")
-			heartbeatTimeout := effectiveSubscriptionHeartbeatTimeout()
-			lastFrameAt := time.Now()
-			streamReadCtx, cancelStreamRead := context.WithCancel(subCtx)
-			decodeCh, readerDone := startSubscriptionReader(streamReadCtx, stream)
-
-		drainRetrySignals:
-			for {
-				select {
-				case <-activeSub.retryCh:
-				default:
-					break drainRetrySignals
-				}
-			}
-
-			// Read from stream until it fails, context is canceled, or retry requested
-		streamLoop:
-			for {
-				var (
-					timer     *time.Timer
-					timeoutCh <-chan time.Time
-				)
-				if heartbeatTimeout > 0 {
-					wait := time.Until(lastFrameAt.Add(heartbeatTimeout))
-					if wait < 0 {
-						wait = 0
+						slog.Int("failure_count", int(activeSub.failureCount.Load())),
+						slog.Duration("heartbeat_timeout", heartbeatTimeout),
+						"err", timeoutErr)...)
+				stopSubscriptionReader(cancelStreamRead, stream, timeoutErr, readerDone)
+				return
+			case result, ok := <-decodeCh:
+				stopTimer(timer)
+				if !ok {
+					streamErr := stream.EndOfStreamError()
+					if streamErr == nil {
+						streamErr = errSubscriptionReaderStopped
 					}
-					timer = time.NewTimer(wait)
-					timeoutCh = timer.C
-				}
-
-				select {
-				case <-subCtx.Done():
-					stopTimer(timer)
-					stopSubscriptionReader(cancelStreamRead, stream, subCtx.Err(), readerDone)
-					return
-				case <-activeSub.retryCh:
-					stopTimer(timer)
-					stopSubscriptionReader(cancelStreamRead, stream, nil, readerDone)
-					break streamLoop
-				case <-timeoutCh:
-					timeoutErr := fmt.Errorf("%w after %s", errSubscriptionHeartbeatLost, heartbeatTimeout)
 					activeSub.failureCount.Add(1)
-					activeSub.setLastError(timeoutErr)
-					slog.WarnContext(subCtx, "client: subscription heartbeat timed out",
+					activeSub.status.Store("failed")
+					activeSub.setLastError(streamErr)
+					slog.WarnContext(subCtx, "client: subscription reader stopped unexpectedly",
 						appendClientLogFields(subscriptionLogFields(activeSub),
 							slog.Int("failure_count", int(activeSub.failureCount.Load())),
-							slog.Duration("heartbeat_timeout", heartbeatTimeout),
-							"err", timeoutErr)...)
-					stopSubscriptionReader(cancelStreamRead, stream, timeoutErr, readerDone)
-					break streamLoop
-				case result, ok := <-decodeCh:
-					stopTimer(timer)
-					if !ok {
-						streamErr := stream.EndOfStreamError()
-						if streamErr == nil {
-							streamErr = errSubscriptionReaderStopped
-						}
-						activeSub.failureCount.Add(1)
-						activeSub.setLastError(streamErr)
-						slog.WarnContext(subCtx, "client: subscription reader stopped unexpectedly",
-							appendClientLogFields(subscriptionLogFields(activeSub),
-								slog.Int("failure_count", int(activeSub.failureCount.Load())),
-								"err", streamErr)...)
-						stopSubscriptionReader(cancelStreamRead, stream, streamErr, readerDone)
-						break streamLoop
-					}
-					if result.err != nil {
-						activeSub.failureCount.Add(1)
-						activeSub.setLastError(result.err)
-						slog.WarnContext(subCtx, "client: subscription stream decode failed",
-							appendClientLogFields(subscriptionLogFields(activeSub),
-								slog.Int("failure_count", int(activeSub.failureCount.Load())),
-								"err", result.err)...)
-						stopSubscriptionReader(cancelStreamRead, stream, result.err, readerDone)
-						if !IsRetryable(result.err) {
-							slog.WarnContext(subCtx, "client: subscription stopped after permanent stream error",
-								appendClientLogFields(subscriptionLogFields(activeSub),
-									slog.String("error_type", classifyRetryError(result.err)),
-									"err", result.err)...)
-							return
-						}
-						break streamLoop // inner loop → re-enqueue for reconnection
-					}
-
-					lastFrameAt = time.Now()
-					if activeSub.failureCount.Load() > 0 {
-						activeSub.failureCount.Store(0)
-					}
-					if result.status.Heartbeat {
-						continue
-					}
-
-					if !c.tryStartSubscriptionHandler(subCtx, activeSub, subID, handler, result.status, &handlerWg) {
-						c.enqueueSubscriptionStatus(subCtx, activeSub, result.status)
-					}
+							"err", streamErr)...)
+					stopSubscriptionReader(cancelStreamRead, stream, streamErr, readerDone)
+					return
 				}
+				if result.err != nil {
+					activeSub.failureCount.Add(1)
+					activeSub.status.Store("failed")
+					activeSub.setLastError(result.err)
+					slog.WarnContext(subCtx, "client: subscription stream ended",
+						appendClientLogFields(subscriptionLogFields(activeSub),
+							slog.Int("failure_count", int(activeSub.failureCount.Load())),
+							"err", result.err)...)
+					stopSubscriptionReader(cancelStreamRead, stream, result.err, readerDone)
+					return
+				}
+
+				lastFrameAt = time.Now()
+				if result.status.Heartbeat {
+					continue
+				}
+
+				if !c.tryStartSubscriptionHandler(subCtx, activeSub, subID, handler, result.status, &handlerWg) {
+					c.enqueueSubscriptionStatus(subCtx, activeSub, result.status)
+				}
+				c.drainPendingSubscriptionStatuses(subCtx, activeSub, subID, handler, &handlerWg)
 			}
 		}
-	}()
+	}(stream)
 
 	return &subscription{id: subID, cancel: cancel, done: done}, nil
 }
 
-// runHandler executes a subscription handler with timeout and panic recovery.
+func (c *client) runHandlerSafely(ctx context.Context, sub *activeSubscription, subID string, handler func(*SegmentStatus), status *SegmentStatus) {
+	defer func() {
+		if r := recover(); r != nil {
+			sub.handlerPanics.Add(1)
+			if c.metrics != nil {
+				c.metrics.RecordHandlerPanic(subID)
+			}
+			slog.ErrorContext(ctx, "subscription handler panic",
+				appendClientLogFields(subscriptionStatusLogFields(sub, status), slog.Any("panic", r))...)
+		}
+	}()
+	handler(status)
+}
+
+// runHandler executes a subscription handler with optional timeout and panic recovery.
 func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID string, handler func(*SegmentStatus), status *SegmentStatus) {
 	if status.LastSequence > 0 {
 		sub.lastDelivered.Store(int64(status.LastSequence))
+	}
+
+	if c.handlerTimeout <= 0 {
+		c.runHandlerSafely(ctx, sub, subID, handler, status)
+		return
 	}
 
 	handlerCtx, cancel := context.WithTimeout(ctx, c.handlerTimeout)
@@ -1544,17 +1446,7 @@ func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer func() {
-			if r := recover(); r != nil {
-				sub.handlerPanics.Add(1)
-				if c.metrics != nil {
-					c.metrics.RecordHandlerPanic(subID)
-				}
-				slog.ErrorContext(ctx, "subscription handler panic",
-					appendClientLogFields(subscriptionStatusLogFields(sub, status), slog.Any("panic", r))...)
-			}
-		}()
-		handler(status)
+		c.runHandlerSafely(ctx, sub, subID, handler, status)
 	}()
 
 	select {
@@ -1592,193 +1484,88 @@ func (s *subscription) Unsubscribe() {
 	<-s.done
 }
 
-// startReconnectDispatcher starts a single-threaded goroutine that processes
-// reconnection requests one at a time. Subscription goroutines enqueue themselves
-// here when their stream dies; the dispatcher calls CallStream serially and delivers
-// the resulting stream back, preventing thundering herd on reconnect.
-func (c *client) startReconnectDispatcher() {
-	c.reconnectLoop.Do(func() {
-		go func() {
-			defer close(c.reconnectDone)
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("reconnect dispatcher panic", slog.Any("panic", r))
-				}
-			}()
-
-			for {
-				select {
-				case <-c.reconnectCtx.Done():
-					return
-				case req, ok := <-c.reconnectQueue:
-					if !ok {
-						return
-					}
-
-					sub := req.sub
-					if !req.enqueuedAt.IsZero() {
-						c.recordReconnectQueueWait(time.Since(req.enqueuedAt))
-					}
-					c.recordReconnectQueueDepth(len(c.reconnectQueue))
-					replayStart := time.Now()
-
-					// Skip if subscription was canceled while waiting in queue
-					select {
-					case <-sub.ctx.Done():
-						continue
-					default:
-					}
-
-					stream, err := c.provider.CallStream(sub.ctx, sub.storeID, sub.initMsg)
-					if err != nil {
-						sub.failureCount.Add(1)
-						sub.setLastError(err)
-						slog.WarnContext(sub.ctx, "client: subscription reconnect failed",
-							appendClientLogFields(subscriptionLogFields(sub),
-								slog.Int("failure_count", int(sub.failureCount.Load())),
-								"err", err)...)
-						if c.metrics != nil {
-							c.metrics.RecordSubscriptionReplay(sub.id, false, time.Since(replayStart))
-						}
-						if !IsRetryable(err) {
-							slog.WarnContext(sub.ctx, "client: subscription reconnect stopped after permanent error",
-								appendClientLogFields(subscriptionLogFields(sub),
-									slog.String("error_type", classifyRetryError(err)),
-									"err", err)...)
-							sub.cancel()
-							continue
-						}
-
-						// Deliver nil so the goroutine re-enqueues itself
-						select {
-						case sub.streamCh <- nil:
-						case <-sub.ctx.Done():
-						}
-						continue
-					}
-
-					// Success — deliver stream to the subscription goroutine.
-					if c.metrics != nil {
-						c.metrics.RecordSubscriptionReplay(sub.id, true, time.Since(replayStart))
-					}
-					select {
-					case sub.streamCh <- stream:
-					case <-sub.ctx.Done():
-						stream.Close(sub.ctx.Err())
-					}
-				}
-			}
-		}()
-	})
-}
-
-// OnReconnected is called by the provider when it reconnects after a failure.
-// Subscription goroutines that are waiting for a stream already have themselves
-// enqueued in the reconnect queue. This callback is a no-op — the architecture
-// ensures that disconnected subscriptions self-enqueue and the single-threaded
-// dispatcher handles them serially.
-// Implements api.ReconnectListener.
+// OnReconnected is kept for compatibility with provider reconnect listener
+// registration, but the client no longer attempts to resume active logical
+// streams when a WebSocket reconnects.
 func (c *client) OnReconnected(ctx context.Context, storeID uuid.UUID) error {
-	c.subscriptionsMu.RLock()
-	count := len(c.subscriptions)
-	c.subscriptionsMu.RUnlock()
-
-	if count > 0 {
-		slog.InfoContext(ctx, "client: provider reconnected, subscriptions will be restored serially", "count", count)
-	}
+	slog.DebugContext(ctx, "client: provider reconnected; active logical streams must be recreated by callers",
+		slog.String("store_id", storeID.String()))
 	return nil
 }
 
-// Close gracefully shuts down the client, stopping the reconnection dispatcher
-// and cleaning up resources. Safe to call multiple times.
+// Close gracefully shuts down the client and cancels active subscriptions.
+// Safe to call multiple times.
 func (c *client) Close() error {
-	var closeErr error
 	c.shutdownOnce.Do(func() {
-		// Cancel dispatcher context; subscription goroutines listen to reconnectCtx.Done()
-		// and will cancel themselves without requiring timed queue closure.
-		if c.reconnectCancel != nil {
-			c.reconnectCancel()
+		for {
+			subs := c.snapshotSubscriptions()
+
+			if len(subs) == 0 {
+				break
+			}
+
+			for _, sub := range subs {
+				sub.cancel()
+			}
+			for _, sub := range subs {
+				<-sub.stopped
+			}
 		}
 
-		// Unregister from provider
-		c.provider.UnregisterReconnectListener(c)
+		if c.handlerWorkersCancel != nil {
+			c.handlerWorkersCancel()
+		}
+		c.handlerWorkersWg.Wait()
 	})
 
-	if c.reconnectDone != nil {
-		<-c.reconnectDone
-	}
-
-	for {
-		c.subscriptionsMu.RLock()
-		stoppedChans := make([]<-chan struct{}, 0, len(c.subscriptions))
-		for _, sub := range c.subscriptions {
-			stoppedChans = append(stoppedChans, sub.stopped)
-		}
-		c.subscriptionsMu.RUnlock()
-
-		if len(stoppedChans) == 0 {
-			break
-		}
-
-		for _, stopped := range stoppedChans {
-			<-stopped
-		}
-	}
-
-	return closeErr
+	return nil
 }
 
-// registerSubscription adds a subscription to the registry for replay on reconnect
+// registerSubscription adds a subscription to the active registry.
 func (c *client) registerSubscription(id string, sub *activeSubscription) {
-	c.subscriptionsMu.Lock()
-	defer c.subscriptionsMu.Unlock()
-	c.subscriptions[id] = sub
+	shard := c.subscriptionShard(id)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	shard.subscriptions[id] = sub
 }
 
 // unregisterSubscription removes a subscription from the registry
 func (c *client) unregisterSubscription(id string) {
-	c.subscriptionsMu.Lock()
-	defer c.subscriptionsMu.Unlock()
-	delete(c.subscriptions, id)
+	shard := c.subscriptionShard(id)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	delete(shard.subscriptions, id)
 }
 
 // RemoveSubscription explicitly removes a subscription from the registry.
 // Returns true if the subscription existed and was removed.
 func (c *client) RemoveSubscription(id string) bool {
-	c.subscriptionsMu.Lock()
-	defer c.subscriptionsMu.Unlock()
-	_, existed := c.subscriptions[id]
-	delete(c.subscriptions, id)
+	shard := c.subscriptionShard(id)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	_, existed := shard.subscriptions[id]
+	delete(shard.subscriptions, id)
 	return existed
 }
 
-// RetryFailedSubscription requests that a subscription reconnect immediately.
-// If the subscription is currently streaming, it will close the stream and re-enqueue
-// for a new one on the next loop iteration. If it is already waiting in the reconnect
-// queue or on a stream from the dispatcher, the next attempt is unchanged.
-// This is useful when external conditions have changed (e.g., server restarted).
+// RetryFailedSubscription is not supported for non-resumable subscriptions.
+// Callers must create a new subscription instead.
 func (c *client) RetryFailedSubscription(id string) error {
-	c.subscriptionsMu.RLock()
-	sub, exists := c.subscriptions[id]
-	c.subscriptionsMu.RUnlock()
+	_, exists := c.getSubscription(id)
 
 	if !exists {
 		return fmt.Errorf("subscription %s not found", id)
 	}
 
-	select {
-	case sub.retryCh <- struct{}{}:
-	default:
-	}
-	return nil
+	return fmt.Errorf("subscription %s does not support in-place retry; create a new subscription", id)
 }
 
 // SubscriptionStatus represents the health status of an active subscription.
 type SubscriptionStatus struct {
 	ID               string // subscription ID
-	Status           string // "active" or "reconnecting"
-	FailureCount     int32  // consecutive reconnection failures (resets on success)
-	LastError        error  // last error encountered during reconnection
+	Status           string // "active" or "failed"
+	FailureCount     int32  // stream failures observed before termination
+	LastError        error  // last stream error observed before termination
 	LastSequence     int64  // last successfully delivered sequence
 	HandlerTimeouts  int32  // count of handler timeout occurrences
 	HandlerPanics    int32  // count of handler panic occurrences
@@ -1788,19 +1575,13 @@ type SubscriptionStatus struct {
 
 // GetSubscriptionStatus returns the current health status of a subscription.
 //
-// The returned status contains the subscription's current state: "active"
-// (stream connected and delivering) or "reconnecting" (stream failed, retrying
-// with exponential backoff). Retryable failures keep reconnecting, but
-// permanent stream or dial errors cancel the subscription and remove it from
-// the registry.
-//
-// Failure counts and last errors are tracked for observability. The failure
-// count resets to zero on each successful reconnection. Returns nil if the
-// subscription id is not found or the subscription has already terminated.
+// The returned status contains the subscription's current state while it is
+// still registered. Active subscriptions report "active"; a stream that has
+// observed a terminal failure may briefly report "failed" until cleanup removes
+// it from the registry. Returns nil if the subscription id is not found or the
+// subscription has already terminated.
 func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
-	c.subscriptionsMu.RLock()
-	sub, exists := c.subscriptions[id]
-	c.subscriptionsMu.RUnlock()
+	sub, exists := c.getSubscription(id)
 
 	if !exists {
 		return nil

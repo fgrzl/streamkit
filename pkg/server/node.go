@@ -47,6 +47,7 @@ func NewNode(storeID uuid.UUID, store storage.Store, busFactory bus.MessageBusFa
 		store:                   store,
 		busFactory:              busFactory,
 		leaseStore:              leaseStore,
+		subscriptionRouters:     make(map[string]*spaceSubscriptionRouter),
 		notifyFailureThreshold:  defaultNotifyFailureThreshold,
 		notifyCircuitOpenWindow: defaultNotifyCircuitOpenWindow,
 	}
@@ -57,6 +58,9 @@ type defaultNode struct {
 	store      storage.Store
 	busFactory bus.MessageBusFactory
 	leaseStore *lease.Store
+
+	subscriptionRoutersMu sync.Mutex
+	subscriptionRouters   map[string]*spaceSubscriptionRouter
 
 	notifyMu                sync.Mutex
 	notifyFailureCount      int
@@ -70,6 +74,17 @@ const defaultNotifyFailureThreshold = 5
 const defaultNotifyCircuitOpenWindow = time.Minute
 
 func (n *defaultNode) Close() {
+	n.subscriptionRoutersMu.Lock()
+	routers := make([]*spaceSubscriptionRouter, 0, len(n.subscriptionRouters))
+	for _, router := range n.subscriptionRouters {
+		routers = append(routers, router)
+	}
+	n.subscriptionRouters = make(map[string]*spaceSubscriptionRouter)
+	n.subscriptionRoutersMu.Unlock()
+
+	for _, router := range routers {
+		router.close()
+	}
 	n.store.Close()
 }
 
@@ -472,10 +487,10 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
-	messageBus, err := n.busFactory.Get(ctx)
+	subscriber, err := n.registerSubscriptionTarget(ctx, args.Space, args.Segment, bidi)
 	if err != nil {
 		telemetry.RecordError(span, err)
-		slog.WarnContext(ctx, "server: failed to connect to the message bus",
+		slog.WarnContext(ctx, "server: failed to initialize subscription router",
 			logContextFields(ctx, n.storeID,
 				slog.String("space", args.Space),
 				slog.String("segment", args.Segment),
@@ -484,46 +499,11 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
-	route := api.GetSegmentNotificationRoute(n.storeID, args.Space)
-	var (
-		snapshotMu      sync.Mutex
-		snapshotPending = true
-		bufferedStatus  = make(map[string]*api.SegmentStatus)
-	)
-	bufferStatus := func(status *api.SegmentStatus) {
-		if status == nil {
-			return
-		}
-		bufferedStatus[status.Segment] = cloneSegmentStatus(status)
-	}
-	// Buffer live notifications until the current snapshot has been emitted so
-	// reconnects observe a stable "snapshot first, then live updates" sequence.
-	sub, err := bus.Subscribe(messageBus, route, func(ctx context.Context, msg *api.SegmentNotification) error {
-		match := args.Segment == "*" || args.Segment == msg.SegmentStatus.Segment
-		if match {
-			snapshotMu.Lock()
-			defer snapshotMu.Unlock()
-			if snapshotPending {
-				bufferStatus(msg.SegmentStatus)
-				return nil
-			}
-			return bidi.Encode(msg.SegmentStatus)
-		}
-		return nil
-	})
-	if err != nil {
-		telemetry.RecordError(span, err)
-		bidi.CloseSend(err)
-		return
-	}
-
-	// Use a dedicated subscription context so cleanup is deterministic and
-	// not tightly coupled to outer request context lifetime.
 	subCtx, cancelSub := context.WithCancel(ctx)
 	var cleanupOnce sync.Once
 	cleanup := func(closeErr error, closeBidi bool) {
 		cleanupOnce.Do(func() {
-			_ = sub.Unsubscribe()
+			subscriber.router.unregisterSubscriber(subscriber)
 			cancelSub()
 			if closeBidi {
 				bidi.Close(closeErr)
@@ -543,43 +523,21 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 		return
 	}
 
-	snapshotMu.Lock()
-	for _, status := range snapshotStatuses {
-		if err := bidi.Encode(status); err != nil {
-			snapshotMu.Unlock()
-			telemetry.RecordError(span, err)
-			slog.WarnContext(ctx, "server: failed to encode subscription snapshot",
-				logContextFields(ctx, n.storeID,
-					slog.String("space", args.Space),
-					slog.String("segment", args.Segment),
-					"err", err)...)
-			cleanup(err, true)
-			return
-		}
+	if err := subscriber.emitSnapshot(snapshotStatuses); err != nil {
+		telemetry.RecordError(span, err)
+		slog.WarnContext(ctx, "server: failed to encode subscription snapshot",
+			logContextFields(ctx, n.storeID,
+				slog.String("space", args.Space),
+				slog.String("segment", args.Segment),
+				"err", err)...)
+		cleanup(err, true)
+		return
 	}
-	buffered := sortedBufferedStatuses(bufferedStatus)
-	for _, status := range buffered {
-		if err := bidi.Encode(status); err != nil {
-			snapshotMu.Unlock()
-			telemetry.RecordError(span, err)
-			slog.WarnContext(ctx, "server: failed to encode buffered subscription status",
-				logContextFields(ctx, n.storeID,
-					slog.String("space", args.Space),
-					slog.String("segment", args.Segment),
-					"err", err)...)
-			cleanup(err, true)
-			return
-		}
-	}
-	snapshotPending = false
-	snapshotMu.Unlock()
 
 	if heartbeatSeconds := clampSubscriptionHeartbeatIntervalSeconds(args.HeartbeatIntervalSeconds); heartbeatSeconds > 0 {
 		go n.streamSubscriptionHeartbeats(subCtx, args.Space, args.Segment, heartbeatSeconds, bidi)
 	}
 
-	// Clean up on bidi close or context cancellation
-	// Issue #6 FIX: Add panic recovery to cleanup goroutine
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {

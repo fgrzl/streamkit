@@ -169,26 +169,6 @@ func (m *testClientMetrics) RecordReconnectQueueWait(duration time.Duration) {
 	}
 }
 
-func newTestClientWithQueue(provider api.BidiStreamProvider, metrics ClientMetrics, queueSize int) *client {
-	ctx, cancel := context.WithCancel(context.Background())
-	c := &client{
-		provider:              provider,
-		policy:                DefaultRetryPolicy(),
-		handlerTimeout:        30 * time.Second,
-		maxConcurrentHandlers: 50,
-		subscriptions:         make(map[string]*activeSubscription),
-		reconnectQueue:        make(chan *reconnectRequest, queueSize),
-		reconnectDone:         make(chan struct{}),
-		reconnectCtx:          ctx,
-		reconnectCancel:       cancel,
-		produceLocks:          make(map[string]*sync.Mutex),
-		metrics:               metrics,
-	}
-	c.startReconnectDispatcher()
-	provider.RegisterReconnectListener(c)
-	return c
-}
-
 func withSubscriptionHeartbeatTiming(interval, timeout time.Duration, fn func()) {
 	oldInterval := subscriptionHeartbeatInterval
 	oldTimeout := subscriptionHeartbeatTimeout
@@ -201,16 +181,14 @@ func withSubscriptionHeartbeatTiming(interval, timeout time.Duration, fn func())
 	fn()
 }
 
-func TestSubscriptionRegisteredOnCreation(t *testing.T) {
-	// Arrange
+func TestClientDoesNotRegisterReconnectListenerOnCreation(t *testing.T) {
 	provider := &mockProvider{}
 	c := NewClient(provider)
 	require.NotNil(t, c)
 
-	// Assert: client should be registered as listener
+	// Assert: the client no longer relies on provider reconnect notifications.
 	listeners := provider.GetListeners()
-	require.Len(t, listeners, 1)
-	assert.IsType(t, (*client)(nil), listeners[0])
+	assert.Empty(t, listeners)
 }
 
 func TestSubscriptionTrackedInRegistry(t *testing.T) {
@@ -218,14 +196,20 @@ func TestSubscriptionTrackedInRegistry(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			// Decode will continuously send status updates
+			emitted := false
 			stream.decodeFn = func(m any) error {
-				// Send one status then end stream
+				if !emitted {
+					emitted = true
+					if status, ok := m.(*SegmentStatus); ok {
+						*status = SegmentStatus{Segment: "test-segment"}
+					}
+					return nil
+				}
 				if status, ok := m.(*SegmentStatus); ok {
 					*status = SegmentStatus{Segment: "test-segment"}
 				}
-				// Return error to close stream
-				return errors.New("stream ended")
+				<-ctx.Done()
+				return ctx.Err()
 			}
 
 			return stream, nil
@@ -253,9 +237,7 @@ func TestSubscriptionTrackedInRegistry(t *testing.T) {
 
 	// Assert: subscription should be tracked in registry
 	clientInst := c.(*client)
-	clientInst.subscriptionsMu.RLock()
-	activeSubs := len(clientInst.subscriptions)
-	clientInst.subscriptionsMu.RUnlock()
+	activeSubs := clientInst.subscriptionCount()
 
 	// Subscription should be active (at least initially before stream ends)
 	assert.Greater(t, activeSubs, 0)
@@ -267,116 +249,43 @@ func TestSubscriptionTrackedInRegistry(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Assert: subscription should be removed from registry after unsubscribe
-	clientInst.subscriptionsMu.RLock()
-	activeSubs = len(clientInst.subscriptions)
-	clientInst.subscriptionsMu.RUnlock()
+	activeSubs = clientInst.subscriptionCount()
 	assert.Equal(t, 0, activeSubs)
 }
 
-func TestReconnectReplaysSubscriptions(t *testing.T) {
-	// Arrange: stream that fails after first decode, then succeeds on reconnect
+func TestSubscriptionStopsAfterStreamDisconnect(t *testing.T) {
 	var streamAttempts atomic.Int32
-	failStream := atomic.Bool{}
-	failStream.Store(true)
+	updates := make(chan uint64, 2)
+	firstStreamReady := make(chan *mockBidiStream, 1)
 
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			streamAttempts.Add(1)
-
-			if failStream.Load() {
-				return nil, errors.New("connection lost")
-			}
-
-			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			stream.decodeFn = func(m any) error {
-				if status, ok := m.(*SegmentStatus); ok {
-					*status = SegmentStatus{Segment: "test-segment"}
-				}
-				<-ctx.Done()
-				return ctx.Err()
-			}
-			return stream, nil
-		},
-	}
-
-	c := NewClient(provider)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	storeID := uuid.New()
-
-	handler := func(status *SegmentStatus) {}
-
-	sub, err := c.SubscribeToSegment(ctx, storeID, "test-space", "test-segment", handler)
-	require.NoError(t, err)
-	require.NotNil(t, sub)
-
-	// Wait for at least one failed attempt
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && streamAttempts.Load() < 2 {
-		time.Sleep(50 * time.Millisecond)
-	}
-	require.GreaterOrEqual(t, streamAttempts.Load(), int32(2), "should have multiple failed attempts")
-
-	// Now allow connections to succeed and signal reconnect
-	attemptsBeforeSignal := streamAttempts.Load()
-	failStream.Store(false)
-
-	clientInst := c.(*client)
-	err = clientInst.OnReconnected(ctx, uuid.Nil)
-	require.NoError(t, err)
-
-	// Wait for the goroutine to reconnect via the signal
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && streamAttempts.Load() <= attemptsBeforeSignal {
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	assert.Greater(t, streamAttempts.Load(), attemptsBeforeSignal, "reconnect signal should trigger new stream attempt")
-
-	// Cleanup
-	cancel()
-	sub.Unsubscribe()
-}
-
-func TestReconnectSubscriptionDeliversInitialSnapshot(t *testing.T) {
-	var attempts atomic.Int32
-	updates := make(chan uint64, 4)
-
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			attempt := attempts.Add(1)
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 			emitted := false
-
 			stream.decodeFn = func(m any) error {
-				if emitted {
-					if attempt == 1 {
-						return errors.New("connection lost")
+				if !emitted {
+					emitted = true
+					status, ok := m.(*SegmentStatus)
+					if !ok {
+						return errors.New("unexpected decode target")
 					}
-					<-ctx.Done()
-					return ctx.Err()
+					*status = SegmentStatus{Space: "space", Segment: "segment", LastSequence: 1}
+					return nil
 				}
-				emitted = true
-
-				status, ok := m.(*SegmentStatus)
-				if !ok {
-					return errors.New("unexpected decode target")
-				}
-				*status = SegmentStatus{
-					Space:        "space",
-					Segment:      "segment",
-					LastSequence: uint64(attempt),
-				}
-				return nil
+				<-stream.closedChan
+				return errors.New("connection lost")
+			}
+			select {
+			case firstStreamReady <- stream:
+			default:
 			}
 			return stream, nil
 		},
 	}
 
 	c := NewClient(provider)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
 	sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "segment", func(status *SegmentStatus) {
 		select {
@@ -393,78 +302,64 @@ func TestReconnectSubscriptionDeliversInitialSnapshot(t *testing.T) {
 		t.Fatal("timeout waiting for initial subscription update")
 	}
 
-	require.Eventually(t, func() bool {
-		return attempts.Load() >= 2
-	}, 3*time.Second, 10*time.Millisecond)
-
+	var firstStream *mockBidiStream
 	select {
-	case seq := <-updates:
-		assert.Equal(t, uint64(2), seq)
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for reconnect snapshot update")
+	case firstStream = <-firstStreamReady:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for initial stream instance")
 	}
+	firstStream.Close(errors.New("connection lost"))
 
-	cancel()
+	require.Eventually(t, func() bool {
+		return c.GetSubscriptionStatus(sub.ID()) == nil
+	}, time.Second, 10*time.Millisecond, "subscription should terminate after the stream disconnects")
+	assert.Equal(t, int32(1), streamAttempts.Load(), "subscriptions should not reopen a new stream after disconnect")
+
 	sub.Unsubscribe()
 }
 
-func TestOnReconnectedCallsAllSubscriptionHandlers(t *testing.T) {
-	// Arrange
+func TestOnReconnectedDoesNotRestoreStoppedSubscriptions(t *testing.T) {
+	var streamAttempts atomic.Int32
+	firstStreamReady := make(chan *mockBidiStream, 1)
+
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			streamAttempts.Add(1)
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 			stream.decodeFn = func(m any) error {
-				if status, ok := m.(*SegmentStatus); ok {
-					*status = SegmentStatus{Segment: "test"}
-				}
-				return nil
+				<-stream.closedChan
+				return errors.New("connection lost")
 			}
-
+			select {
+			case firstStreamReady <- stream:
+			default:
+			}
 			return stream, nil
 		},
 	}
 
-	c := NewClient(provider)
-	ctx := context.Background()
-	storeID := uuid.New()
-
-	// Create multiple subscriptions
-	handler1 := func(status *SegmentStatus) {
-		// Handler will be called during reconnect
-	}
-
-	handler2 := func(status *SegmentStatus) {
-		// Handler will be called during reconnect
-	}
-
-	sub1, err := c.SubscribeToSegment(ctx, storeID, "space1", "seg1", handler1)
+	c := NewClient(provider).(*client)
+	sub, err := c.SubscribeToSegment(context.Background(), uuid.New(), "space", "segment", func(*SegmentStatus) {})
 	require.NoError(t, err)
 
-	sub2, err := c.SubscribeToSegment(ctx, storeID, "space2", "seg2", handler2)
-	require.NoError(t, err)
+	var firstStream *mockBidiStream
+	select {
+	case firstStream = <-firstStreamReady:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for initial stream instance")
+	}
+	firstStream.Close(errors.New("connection lost"))
 
-	// Give subscriptions time to connect
+	require.Eventually(t, func() bool {
+		return c.GetSubscriptionStatus(sub.ID()) == nil
+	}, time.Second, 10*time.Millisecond)
+
+	err = c.OnReconnected(context.Background(), uuid.Nil)
+	require.NoError(t, err)
 	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(1), streamAttempts.Load(), "provider reconnect notifications must not recreate stopped logical streams")
 
-	// Act: trigger reconnect
-	clientInst := c.(*client)
-	err = clientInst.OnReconnected(ctx, uuid.Nil)
-	require.NoError(t, err)
-
-	// Give replay time to execute
-	time.Sleep(200 * time.Millisecond)
-
-	// Assert: subscriptions should still be receiving updates through replayed handlers
-	// (handlers would be called when replayed subscriptions receive status updates)
-	clientInst.subscriptionsMu.RLock()
-	activeSubs := len(clientInst.subscriptions)
-	clientInst.subscriptionsMu.RUnlock()
-
-	assert.Greater(t, activeSubs, 0, "subscriptions should still be active after reconnect")
-
-	// Cleanup
-	sub1.Unsubscribe()
-	sub2.Unsubscribe()
+	sub.Unsubscribe()
 }
 
 func TestSubscriptionFiltersHeartbeats(t *testing.T) {
@@ -516,7 +411,47 @@ func TestSubscriptionFiltersHeartbeats(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestSubscriptionReconnectsWhenHeartbeatsStop(t *testing.T) {
+func TestSubscriptionDoesNotRequestHeartbeatsByDefault(t *testing.T) {
+	requested := make(chan *api.SubscribeToSegmentStatus, 1)
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			args, ok := routeable.(*api.SubscribeToSegmentStatus)
+			require.True(t, ok, "expected subscription request")
+			select {
+			case requested <- args:
+			default:
+			}
+
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider).(*client)
+	sub, err := c.SubscribeToSegment(context.Background(), uuid.New(), "space", "segment", func(*SegmentStatus) {})
+	require.NoError(t, err)
+
+	var args *api.SubscribeToSegmentStatus
+	select {
+	case args = <-requested:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscription request")
+	}
+	require.NotNil(t, args)
+	assert.Equal(t, int64(0), args.HeartbeatIntervalSeconds)
+
+	time.Sleep(150 * time.Millisecond)
+	assert.NotNil(t, c.GetSubscriptionStatus(sub.ID()), "idle subscriptions should stay alive without default heartbeat timeouts")
+
+	sub.Unsubscribe()
+	assert.Nil(t, c.GetSubscriptionStatus(sub.ID()))
+}
+
+func TestSubscriptionStopsWhenHeartbeatsStop(t *testing.T) {
 	withSubscriptionHeartbeatTiming(25*time.Millisecond, 80*time.Millisecond, func() {
 		var attempts atomic.Int32
 		provider := &mockProvider{
@@ -531,19 +466,17 @@ func TestSubscriptionReconnectsWhenHeartbeatsStop(t *testing.T) {
 			},
 		}
 
-		c := NewClient(provider)
+		c := NewClient(provider).(*client)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "segment", func(status *SegmentStatus) {})
 		require.NoError(t, err)
 
-		deadline := time.Now().Add(500 * time.Millisecond)
-		for time.Now().Before(deadline) && attempts.Load() < 2 {
-			time.Sleep(10 * time.Millisecond)
-		}
-
-		assert.GreaterOrEqual(t, attempts.Load(), int32(2), "subscription should reconnect after heartbeat timeout")
+		require.Eventually(t, func() bool {
+			return c.GetSubscriptionStatus(sub.ID()) == nil
+		}, time.Second, 10*time.Millisecond, "subscription should terminate after heartbeat timeout")
+		assert.Equal(t, int32(1), attempts.Load(), "subscription should not reconnect after heartbeat timeout")
 		sub.Unsubscribe()
 	})
 }
@@ -631,265 +564,12 @@ func TestHandlerPanicResilience(t *testing.T) {
 
 	// Verify the subscription is still in registry and functional
 	clientInst := c.(*client)
-	clientInst.subscriptionsMu.RLock()
-	activeSubs := len(clientInst.subscriptions)
-	clientInst.subscriptionsMu.RUnlock()
+	activeSubs := clientInst.subscriptionCount()
 	assert.Greater(t, activeSubs, 0, "subscription should still be active after handler panic")
 
 	// Cleanup
 	cancel()
 	sub.Unsubscribe()
-}
-
-func TestNoDuplicateReplayOnRapidReconnect(t *testing.T) {
-	// Reconnections are serialized through a single-threaded dispatcher.
-	// Verify that at most one CallStream is in-flight at any given time,
-	// even when multiple subscriptions enqueue concurrently.
-
-	var concurrent atomic.Int32
-	var maxConcurrent atomic.Int32
-
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			cur := concurrent.Add(1)
-			defer concurrent.Add(-1)
-			for {
-				old := maxConcurrent.Load()
-				if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
-					break
-				}
-			}
-			// Small sleep so concurrent calls would overlap if they existed
-			time.Sleep(5 * time.Millisecond)
-
-			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			stream.decodeFn = func(m any) error {
-				if status, ok := m.(*SegmentStatus); ok {
-					status.Segment = "test-segment"
-					status.LastSequence = 1
-				}
-				// Block until context canceled — stable stream
-				<-ctx.Done()
-				return ctx.Err()
-			}
-			return stream, nil
-		},
-	}
-
-	c := NewClient(provider)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	storeID := uuid.New()
-
-	// Create multiple subscriptions
-	const numSubs = 5
-	subs := make([]api.Subscription, numSubs)
-	for i := 0; i < numSubs; i++ {
-		var err error
-		subs[i], err = c.SubscribeToSegment(ctx, storeID, "space", fmt.Sprintf("seg%d", i), func(s *SegmentStatus) {})
-		require.NoError(t, err)
-	}
-
-	// Wait for all subscriptions to connect (serialized through dispatcher)
-	time.Sleep(500 * time.Millisecond)
-
-	// Assert: concurrent CallStream never exceeded 1 (single-threaded dispatcher)
-	t.Logf("Max concurrent CallStream: %d", maxConcurrent.Load())
-	assert.LessOrEqual(t, maxConcurrent.Load(), int32(1), "reconnect dispatcher should call CallStream one at a time")
-
-	// Cleanup
-	cancel()
-	for _, sub := range subs {
-		sub.Unsubscribe()
-	}
-}
-
-func TestReconnectFailureBackoffDoesNotBlockOtherSubscriptions(t *testing.T) {
-	t.Setenv("STREAMKIT_TEST_NO_JITTER", "1")
-
-	var badAttempts atomic.Int32
-	goodUpdates := make(chan struct{}, 1)
-
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			args, ok := routeable.(*api.SubscribeToSegmentStatus)
-			if !ok {
-				return nil, errors.New("unexpected routeable")
-			}
-
-			switch args.Segment {
-			case "bad":
-				badAttempts.Add(1)
-				return nil, errors.New("can't connect")
-			case "good":
-				stream := &mockBidiStream{closedChan: make(chan struct{})}
-				emitted := false
-				stream.decodeFn = func(m any) error {
-					if !emitted {
-						emitted = true
-						status, ok := m.(*SegmentStatus)
-						if !ok {
-							return errors.New("unexpected decode target")
-						}
-						*status = SegmentStatus{Space: "space", Segment: "good", LastSequence: 1}
-						return nil
-					}
-
-					<-ctx.Done()
-					return ctx.Err()
-				}
-				return stream, nil
-			default:
-				return nil, fmt.Errorf("unexpected segment %q", args.Segment)
-			}
-		},
-	}
-
-	c := NewClient(provider)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	badSub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "bad", func(status *SegmentStatus) {})
-	require.NoError(t, err)
-
-	require.Eventually(t, func() bool {
-		return badAttempts.Load() >= 1
-	}, time.Second, 10*time.Millisecond)
-
-	start := time.Now()
-	goodSub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "good", func(status *SegmentStatus) {
-		select {
-		case goodUpdates <- struct{}{}:
-		default:
-		}
-	})
-	require.NoError(t, err)
-
-	select {
-	case <-goodUpdates:
-		assert.Less(t, time.Since(start), 90*time.Millisecond, "healthy subscription should not inherit another subscription's reconnect backoff")
-	case <-time.After(90 * time.Millisecond):
-		t.Fatal("timeout waiting for healthy subscription while another subscription is reconnecting")
-	}
-
-	cancel()
-	badSub.Unsubscribe()
-	goodSub.Unsubscribe()
-}
-
-func TestReconnectQueueMetricsTrackDepthAndBlockedEnqueue(t *testing.T) {
-	firstCallStarted := make(chan struct{})
-	releaseFirstCall := make(chan struct{})
-	metrics := &testClientMetrics{}
-
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			select {
-			case <-firstCallStarted:
-			default:
-				close(firstCallStarted)
-				<-releaseFirstCall
-			}
-
-			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			stream.decodeFn = func(m any) error {
-				<-ctx.Done()
-				return ctx.Err()
-			}
-			return stream, nil
-		},
-	}
-
-	c := newTestClientWithQueue(provider, metrics, 1)
-	defer c.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	subs := make([]api.Subscription, 0, 3)
-	for i := range 3 {
-		sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", fmt.Sprintf("seg-%d", i), func(*SegmentStatus) {})
-		require.NoError(t, err)
-		subs = append(subs, sub)
-	}
-
-	select {
-	case <-firstCallStarted:
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for the reconnect dispatcher to start its first call")
-	}
-
-	require.Eventually(t, func() bool {
-		return metrics.reconnectMaxDepth.Load() >= 1
-	}, time.Second, 10*time.Millisecond)
-
-	close(releaseFirstCall)
-
-	require.Eventually(t, func() bool {
-		return metrics.reconnectBlocked.Load() >= 1 && c.reconnectBlocks.Load() >= 1
-	}, time.Second, 10*time.Millisecond)
-
-	assert.Equal(t, int64(1), metrics.reconnectMaxDepth.Load())
-
-	cancel()
-	for _, sub := range subs {
-		sub.Unsubscribe()
-	}
-}
-
-func TestReconnectQueueMetricsRecordDispatcherWait(t *testing.T) {
-	firstCallStarted := make(chan struct{})
-	releaseFirstCall := make(chan struct{})
-	metrics := &testClientMetrics{}
-
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			select {
-			case <-firstCallStarted:
-			default:
-				close(firstCallStarted)
-				<-releaseFirstCall
-			}
-
-			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			stream.decodeFn = func(m any) error {
-				<-ctx.Done()
-				return ctx.Err()
-			}
-			return stream, nil
-		},
-	}
-
-	c := newTestClientWithQueue(provider, metrics, 2)
-	defer c.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	firstSub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "seg-a", func(*SegmentStatus) {})
-	require.NoError(t, err)
-
-	select {
-	case <-firstCallStarted:
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for the reconnect dispatcher to stall on the first request")
-	}
-
-	secondSub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "seg-b", func(*SegmentStatus) {})
-	require.NoError(t, err)
-
-	time.Sleep(50 * time.Millisecond)
-	close(releaseFirstCall)
-
-	require.Eventually(t, func() bool {
-		return metrics.reconnectWaitCount.Load() >= 2 && time.Duration(metrics.reconnectMaxWaitNs.Load()) >= 40*time.Millisecond
-	}, time.Second, 10*time.Millisecond)
-
-	assert.GreaterOrEqual(t, c.reconnectDepth.Load(), int64(0))
-
-	cancel()
-	firstSub.Unsubscribe()
-	secondSub.Unsubscribe()
 }
 
 // TestHealthStatusTracking tests Issue 4: Silent subscription failures detection
@@ -929,13 +609,9 @@ func TestHealthStatusTracking(t *testing.T) {
 
 	// Act: get subscription status via helper method (Issue 4)
 	clientInst := c.(*client)
-	var subID string
-	clientInst.subscriptionsMu.RLock()
-	for id := range clientInst.subscriptions {
-		subID = id
-		break
-	}
-	clientInst.subscriptionsMu.RUnlock()
+	ids := clientInst.snapshotSubscriptionIDs()
+	require.NotEmpty(t, ids, "should have subscription in registry")
+	subID := ids[0]
 
 	// Get status using the helper method
 	status := clientInst.GetSubscriptionStatus(subID)
@@ -943,8 +619,7 @@ func TestHealthStatusTracking(t *testing.T) {
 	// Assert: subscription should be tracked and queryable
 	assert.NotNil(t, status, "should be able to query subscription status (Issue 4)")
 	if status != nil {
-		// Status should be "active" or "reconnecting"
-		assert.Contains(t, []string{"active", "reconnecting"}, status.Status, "status should be active or reconnecting")
+		assert.Equal(t, "active", status.Status, "active subscriptions should report an active status")
 	}
 
 	// Cleanup
@@ -1059,9 +734,7 @@ func TestSubscriptionCleanupOnPanic(t *testing.T) {
 
 	// Act: Verify subscription is still registered despite panic (Issue 1: panic recovery working)
 	clientInst := c.(*client)
-	clientInst.subscriptionsMu.RLock()
-	countAfterPanic := len(clientInst.subscriptions)
-	clientInst.subscriptionsMu.RUnlock()
+	countAfterPanic := clientInst.subscriptionCount()
 
 	// Assert:  Subscription should still be in registry (panic was recovered)
 	assert.Greater(t, countAfterPanic, 0, "subscription should survive panic with recovery (Issue 1 + Issue 6)")
@@ -1070,9 +743,7 @@ func TestSubscriptionCleanupOnPanic(t *testing.T) {
 	sub.Unsubscribe()
 
 	// After unsubscribe, subscription should be removed from registry
-	clientInst.subscriptionsMu.RLock()
-	countAfterUnsubscribe := len(clientInst.subscriptions)
-	clientInst.subscriptionsMu.RUnlock()
+	countAfterUnsubscribe := clientInst.subscriptionCount()
 
 	assert.Equal(t, 0, countAfterUnsubscribe, "subscription should be unregistered after Unsubscribe")
 }
@@ -1131,15 +802,13 @@ func TestOffsetTracking(t *testing.T) {
 
 	// Assert: subscription should track offset
 	clientInst := c.(*client)
-	clientInst.subscriptionsMu.RLock()
 	var lastDelivered int64
-	for _, activeSub := range clientInst.subscriptions {
+	for _, activeSub := range clientInst.snapshotSubscriptions() {
 		delivered := activeSub.lastDelivered.Load()
 		if delivered > lastDelivered {
 			lastDelivered = delivered
 		}
 	}
-	clientInst.subscriptionsMu.RUnlock()
 
 	// Should have tracked at least one sequence
 	assert.Greater(t, lastDelivered, int64(0), "should track delivered sequences")
@@ -1164,7 +833,8 @@ func TestHandlerTimeoutTracking(t *testing.T) {
 					}
 					return nil
 				}
-				return errors.New("stream ended")
+				<-ctx.Done()
+				return ctx.Err()
 			}
 
 			return stream, nil
@@ -1198,6 +868,42 @@ func TestHandlerTimeoutTracking(t *testing.T) {
 	sub.Unsubscribe()
 }
 
+func TestHandlerTimeoutCanBeDisabled(t *testing.T) {
+	c := NewClientWithHandlerTimeout(&mockProvider{}, 0).(*client)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+
+	sub := &activeSubscription{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	returned := make(chan struct{})
+
+	go func() {
+		c.runHandler(context.Background(), sub, "sub-id", func(*SegmentStatus) {
+			close(started)
+			<-release
+		}, &SegmentStatus{Space: "space", Segment: "segment", LastSequence: 1})
+		close(returned)
+	}()
+
+	<-started
+	select {
+	case <-returned:
+		t.Fatal("runHandler should wait for handler completion when timeout is disabled")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("runHandler should return after the handler completes")
+	}
+
+	assert.Equal(t, int32(0), sub.handlerTimeouts.Load(), "disabled timeout should not increment timeout metrics")
+}
+
 // TestHandlerTimeoutMetrics verifies that handler timeouts and panics are tracked (Issue 7).
 // Applications should be able to query subscription health including timeout/panic counts.
 func TestHandlerTimeoutMetrics(t *testing.T) {
@@ -1214,7 +920,8 @@ func TestHandlerTimeoutMetrics(t *testing.T) {
 					}
 					return nil
 				}
-				return errors.New("stream ended")
+				<-ctx.Done()
+				return ctx.Err()
 			}
 
 			return stream, nil
@@ -1245,14 +952,10 @@ func TestHandlerTimeoutMetrics(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get subscription ID from internal registry
-	var subID string
 	clientInst := c.(*client)
-	clientInst.subscriptionsMu.RLock()
-	for id := range clientInst.subscriptions {
-		subID = id
-		break
-	}
-	clientInst.subscriptionsMu.RUnlock()
+	ids := clientInst.snapshotSubscriptionIDs()
+	require.NotEmpty(t, ids, "should have subscription in registry")
+	subID := ids[0]
 
 	require.NotEmpty(t, subID, "should have subscription in registry")
 
@@ -1427,19 +1130,40 @@ func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 func TestSubscriptionStatusHandlesDifferentConcreteErrorTypes(t *testing.T) {
 	c := NewClient(&mockProvider{}).(*client)
 	sub := &activeSubscription{id: "sub-1"}
-	sub.status.Store("reconnecting")
+	sub.status.Store("failed")
 	sub.setLastError(errors.New("first failure"))
 	sub.setLastError(context.DeadlineExceeded)
 
-	c.subscriptionsMu.Lock()
-	c.subscriptions[sub.id] = sub
-	c.subscriptionsMu.Unlock()
+	c.registerSubscription(sub.id, sub)
 
 	status := c.GetSubscriptionStatus(sub.id)
 	require.NotNil(t, status)
 	require.NotNil(t, status.LastError)
-	assert.Equal(t, "reconnecting", status.Status)
+	assert.Equal(t, "failed", status.Status)
 	assert.Equal(t, context.DeadlineExceeded.Error(), status.LastError.Error())
+}
+
+func TestExactSubscriptionUsesSinglePendingStatusSlot(t *testing.T) {
+	sub := &activeSubscription{}
+
+	coalesced := sub.queuePendingStatus(SegmentStatus{Space: "space", Segment: "segment", LastSequence: 1})
+	assert.False(t, coalesced)
+	assert.Nil(t, sub.pendingStatusByKey)
+	assert.Empty(t, sub.pendingOrder)
+	assert.Equal(t, 1, sub.pendingStatusCount())
+
+	coalesced = sub.queuePendingStatus(SegmentStatus{Space: "space", Segment: "segment", LastSequence: 2})
+	assert.True(t, coalesced)
+	assert.Nil(t, sub.pendingStatusByKey)
+	assert.Empty(t, sub.pendingOrder)
+
+	status, ok := sub.takePendingStatus()
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), status.LastSequence)
+	assert.Equal(t, 0, sub.pendingStatusCount())
+
+	_, ok = sub.takePendingStatus()
+	assert.False(t, ok)
 }
 
 func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSaturate(t *testing.T) {
@@ -1869,18 +1593,15 @@ func TestProduceLockIsolatesBySegment(t *testing.T) {
 
 // --- New tests for RC hardening ---
 
-func TestResilienceEnumeratorResumesConsumeSegment(t *testing.T) {
-	var calls int
-	var capturedArgs []api.Routeable
+func TestConsumeSegmentStopsAfterDisconnectWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
 
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			calls++
-			capturedArgs = append(capturedArgs, routeable)
+			calls.Add(1)
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 			seq := 0
 			stream.decodeFn = func(m any) error {
-				// handle both *api.Entry and **api.Entry due to how the enumerator passes values
 				switch v := m.(type) {
 				case *api.Entry:
 					seq++
@@ -1902,224 +1623,47 @@ func TestResilienceEnumeratorResumesConsumeSegment(t *testing.T) {
 	}
 
 	c := NewClient(provider)
-	ctx := context.Background()
-	storeID := uuid.New()
-	args := &ConsumeSegment{Space: "space", Segment: "segment"}
-	enum := c.ConsumeSegment(ctx, storeID, args)
+	args := &ConsumeSegment{Space: "space", Segment: "segment", MinSequence: 7}
+	enum := c.ConsumeSegment(context.Background(), uuid.New(), args)
 	defer enum.Dispose()
 
-	// First MoveNext should return the first entry
 	assert.True(t, enum.MoveNext())
 	entry, err := enum.Current()
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), entry.Sequence)
 
-	// Next MoveNext triggers reconnect; we don't rely on its return value here
-	_ = enum.MoveNext()
-
-	// We expect at least two calls and second call's args to be a ConsumeSegment with MinSequence == 2
-	require.GreaterOrEqual(t, calls, 2)
-	if cs, ok := capturedArgs[len(capturedArgs)-1].(*api.ConsumeSegment); ok {
-		assert.Equal(t, uint64(2), cs.MinSequence)
-	} else {
-		t.Fatalf("expected ConsumeSegment, got %T", capturedArgs[len(capturedArgs)-1])
-	}
+	assert.False(t, enum.MoveNext())
+	require.Error(t, enum.Err())
+	assert.ErrorContains(t, enum.Err(), "simulated disconnect")
+	assert.Equal(t, int32(1), calls.Load(), "consume streams should not reopen after a disconnect")
+	assert.Equal(t, uint64(7), args.MinSequence, "caller offsets should remain unchanged after a disconnect")
 }
 
-func TestResilienceEnumeratorResumesConsumeSpace(t *testing.T) {
-	var calls int
-	var capturedArgs []api.Routeable
+func TestConsumeDoesNotMutateCallerOffsetsOnDisconnect(t *testing.T) {
+	var calls atomic.Int32
+	initialOffset := lexkey.Encode("space", "segment", 1)
 
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			calls++
-			capturedArgs = append(capturedArgs, routeable)
+			calls.Add(1)
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			first := true
-			stream.decodeFn = func(m any) error {
-				// handle both *api.Entry and **api.Entry
-				switch v := m.(type) {
-				case *api.Entry:
-					if first {
-						first = false
-						*v = api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
-						return nil
-					}
-				case **api.Entry:
-					if first {
-						first = false
-						*v = &api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
-						return nil
-					}
-				}
+			stream.decodeFn = func(any) error {
 				return errors.New("simulated disconnect")
 			}
 			return stream, nil
 		},
 	}
 
+	args := &Consume{Offsets: map[string]lexkey.LexKey{"space": initialOffset}}
 	c := NewClient(provider)
-	ctx := context.Background()
-	storeID := uuid.New()
-	args := &ConsumeSpace{Space: "spaceX"}
-	enum := c.ConsumeSpace(ctx, storeID, args)
+	enum := c.Consume(context.Background(), uuid.New(), args)
 	defer enum.Dispose()
 
-	// First MoveNext returns the first entry
-	assert.True(t, enum.MoveNext())
-	entry, err := enum.Current()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(5), entry.Sequence)
-
-	// Next MoveNext triggers reconnect; we don't rely on its return value here
-	_ = enum.MoveNext()
-
-	require.GreaterOrEqual(t, calls, 2)
-	if cs, ok := capturedArgs[len(capturedArgs)-1].(*api.ConsumeSpace); ok {
-		// Offset should be set and equal to the entry's space offset
-		expected := entry.GetSpaceOffset()
-		assert.Equal(t, expected, cs.Offset)
-	} else {
-		t.Fatalf("expected ConsumeSpace, got %T", capturedArgs[len(capturedArgs)-1])
-	}
-}
-
-func TestResilienceEnumeratorResumesConsume(t *testing.T) {
-	var calls int
-	var capturedArgs []api.Routeable
-
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			calls++
-			capturedArgs = append(capturedArgs, routeable)
-			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			first := true
-			stream.decodeFn = func(m any) error {
-				switch v := m.(type) {
-				case *api.Entry:
-					if first {
-						first = false
-						*v = api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
-						return nil
-					}
-				case **api.Entry:
-					if first {
-						first = false
-						*v = &api.Entry{Sequence: 5, Timestamp: 12345, Space: "spaceX", Segment: "segX"}
-						return nil
-					}
-				}
-				return errors.New("simulated disconnect")
-			}
-			return stream, nil
-		},
-	}
-
-	c := NewClient(provider)
-	ctx := context.Background()
-	storeID := uuid.New()
-	args := &Consume{
-		Offsets: map[string]lexkey.LexKey{
-			"spaceX": {},
-		},
-	}
-	enum := c.Consume(ctx, storeID, args)
-	defer enum.Dispose()
-
-	assert.True(t, enum.MoveNext())
-	entry, err := enum.Current()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(5), entry.Sequence)
-
-	_ = enum.MoveNext()
-
-	require.GreaterOrEqual(t, calls, 2)
-	if consumeArgs, ok := capturedArgs[len(capturedArgs)-1].(*api.Consume); ok {
-		expected := entry.GetSpaceOffset()
-		require.Contains(t, consumeArgs.Offsets, "spaceX")
-		assert.Equal(t, expected, consumeArgs.Offsets["spaceX"])
-		assert.NotContains(t, consumeArgs.Offsets, "spaceX/segX")
-	} else {
-		t.Fatalf("expected Consume, got %T", capturedArgs[len(capturedArgs)-1])
-	}
-}
-
-func TestResilienceEnumeratorResumesConsumeAcrossSpaces(t *testing.T) {
-	var calls int
-	var capturedArgs []api.Routeable
-
-	firstStreamEntries := []*api.Entry{
-		{Sequence: 1, Timestamp: 100, Space: "spaceA", Segment: "segA"},
-		{Sequence: 1, Timestamp: 200, Space: "spaceB", Segment: "segB"},
-	}
-
-	provider := &mockProvider{
-		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			calls++
-			callNumber := calls
-			capturedArgs = append(capturedArgs, routeable)
-			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			index := 0
-			stream.decodeFn = func(m any) error {
-				var entry *api.Entry
-				switch {
-				case callNumber == 1 && index < len(firstStreamEntries):
-					entry = firstStreamEntries[index]
-					index++
-				case callNumber == 2 && index == 0:
-					entry = &api.Entry{Sequence: 2, Timestamp: 300, Space: "spaceA", Segment: "segA"}
-					index++
-				}
-				if entry != nil {
-					switch v := m.(type) {
-					case *api.Entry:
-						*v = *entry
-						return nil
-					case **api.Entry:
-						copyEntry := *entry
-						*v = &copyEntry
-						return nil
-					}
-				}
-				return errors.New("simulated disconnect")
-			}
-			return stream, nil
-		},
-	}
-
-	c := NewClient(provider)
-	ctx := context.Background()
-	storeID := uuid.New()
-	args := &Consume{
-		Offsets: map[string]lexkey.LexKey{
-			"spaceA": {},
-			"spaceB": {},
-		},
-	}
-	enum := c.Consume(ctx, storeID, args)
-	defer enum.Dispose()
-
-	assert.True(t, enum.MoveNext())
-	firstEntry, err := enum.Current()
-	require.NoError(t, err)
-	assert.Equal(t, "spaceA", firstEntry.Space)
-
-	assert.True(t, enum.MoveNext())
-	secondEntry, err := enum.Current()
-	require.NoError(t, err)
-	assert.Equal(t, "spaceB", secondEntry.Space)
-
-	_ = enum.MoveNext()
-
-	require.GreaterOrEqual(t, calls, 2)
-	consumeArgs, ok := capturedArgs[len(capturedArgs)-1].(*api.Consume)
-	if !ok {
-		t.Fatalf("expected Consume, got %T", capturedArgs[len(capturedArgs)-1])
-	}
-	require.Contains(t, consumeArgs.Offsets, "spaceA")
-	require.Contains(t, consumeArgs.Offsets, "spaceB")
-	assert.Equal(t, firstEntry.GetSpaceOffset(), consumeArgs.Offsets["spaceA"])
-	assert.Equal(t, secondEntry.GetSpaceOffset(), consumeArgs.Offsets["spaceB"])
+	assert.False(t, enum.MoveNext())
+	require.Error(t, enum.Err())
+	assert.ErrorContains(t, enum.Err(), "simulated disconnect")
+	assert.Equal(t, int32(1), calls.Load(), "consume enumerators should not retry after a disconnect")
+	assert.Equal(t, initialOffset, args.Offsets["space"], "consume arguments should remain owned by the caller")
 }
 
 func TestProduceLockEviction(t *testing.T) {
@@ -2192,7 +1736,7 @@ func TestConsumeSegmentReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
 	assert.Equal(t, int32(1), calls.Load(), "permanent stream errors should not trigger consume retries")
 }
 
-func TestSubscriptionRetriesIndefinitely(t *testing.T) {
+func TestSubscriptionInitialCallStreamReturnsErrorAfterRetries(t *testing.T) {
 	var attempts atomic.Int32
 
 	provider := &mockProvider{
@@ -2202,51 +1746,19 @@ func TestSubscriptionRetriesIndefinitely(t *testing.T) {
 		},
 	}
 
-	c := NewClientWithHandlerTimeout(provider, 50*time.Millisecond).(*client)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	storeID := uuid.New()
+	c := NewClientWithRetryPolicy(provider, RetryPolicy{
+		MaxAttempts:       3,
+		InitialBackoff:    time.Millisecond,
+		MaxBackoff:        time.Millisecond,
+		BackoffMultiplier: 1,
+	}).(*client)
 
-	// Register subscription that will fail to connect
-	sub, err := c.SubscribeToSegment(ctx, storeID, "space", "segment", func(s *SegmentStatus) {})
-	require.NoError(t, err)
+	sub, err := c.SubscribeToSegment(context.Background(), uuid.New(), "space", "segment", func(*SegmentStatus) {})
+	require.Error(t, err)
+	assert.Nil(t, sub)
+	assert.Equal(t, int32(3), attempts.Load(), "initial subscription open should use retry policy, then return the final error")
 
-	// Wait for several retry attempts
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if attempts.Load() >= 3 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	// Assert: subscription keeps retrying (status is "reconnecting", not "failed")
-	var subID string
-	c.subscriptionsMu.RLock()
-	for id := range c.subscriptions {
-		subID = id
-		break
-	}
-	c.subscriptionsMu.RUnlock()
-	require.NotEmpty(t, subID, "subscription should still be registered")
-
-	status := c.GetSubscriptionStatus(subID)
-	require.NotNil(t, status)
-	assert.Equal(t, "reconnecting", status.Status, "subscription should be reconnecting, never permanently failed")
-	assert.GreaterOrEqual(t, status.FailureCount, int32(3), "should have multiple failure attempts")
-	assert.NotNil(t, status.LastError)
-
-	// RetryFailedSubscription signals immediate retry (works regardless of status)
-	err = c.RetryFailedSubscription(subID)
-	require.NoError(t, err)
-
-	// Cleanup — Unsubscribe should stop the retry loop
-	sub.Unsubscribe()
-
-	c.subscriptionsMu.RLock()
-	_, stillExists := c.subscriptions[subID]
-	c.subscriptionsMu.RUnlock()
-	assert.False(t, stillExists, "subscription should be unregistered after Unsubscribe")
+	assert.Equal(t, 0, c.subscriptionCount(), "failed initial subscription opens must not leave registry entries behind")
 }
 
 func TestSubscriptionStopsOnPermanentRemoteError(t *testing.T) {
@@ -2274,9 +1786,7 @@ func TestSubscriptionStopsOnPermanentRemoteError(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		c.subscriptionsMu.RLock()
-		defer c.subscriptionsMu.RUnlock()
-		return len(c.subscriptions) == 0
+		return c.subscriptionCount() == 0
 	}, time.Second, 10*time.Millisecond, "permanent remote errors should stop the subscription loop")
 
 	assert.Equal(t, int32(1), attempts.Load(), "permanent remote errors should not trigger reconnect retries")
@@ -2307,13 +1817,8 @@ func TestSubscriptionCancelsOnPermanentCallStreamError(t *testing.T) {
 		default:
 		}
 	})
-	require.NoError(t, err)
-
-	require.Eventually(t, func() bool {
-		c.subscriptionsMu.RLock()
-		defer c.subscriptionsMu.RUnlock()
-		return len(c.subscriptions) == 0
-	}, time.Second, 10*time.Millisecond, "permanent CallStream errors should cancel the subscription")
+	require.Error(t, err)
+	assert.Nil(t, sub)
 
 	assert.Equal(t, int32(1), attempts.Load(), "permanent CallStream errors should not trigger reconnect retries")
 	select {
@@ -2322,7 +1827,7 @@ func TestSubscriptionCancelsOnPermanentCallStreamError(t *testing.T) {
 	default:
 	}
 
-	sub.Unsubscribe()
+	assert.Equal(t, 0, c.subscriptionCount(), "failed initial subscription opens must not register a subscription")
 }
 
 func TestSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
@@ -2350,9 +1855,7 @@ func TestSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		c.subscriptionsMu.RLock()
-		defer c.subscriptionsMu.RUnlock()
-		return len(c.subscriptions) == 0
+		return c.subscriptionCount() == 0
 	}, time.Second, 10*time.Millisecond, "stream overload should stop the subscription loop")
 
 	assert.Equal(t, int32(1), attempts.Load(), "stream overload should not trigger reconnect retries")
@@ -2365,42 +1868,14 @@ func TestSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestRetryFailedSubscriptionReconnectsActiveStream(t *testing.T) {
+func TestRetryFailedSubscriptionReturnsError(t *testing.T) {
 	var attempts atomic.Int32
-	firstStreamClosed := make(chan struct{})
-	updates := make(chan SegmentStatus, 1)
 
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
-			attempt := attempts.Add(1)
+			attempts.Add(1)
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
-
-			if attempt == 1 {
-				stream.closeFn = func(err error) {
-					select {
-					case <-firstStreamClosed:
-					default:
-						close(firstStreamClosed)
-					}
-				}
-				stream.decodeFn = func(m any) error {
-					<-stream.closedChan
-					return errors.New("stream closed")
-				}
-				return stream, nil
-			}
-
-			emitted := false
 			stream.decodeFn = func(m any) error {
-				if !emitted {
-					emitted = true
-					status, ok := m.(*SegmentStatus)
-					if !ok {
-						return errors.New("unexpected decode target")
-					}
-					*status = SegmentStatus{Space: "space", Segment: "segment", LastSequence: 99}
-					return nil
-				}
 				<-ctx.Done()
 				return ctx.Err()
 			}
@@ -2412,44 +1887,22 @@ func TestRetryFailedSubscriptionReconnectsActiveStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "segment", func(status *SegmentStatus) {
-		select {
-		case updates <- *status:
-		default:
-		}
-	})
+	sub, err := c.SubscribeToSegment(ctx, uuid.New(), "space", "segment", func(*SegmentStatus) {})
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
 		return attempts.Load() >= 1
 	}, time.Second, 10*time.Millisecond)
 
-	var subID string
-	c.subscriptionsMu.RLock()
-	for id := range c.subscriptions {
-		subID = id
-		break
-	}
-	c.subscriptionsMu.RUnlock()
+	ids := c.snapshotSubscriptionIDs()
+	require.NotEmpty(t, ids)
+	subID := ids[0]
 	require.NotEmpty(t, subID)
 
 	err = c.RetryFailedSubscription(subID)
-	require.NoError(t, err)
-
-	select {
-	case <-firstStreamClosed:
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for active stream to close on retry")
-	}
-
-	select {
-	case status := <-updates:
-		assert.Equal(t, uint64(99), status.LastSequence)
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for update after retry reconnect")
-	}
-
-	assert.GreaterOrEqual(t, attempts.Load(), int32(2), "retry should force a new CallStream attempt")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "does not support in-place retry")
+	assert.Equal(t, int32(1), attempts.Load(), "retry requests must not reopen active streams")
 
 	cancel()
 	sub.Unsubscribe()
@@ -2488,19 +1941,13 @@ func TestClientCloseCancelsActiveSubscriptions(t *testing.T) {
 	}
 
 	require.Eventually(t, func() bool {
-		c.subscriptionsMu.RLock()
-		defer c.subscriptionsMu.RUnlock()
-		return len(c.subscriptions) == 1
+		return c.subscriptionCount() == 1
 	}, time.Second, 10*time.Millisecond)
-	require.Len(t, provider.GetListeners(), 1)
 
 	require.NoError(t, c.Close())
 
-	c.subscriptionsMu.RLock()
-	remainingSubscriptions := len(c.subscriptions)
-	c.subscriptionsMu.RUnlock()
+	remainingSubscriptions := c.subscriptionCount()
 	assert.Equal(t, 0, remainingSubscriptions, "Close should wait for subscriptions to unregister before returning")
-	assert.Len(t, provider.GetListeners(), 0)
 	assert.GreaterOrEqual(t, closedCount.Load(), int32(1), "closing the client should close active streams")
 
 	// Safe after client shutdown; subscription should already be done.
@@ -2559,9 +2006,7 @@ func TestClientCloseReturnsWhenCalledFromHandler(t *testing.T) {
 		t.Fatal("timeout waiting for Close called from a handler")
 	}
 
-	c.subscriptionsMu.RLock()
-	remainingSubscriptions := len(c.subscriptions)
-	c.subscriptionsMu.RUnlock()
+	remainingSubscriptions := c.subscriptionCount()
 	assert.Equal(t, 0, remainingSubscriptions, "Close called from a handler should still drain subscriptions")
 	assert.Equal(t, int32(0), metrics.handlerTimeouts.Load(), "shutdown-triggered cancellation should not be recorded as a handler timeout")
 

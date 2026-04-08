@@ -65,15 +65,16 @@ The client includes production-grade resilience features but has documented limi
 
 1. **Lock Management**: Per-segment produce locks accumulate over time. Not an issue for typical workloads (<10K segments) but may impact scenarios with millions of unique segments over time.
 
-2. **Deduplication**: While resilience enumerators resume from last consumed position, applications should implement sequence-based deduplication for exactly-once semantics in critical workflows.
+2. **Consumer Recovery**: Consume streams are not resumed after a WebSocket disconnect. Applications should persist their own last known offsets or sequences and recreate consumers explicitly when the transport drops.
 
-3. **Subscription Lifecycle**: Retryable subscription failures stay in the reconnect loop, but permanent errors stop the subscription and remove it from the client registry. `SubscribeToSpace()` is the wildcard form of `SubscribeToSegmentStatus` (`Segment: "*"`) and reconnects receive a latest-state snapshot before live updates resume. Durable missed-update replay/cursors are not part of the current subscription contract.
+3. **Subscription Lifecycle**: Subscriptions are tied to a single logical stream. If that stream ends because the WebSocket disconnects, an explicit subscription heartbeat expires, or the server closes it, the subscription stops and is removed from the client registry. Callers must create a new subscription explicitly; durable missed-update replay/cursors are not part of the current contract.
 
 **Recommendations for Alpha Testing:**
 
-- ✅ Treat subscription handlers as latest-state processors: reconnects deliver a fresh snapshot, then continue live updates
+- ✅ Persist consumer offsets in application code and recreate consumers from the last known position after disconnects
+- ✅ Resubscribe explicitly after subscription stream failures
 - ✅ Implement application-level deduplication using `Entry.Sequence` numbers
 - ✅ Monitor segment churn if creating more than 10K unique segments
-- ✅ Handle permanent subscription failures explicitly in application code and logs
+- ✅ Handle subscription stream failures explicitly in application code and logs
 
 For detailed changes and future roadmap, see [CHANGELOG.md](CHANGELOG.md).

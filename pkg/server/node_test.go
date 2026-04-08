@@ -92,11 +92,12 @@ func (s *mockBusSubscription) Unsubscribe() error {
 }
 
 type mockMessageBus struct {
-	route        bus.Route
-	handler      bus.MessageHandler
-	subscription *mockBusSubscription
-	notifyErr    error
-	notifyCalls  atomic.Int32
+	route          bus.Route
+	handler        bus.MessageHandler
+	subscription   *mockBusSubscription
+	notifyErr      error
+	notifyCalls    atomic.Int32
+	subscribeCalls atomic.Int32
 }
 
 func (b *mockMessageBus) Notify(msg bus.Message) error {
@@ -109,6 +110,7 @@ func (b *mockMessageBus) NotifyWithContext(ctx context.Context, msg bus.Message)
 }
 
 func (b *mockMessageBus) Subscribe(route bus.Route, handler bus.MessageHandler) (bus.Subscription, error) {
+	b.subscribeCalls.Add(1)
 	b.route = route
 	b.handler = handler
 	if b.subscription == nil {
@@ -722,6 +724,174 @@ func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 		return messageBus.subscription != nil && messageBus.subscription.unsubscribed.Load()
 	}, time.Second, 10*time.Millisecond)
 	require.NotNil(t, messageBus.subscription)
+	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
+}
+
+func TestSubscribeSharesBusSubscriptionPerSpace(t *testing.T) {
+	messageBus := &mockMessageBus{}
+	storeID := uuid.New()
+	node := NewNode(storeID, &mockStore{}, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	bidi1 := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "seg-a",
+	}})
+	bidi1.encodedCh = make(chan any, 2)
+	node.Handle(ctx1, bidi1)
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	bidi2 := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "seg-b",
+	}})
+	bidi2.encodedCh = make(chan any, 2)
+	node.Handle(ctx2, bidi2)
+
+	require.Eventually(t, func() bool {
+		return messageBus.subscribeCalls.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.NotNil(t, messageBus.handler)
+
+	require.NoError(t, messageBus.handler(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:        "s",
+			Segment:      "seg-a",
+			LastSequence: 1,
+		},
+	}))
+	require.NoError(t, messageBus.handler(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:        "s",
+			Segment:      "seg-b",
+			LastSequence: 2,
+		},
+	}))
+
+	select {
+	case msg := <-bidi1.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok)
+		assert.Equal(t, "seg-a", status.Segment)
+		assert.Equal(t, uint64(1), status.LastSequence)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first subscription update")
+	}
+
+	select {
+	case msg := <-bidi2.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok)
+		assert.Equal(t, "seg-b", status.Segment)
+		assert.Equal(t, uint64(2), status.LastSequence)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for second subscription update")
+	}
+
+	cancel1()
+	waitForClosed(t, bidi1)
+	assert.False(t, messageBus.subscription.unsubscribed.Load())
+
+	cancel2()
+	waitForClosed(t, bidi2)
+	require.Eventually(t, func() bool {
+		return messageBus.subscription.unsubscribed.Load()
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
+}
+
+func TestSubscribeRoutesNotificationsToWildcardAndExactSubscribers(t *testing.T) {
+	messageBus := &mockMessageBus{}
+	storeID := uuid.New()
+	node := NewNode(storeID, &mockStore{}, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
+
+	ctxExact, cancelExact := context.WithCancel(context.Background())
+	bidiExact := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "seg-a",
+	}})
+	bidiExact.encodedCh = make(chan any, 2)
+	node.Handle(ctxExact, bidiExact)
+
+	ctxWildcard, cancelWildcard := context.WithCancel(context.Background())
+	bidiWildcard := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "*",
+	}})
+	bidiWildcard.encodedCh = make(chan any, 4)
+	node.Handle(ctxWildcard, bidiWildcard)
+
+	require.Eventually(t, func() bool {
+		return messageBus.subscribeCalls.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.NotNil(t, messageBus.handler)
+
+	require.NoError(t, messageBus.handler(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:        "s",
+			Segment:      "seg-a",
+			LastSequence: 1,
+		},
+	}))
+	require.NoError(t, messageBus.handler(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:        "s",
+			Segment:      "seg-b",
+			LastSequence: 2,
+		},
+	}))
+
+	select {
+	case msg := <-bidiExact.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok)
+		assert.Equal(t, "seg-a", status.Segment)
+		assert.Equal(t, uint64(1), status.LastSequence)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for exact-segment subscription update")
+	}
+
+	select {
+	case msg := <-bidiWildcard.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok)
+		assert.Equal(t, "seg-a", status.Segment)
+		assert.Equal(t, uint64(1), status.LastSequence)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for wildcard subscription first update")
+	}
+
+	select {
+	case msg := <-bidiWildcard.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok)
+		assert.Equal(t, "seg-b", status.Segment)
+		assert.Equal(t, uint64(2), status.LastSequence)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for wildcard subscription second update")
+	}
+
+	select {
+	case msg := <-bidiExact.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok)
+		t.Fatalf("exact subscriber should not receive non-matching segment update: %+v", status)
+	default:
+	}
+
+	cancelExact()
+	waitForClosed(t, bidiExact)
+	assert.False(t, messageBus.subscription.unsubscribed.Load())
+
+	cancelWildcard()
+	waitForClosed(t, bidiWildcard)
+	require.Eventually(t, func() bool {
+		return messageBus.subscription.unsubscribed.Load()
+	}, time.Second, 10*time.Millisecond)
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
