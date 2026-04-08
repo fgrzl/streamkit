@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1061,18 +1063,124 @@ func isNotFoundError(err error) bool {
 }
 
 func isRetryableError(err error) bool {
+	retryable, _ := classifyAzureError(err)
+	return retryable
+}
+
+func classifyAzureError(err error) (retryable bool, reason string) {
 	if err == nil {
+		return false, "none"
+	}
+	if errors.Is(err, context.Canceled) {
+		return false, "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false, "deadline_exceeded"
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return false, "network_closed"
+	}
+
+	var azureErr *client.AzureError
+	if errors.As(err, &azureErr) && azureErr != nil {
+		return classifyAzureHTTPStatus(azureErr.StatusCode)
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return true, "network_timeout"
+		}
+		return true, "network"
+	}
+
+	if status, ok := extractHTTPStatusCode(err.Error()); ok {
+		return classifyAzureHTTPStatus(status)
+	}
+
+	return false, "other"
+}
+
+func classifyAzureHTTPStatus(status int) (retryable bool, reason string) {
+	switch status {
+	case 408:
+		return true, "http_408"
+	case 429:
+		return true, "http_429"
+	case 500:
+		return true, "http_500"
+	case 502:
+		return true, "http_502"
+	case 503:
+		return true, "http_503"
+	case 504:
+		return true, "http_504"
+	case 400:
+		return false, "http_400"
+	case 401:
+		return false, "http_401"
+	case 403:
+		return false, "http_403"
+	case 404:
+		return false, "http_404"
+	case 409:
+		return false, "http_409"
+	case 410:
+		return false, "http_410"
+	default:
+		if status >= 400 && status < 500 {
+			return false, fmt.Sprintf("http_%d", status)
+		}
+		if status >= 500 && status < 600 {
+			return false, fmt.Sprintf("http_%d", status)
+		}
+		return false, "other"
+	}
+}
+
+func extractHTTPStatusCode(message string) (int, bool) {
+	msg := strings.ToLower(strings.TrimSpace(message))
+	if len(msg) >= 3 && isThreeDigitStatus(msg[:3]) {
+		status, err := strconv.Atoi(msg[:3])
+		if err == nil {
+			return status, true
+		}
+	}
+
+	for _, marker := range []string{"status=", "status "} {
+		idx := strings.Index(msg, marker)
+		if idx == -1 {
+			continue
+		}
+		start := idx + len(marker)
+		for start < len(msg) && msg[start] == ' ' {
+			start++
+		}
+		end := start
+		for end < len(msg) && msg[end] >= '0' && msg[end] <= '9' {
+			end++
+		}
+		if end-start == 3 && isThreeDigitStatus(msg[start:end]) {
+			status, err := strconv.Atoi(msg[start:end])
+			if err == nil {
+				return status, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+func isThreeDigitStatus(value string) bool {
+	if len(value) != 3 {
 		return false
 	}
-	// Check for transient errors based on error messages
-	errStr := err.Error()
-	return strings.Contains(errStr, "ServiceUnavailable") ||
-		strings.Contains(errStr, "429") ||
-		strings.Contains(errStr, "500") ||
-		strings.Contains(errStr, "502") ||
-		strings.Contains(errStr, "503") ||
-		strings.Contains(errStr, "504") ||
-		strings.Contains(errStr, "TooManyRequests")
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeSnappyEntryEntity(value []byte) (*api.Entry, error) {
