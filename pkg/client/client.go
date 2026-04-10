@@ -52,6 +52,7 @@ var (
 	subscriptionHeartbeatTimeout  = time.Duration(0)
 	errSubscriptionHeartbeatLost  = errors.New("subscription heartbeat lost")
 	errSubscriptionReaderStopped  = errors.New("subscription stream reader stopped unexpectedly")
+	errInvalidConsumeEntry        = errors.New("invalid consume entry payload")
 )
 
 // ClientFactory defines how to create new Client instances.
@@ -382,7 +383,7 @@ type consumeEnumerator struct {
 	args      api.Routeable // ConsumeSegment or ConsumeSpace request
 	ctx       context.Context
 	cancel    context.CancelFunc
-	innerEnum enumerators.Enumerator[*Entry]
+	innerEnum enumerators.Enumerator[api.Entry]
 	current   *Entry
 	err       error
 }
@@ -837,7 +838,7 @@ func (e *consumeEnumerator) MoveNext() bool {
 				appendClientLogFields(routeLogFields(e.storeID, e.args), "err", err)...)
 			return false
 		}
-		e.innerEnum = api.NewStreamEnumerator[*Entry](bidi)
+		e.innerEnum = api.NewStreamEnumerator[api.Entry](bidi)
 	}
 
 	start := time.Now()
@@ -860,8 +861,15 @@ func (e *consumeEnumerator) MoveNext() bool {
 		e.innerEnum = nil
 		return false
 	}
+	if !isValidConsumeEntry(&entry) {
+		e.err = errInvalidConsumeEntry
+		e.current = nil
+		e.innerEnum.Dispose()
+		e.innerEnum = nil
+		return false
+	}
 
-	e.current = entry
+	e.current = &entry
 	e.err = nil
 	if e.client != nil && e.client.metrics != nil {
 		e.client.metrics.RecordConsumeLatency(entry.Space, entry.Segment, time.Since(start))
@@ -908,6 +916,22 @@ func (e *consumeEnumerator) Err() error {
 		return e.innerEnum.Err()
 	}
 	return nil
+}
+
+func isValidConsumeEntry(entry *Entry) bool {
+	if entry == nil {
+		return false
+	}
+	if entry.Space == "" || entry.Segment == "" {
+		return false
+	}
+	if entry.Sequence == 0 || entry.Timestamp == 0 {
+		return false
+	}
+	if entry.Payload == nil {
+		return false
+	}
+	return true
 }
 
 func newConsumeEnumerator(client *client, ctx context.Context, storeID uuid.UUID, args api.Routeable) enumerators.Enumerator[*Entry] {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1602,17 +1603,17 @@ func TestConsumeSegmentStopsAfterDisconnectWithoutRetry(t *testing.T) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 			seq := 0
 			stream.decodeFn = func(m any) error {
-				switch v := m.(type) {
-				case *api.Entry:
+				if v, ok := m.(*api.Entry); ok {
 					seq++
 					if seq == 1 {
-						*v = api.Entry{Sequence: 1}
-						return nil
-					}
-				case **api.Entry:
-					seq++
-					if seq == 1 {
-						*v = &api.Entry{Sequence: 1}
+						*v = api.Entry{
+							Space:     "space",
+							Segment:   "segment",
+							Sequence:  1,
+							Timestamp: 1,
+							TRX:       api.TRX{ID: uuid.New(), Number: 1},
+							Payload:   []byte("payload"),
+						}
 						return nil
 					}
 				}
@@ -1637,6 +1638,52 @@ func TestConsumeSegmentStopsAfterDisconnectWithoutRetry(t *testing.T) {
 	assert.ErrorContains(t, enum.Err(), "simulated disconnect")
 	assert.Equal(t, int32(1), calls.Load(), "consume streams should not reopen after a disconnect")
 	assert.Equal(t, uint64(7), args.MinSequence, "caller offsets should remain unchanged after a disconnect")
+}
+
+func TestConsumeReturnsNoEntryWhenStreamEndsImmediately(t *testing.T) {
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(any) error {
+				return io.EOF
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	enum := c.Consume(context.Background(), uuid.New(), &Consume{
+		Offsets: map[string]lexkey.LexKey{"tenants": nil},
+	})
+	defer enum.Dispose()
+
+	assert.False(t, enum.MoveNext())
+	require.NoError(t, enum.Err())
+}
+
+func TestConsumeRejectsZeroValueEntry(t *testing.T) {
+	provider := &mockProvider{
+		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
+			stream := &mockBidiStream{closedChan: make(chan struct{})}
+			stream.decodeFn = func(m any) error {
+				if entry, ok := m.(*api.Entry); ok {
+					*entry = api.Entry{}
+					return nil
+				}
+				return errors.New("unexpected decode target")
+			}
+			return stream, nil
+		},
+	}
+
+	c := NewClient(provider)
+	enum := c.Consume(context.Background(), uuid.New(), &Consume{
+		Offsets: map[string]lexkey.LexKey{"tenants": nil},
+	})
+	defer enum.Dispose()
+
+	assert.False(t, enum.MoveNext())
+	require.ErrorIs(t, enum.Err(), errInvalidConsumeEntry)
 }
 
 func TestConsumeDoesNotMutateCallerOffsetsOnDisconnect(t *testing.T) {
