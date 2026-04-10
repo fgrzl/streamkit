@@ -1010,7 +1010,13 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		offerTimeout = defaultStreamRecvOfferTimeout
 	}
 
-	for attempt := int64(1); attempt <= threshold; attempt++ {
+	for consecutiveTimeouts := int64(0); ; consecutiveTimeouts++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		queueDepth := m.snapshotStreamRecvDepth(bidi)
 		blockedAt := time.Now()
 		if bidi.OfferWithin(msg.Payload, offerTimeout) {
@@ -1021,17 +1027,18 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		blockedFor := time.Since(blockedAt)
 		m.recordStreamRecvBlocked(blockedFor)
 		m.recordStreamRecvTimeout()
+		consecutiveTimeouts++
 
 		if bidi.IsClosed() {
 			slog.DebugContext(ctx, "muxer: dropping message for closed stream after waiting", m.msgLogFields(msg)...)
 			return
 		}
 
-		if attempt < threshold {
+		if consecutiveTimeouts <= threshold {
 			slog.DebugContext(ctx, "muxer: stream receive buffer saturated; retrying",
 				m.msgLogFields(msg,
-					slog.Int64("saturation_attempt", attempt),
-					slog.Int64("saturation_limit", threshold),
+					slog.Int64("consecutive_timeouts", consecutiveTimeouts),
+					slog.Int64("saturation_threshold", threshold),
 					slog.Duration("offer_timeout", offerTimeout),
 					slog.Duration("blocked_for", blockedFor),
 					slog.Int64("queue_depth", queueDepth))...)
@@ -1041,8 +1048,8 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		slog.WarnContext(ctx, "muxer: stream receive buffer overloaded; closing channel",
 			m.msgLogFields(msg,
 				slog.String("error_type", classifyTransportError(ErrStreamOverloaded)),
-				slog.Int64("saturation_attempts", attempt),
-				slog.Int64("saturation_limit", threshold),
+				slog.Int64("consecutive_timeouts", consecutiveTimeouts),
+				slog.Int64("saturation_threshold", threshold),
 				slog.Duration("offer_timeout", offerTimeout),
 				slog.Duration("blocked_for", blockedFor))...)
 		m.recordStreamRecvOverload()
