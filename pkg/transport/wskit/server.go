@@ -16,15 +16,17 @@ import (
 
 // ConfigureWebSocketServer configures a WebSocket endpoint on the provided router
 // that integrates with the node manager for handling streaming requests.
-func ConfigureWebSocketServer(router *mux.Router, manager server.NodeManager) {
+func ConfigureWebSocketServer(router *mux.Router, manager server.NodeManager, opts ...MuxerOption) {
 	server := &webSocketServer{
-		manager: manager,
+		manager:      manager,
+		muxerOptions: append([]MuxerOption(nil), opts...),
 	}
 	router.GET("/streamz", server.connect)
 }
 
 type webSocketServer struct {
-	manager server.NodeManager
+	manager      server.NodeManager
+	muxerOptions []MuxerOption
 }
 
 func (s *webSocketServer) connect(c mux.RouteContext) {
@@ -36,20 +38,22 @@ func (s *webSocketServer) connect(c mux.RouteContext) {
 	}
 
 	handler := &webSocketHandler{
-		ctx:     c,
-		session: session,
-		manager: s.manager,
+		ctx:          c,
+		session:      session,
+		manager:      s.manager,
+		muxerOptions: append([]MuxerOption(nil), s.muxerOptions...),
 	}
 
 	websocket.Handler(handler.handle).ServeHTTP(c.Response(), c.Request())
 }
 
 type webSocketHandler struct {
-	ctx     context.Context
-	session MuxerSession
-	manager server.NodeManager
+	ctx          context.Context
+	session      MuxerSession
+	manager      server.NodeManager
+	muxerOptions []MuxerOption
 }
 
 func (h *webSocketHandler) handle(conn *websocket.Conn) {
-	NewServerWebSocketMuxer(h.ctx, h.session, h.manager, conn)
+	NewServerWebSocketMuxer(h.ctx, h.session, h.manager, conn, h.muxerOptions...)
 }

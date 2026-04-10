@@ -26,6 +26,11 @@ type WSKitQueueMetrics struct {
 	writeQueueBlockTime   metric.Float64Histogram
 	writeQueueFallbacks   metric.Int64Counter
 	writeQueueSaturations metric.Int64Counter
+	streamRecvDepth       metric.Int64Gauge
+	streamRecvBlocked     metric.Int64Counter
+	streamRecvBlockTime   metric.Float64Histogram
+	streamRecvTimeouts    metric.Int64Counter
+	streamRecvOverloads   metric.Int64Counter
 }
 
 // NewWSKitQueueMetrics returns queue pressure instruments for websocket muxers.
@@ -56,12 +61,42 @@ func NewWSKitQueueMetrics() *WSKitQueueMetrics {
 		metric.WithDescription("Number of sustained websocket muxer queue saturation events"),
 		metric.WithUnit("1"),
 	)
+	streamRecvDepth, _ := meter.Int64Gauge(
+		"streamkit.transport.wskit.stream.recv.queue.depth",
+		metric.WithDescription("Current websocket muxer stream receive queue depth"),
+		metric.WithUnit("1"),
+	)
+	streamRecvBlocked, _ := meter.Int64Counter(
+		"streamkit.transport.wskit.stream.recv.blocked.total",
+		metric.WithDescription("Number of websocket muxer stream receives that waited for headroom"),
+		metric.WithUnit("1"),
+	)
+	streamRecvBlockTime, _ := meter.Float64Histogram(
+		"streamkit.transport.wskit.stream.recv.blocked.duration",
+		metric.WithDescription("Time spent waiting for websocket muxer stream receive headroom"),
+		metric.WithUnit("ms"),
+	)
+	streamRecvTimeouts, _ := meter.Int64Counter(
+		"streamkit.transport.wskit.stream.recv.timeout.total",
+		metric.WithDescription("Number of websocket muxer stream receive attempts that timed out"),
+		metric.WithUnit("1"),
+	)
+	streamRecvOverloads, _ := meter.Int64Counter(
+		"streamkit.transport.wskit.stream.recv.overload.total",
+		metric.WithDescription("Number of websocket muxer stream receive overload closures"),
+		metric.WithUnit("1"),
+	)
 	return &WSKitQueueMetrics{
 		writeQueueDepth:       writeQueueDepth,
 		writeQueueBlocked:     writeQueueBlocked,
 		writeQueueBlockTime:   writeQueueBlockTime,
 		writeQueueFallbacks:   writeQueueFallbacks,
 		writeQueueSaturations: writeQueueSaturations,
+		streamRecvDepth:       streamRecvDepth,
+		streamRecvBlocked:     streamRecvBlocked,
+		streamRecvBlockTime:   streamRecvBlockTime,
+		streamRecvTimeouts:    streamRecvTimeouts,
+		streamRecvOverloads:   streamRecvOverloads,
 	}
 }
 
@@ -112,6 +147,58 @@ func (m *WSKitQueueMetrics) RecordWriteQueueSaturation(ctx context.Context, role
 		return
 	}
 	m.writeQueueSaturations.Add(metricContext(ctx), 1, metric.WithAttributes(
+		WithTransportType("websocket"),
+		WithMuxerRole(role),
+	))
+}
+
+// RecordStreamRecvDepth records the current websocket muxer stream receive queue depth.
+func (m *WSKitQueueMetrics) RecordStreamRecvDepth(ctx context.Context, role string, depth int64) {
+	if m == nil || m.streamRecvDepth == nil {
+		return
+	}
+	m.streamRecvDepth.Record(metricContext(ctx), depth, metric.WithAttributes(
+		WithTransportType("websocket"),
+		WithMuxerRole(role),
+	))
+}
+
+// RecordStreamRecvBlocked increments the blocked-receive counter and duration histogram.
+func (m *WSKitQueueMetrics) RecordStreamRecvBlocked(ctx context.Context, role string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	if m.streamRecvBlocked != nil {
+		m.streamRecvBlocked.Add(metricContext(ctx), 1, metric.WithAttributes(
+			WithTransportType("websocket"),
+			WithMuxerRole(role),
+		))
+	}
+	if m.streamRecvBlockTime != nil {
+		m.streamRecvBlockTime.Record(metricContext(ctx), float64(duration.Milliseconds()), metric.WithAttributes(
+			WithTransportType("websocket"),
+			WithMuxerRole(role),
+		))
+	}
+}
+
+// RecordStreamRecvTimeout increments the websocket stream receive timeout counter.
+func (m *WSKitQueueMetrics) RecordStreamRecvTimeout(ctx context.Context, role string) {
+	if m == nil || m.streamRecvTimeouts == nil {
+		return
+	}
+	m.streamRecvTimeouts.Add(metricContext(ctx), 1, metric.WithAttributes(
+		WithTransportType("websocket"),
+		WithMuxerRole(role),
+	))
+}
+
+// RecordStreamRecvOverload increments the websocket stream receive overload counter.
+func (m *WSKitQueueMetrics) RecordStreamRecvOverload(ctx context.Context, role string) {
+	if m == nil || m.streamRecvOverloads == nil {
+		return
+	}
+	m.streamRecvOverloads.Add(metricContext(ctx), 1, metric.WithAttributes(
 		WithTransportType("websocket"),
 		WithMuxerRole(role),
 	))

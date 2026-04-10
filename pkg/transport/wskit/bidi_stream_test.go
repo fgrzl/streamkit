@@ -23,6 +23,11 @@ func newCapturingStream() (*MuxerBidiStream, *[]byte) {
 	return s, &last
 }
 
+func TestNewMuxerBidiStreamUsesConfiguredQueueSize(t *testing.T) {
+	s := NewMuxerBidiStream(func([]byte) error { return nil }, nil, 7)
+	assert.Equal(t, 7, cap(s.recvChan))
+}
+
 func TestEncodeUsesEncoder(t *testing.T) {
 	t.Run("Given a stream with a capturing encoder", func(t *testing.T) {
 		s, got := newCapturingStream()

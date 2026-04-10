@@ -40,10 +40,15 @@ type MuxerBidiStream struct {
 func NewMuxerBidiStream(
 	encode func([]byte) error,
 	onClose func(),
+	queueSize ...int,
 ) *MuxerBidiStream {
+	capacity := defaultStreamRecvQueueSize
+	if len(queueSize) > 0 && queueSize[0] > 0 {
+		capacity = queueSize[0]
+	}
 	s := &MuxerBidiStream{
 		encode:   encode,
-		recvChan: make(chan any, defaultStreamRecvQueueSize),
+		recvChan: make(chan any, capacity),
 		closed:   make(chan struct{}),
 		onClose:  onClose,
 	}

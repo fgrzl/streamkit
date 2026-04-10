@@ -79,7 +79,7 @@ type WebSocketBidiStreamProvider struct {
 //
 //	provider := wskit.NewBidiStreamProvider(addr, fetchJWT).(*wskit.WebSocketBidiStreamProvider)
 //	provider.RetryAuthFailures = true
-func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.BidiStreamProvider {
+func NewBidiStreamProvider(addr string, fetchJWT func() (string, error), opts ...MuxerOption) api.BidiStreamProvider {
 
 	// normalize address: ensure it ends with /streamz and avoid duplicate slashes
 	// trim any trailing slashes, then append the segment
@@ -97,7 +97,7 @@ func NewBidiStreamProvider(addr string, fetchJWT func() (string, error)) api.Bid
 	}
 	// default muxer factory uses real client muxer
 	p.newClientMuxer = func(ctx context.Context, session MuxerSession, conn *websocket.Conn) providerMuxer {
-		return NewClientWebSocketMuxer(ctx, session, conn)
+		return NewClientWebSocketMuxer(ctx, session, conn, opts...)
 	}
 	p.reconnectCtx, p.reconnectCancel = context.WithCancel(context.Background())
 	return p

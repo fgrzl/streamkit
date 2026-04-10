@@ -186,6 +186,19 @@ func TestShouldRejectOfferAfterClose(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestMuxerReceivePressureOptionsOverrideDefaults(t *testing.T) {
+	m := &WebSocketMuxer{}
+	applyMuxerOptions(m,
+		WithStreamRecvQueueSize(9),
+		WithStreamRecvOfferTimeout(5*time.Millisecond),
+		WithStreamRecvSaturationThreshold(4),
+	)
+
+	assert.Equal(t, 9, m.streamRecvQueueSize)
+	assert.Equal(t, 5*time.Millisecond, m.streamRecvOfferTimeout)
+	assert.Equal(t, int64(4), m.streamRecvSaturationThreshold)
+}
+
 func TestValidateInboundMessageRejectsOversizedPayload(t *testing.T) {
 	m := &WebSocketMuxer{maxMessagePayloadBytes: 4}
 
@@ -546,14 +559,16 @@ func TestShouldReleaseStreamOnPeerCloseWithoutDroppingBufferedMessages(t *testin
 	assert.Equal(t, io.EOF, bidi.Decode(&value))
 }
 
-func TestDeliverToStreamClosesOnlyOverloadedChannel(t *testing.T) {
+func TestDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
 	sent := make(chan MuxerMsg, 4)
 	m := &WebSocketMuxer{
-		Context:    context.Background(),
-		name:       "client",
-		channels:   make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones: make(map[uuid.UUID]error),
-		done:       make(chan struct{}),
+		Context:                       context.Background(),
+		name:                          "client",
+		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:                    make(map[uuid.UUID]error),
+		done:                          make(chan struct{}),
+		streamRecvOfferTimeout:        5 * time.Millisecond,
+		streamRecvSaturationThreshold: 2,
 		sendJSON: func(_ *websocket.Conn, v interface{}) error {
 			if msg, ok := v.(*MuxerMsg); ok {
 				sent <- *msg
@@ -579,8 +594,11 @@ func TestDeliverToStreamClosesOnlyOverloadedChannel(t *testing.T) {
 		Payload:     []byte(`"overflow"`),
 	})
 
-	require.Eventually(t, slow.IsClosed, time.Second, 10*time.Millisecond)
+	require.True(t, slow.IsClosed())
 	assert.ErrorIs(t, slow.Decode(new(string)), ErrStreamOverloaded)
+	assert.GreaterOrEqual(t, m.StreamRecvBlocks(), int64(2))
+	assert.GreaterOrEqual(t, m.StreamRecvTimeouts(), int64(2))
+	assert.Equal(t, int64(1), m.StreamRecvOverloads())
 
 	m.deliverToStream(fast, context.Background(), &MuxerMsg{
 		ControlType: ControlTypeData,
@@ -613,12 +631,14 @@ func TestDeliverToStreamClosesOnlyOverloadedChannel(t *testing.T) {
 
 func TestDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 	m := &WebSocketMuxer{
-		Context:    context.Background(),
-		name:       "client",
-		channels:   make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones: make(map[uuid.UUID]error),
-		done:       make(chan struct{}),
-		sendJSON:   func(_ *websocket.Conn, _ interface{}) error { return nil },
+		Context:                       context.Background(),
+		name:                          "client",
+		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:                    make(map[uuid.UUID]error),
+		done:                          make(chan struct{}),
+		streamRecvOfferTimeout:        5 * time.Millisecond,
+		streamRecvSaturationThreshold: 2,
+		sendJSON:                      func(_ *websocket.Conn, _ interface{}) error { return nil },
 	}
 
 	storeID := uuid.New()
@@ -657,6 +677,7 @@ func TestDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 	}
 
 	assert.False(t, slow.IsClosed())
+	assert.GreaterOrEqual(t, m.StreamRecvTimeouts(), int64(1))
 	var slowValue string
 	require.NoError(t, slow.Decode(&slowValue))
 	assert.Equal(t, "recovered", slowValue)
