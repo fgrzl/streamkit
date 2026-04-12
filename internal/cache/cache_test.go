@@ -133,14 +133,19 @@ func TestShouldRecoverCleanupLoopFromPanic(t *testing.T) {
 		}
 	})
 
-	c.Set("k-panic", "v")
+	// Insert a malformed entry so only the cleanup loop can remove it.
+	c.store.Store("k-panic", "not-a-cache-item")
 
-	// Act + Assert: cleanup loop should recover and continue expiring entries.
+	// Act + Assert: cleanup loop should recover and continue ticking.
 	require.Eventually(t, func() bool {
-		_, ok := c.Get("k-panic")
+		return ticks.Load() >= 2
+	}, time.Second, 10*time.Millisecond)
+
+	// Cleanup should keep running after restart and remove malformed entries.
+	require.Eventually(t, func() bool {
+		_, ok := c.store.Load("k-panic")
 		return !ok
 	}, time.Second, 10*time.Millisecond)
-	require.GreaterOrEqual(t, ticks.Load(), int32(2))
 	assert.Equal(t, int32(1), c.CleanupPanicCount())
 }
 
