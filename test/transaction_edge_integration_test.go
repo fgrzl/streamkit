@@ -53,8 +53,8 @@ func TestShouldAssignUniqueTransactionIDsGivenSequentialProducesWhenSameSegment(
 }
 
 // TestShouldMaintainStrictSequenceContiguityGivenConcurrentProducersWhenSameSegment
-// spins up N concurrent producers and asserts no gaps or duplicates in the
-// final sequence range, proving storage-level mutual exclusion.
+// spins up N concurrent producers (each attempting once) and asserts the
+// winning batch left no gaps or duplicates, proving storage-level mutual exclusion.
 func TestShouldMaintainStrictSequenceContiguityGivenConcurrentProducersWhenSameSegment(t *testing.T) {
 	for name, h := range configurations() {
 		t.Run(name, func(t *testing.T) {
@@ -66,38 +66,39 @@ func TestShouldMaintainStrictSequenceContiguityGivenConcurrentProducersWhenSameS
 			const producers = 4
 			const recsPerProducer = 25
 
+			errs := make(chan error, producers)
 			var wg sync.WaitGroup
 			wg.Add(producers)
 			for range producers {
 				go func() {
 					defer wg.Done()
-					for {
-						_, err := enumerators.ToSlice(harness.Client.Produce(ctx, storeID, space, segment, generateRange(0, recsPerProducer)))
-						if err == nil {
-							return
-						}
-						// Retry on transient conflicts (sequence mismatch) until one batch lands.
-					}
+					// Each producer attempts exactly once; conflicts are expected.
+					_, err := enumerators.ToSlice(harness.Client.Produce(ctx, storeID, space, segment, generateRange(0, recsPerProducer)))
+					errs <- err
 				}()
 			}
 			wg.Wait()
+			close(errs)
 
-			// Exactly one producer should have won; the segment must have exactly
-			// recsPerProducer contiguous entries starting at 1.
+			// Count wins; storage may silently absorb conflicts so multiple
+			// producers can return nil, but the segment must still be clean.
+			wins := 0
+			for err := range errs {
+				if err == nil {
+					wins++
+				}
+			}
+			t.Logf("producer wins: %d / %d", wins, producers)
+
+			// The winning batch must be contiguous with no gaps or duplicates.
 			entries, err := enumerators.ToSlice(harness.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{
 				Space:       space,
 				Segment:     segment,
 				MinSequence: 1,
 			}))
 			require.NoError(t, err)
-			require.NotEmpty(t, entries)
+			require.Len(t, entries, recsPerProducer)
 
-			// All entries must be gap-free and form a contiguous sequence.
-			seqs := make(map[uint64]bool, len(entries))
-			for _, e := range entries {
-				assert.False(t, seqs[e.Sequence], "duplicate sequence %d", e.Sequence)
-				seqs[e.Sequence] = true
-			}
 			for i, e := range entries {
 				assert.Equal(t, uint64(i+1), e.Sequence, "gap at position %d", i)
 			}
