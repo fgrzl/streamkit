@@ -32,6 +32,10 @@ type MuxerBidiStream struct {
 	closeErr   error
 	onClose    func()
 	channelID  uuid.UUID
+	routeMu    sync.RWMutex
+	routeOp    string
+	routeSpace string
+	routeSeg   string
 }
 
 // NewMuxerBidiStream creates a new MuxerBidiStream.
@@ -350,4 +354,19 @@ type ErrorMessage struct {
 // SetChannelID attaches a channel ID to the stream for contextual logging.
 func (c *MuxerBidiStream) SetChannelID(id uuid.UUID) {
 	c.channelID = id
+}
+
+// SetRouteDebugDetails attaches stream route identity used by transport logs.
+func (c *MuxerBidiStream) SetRouteDebugDetails(operation, space, segment string) {
+	c.routeMu.Lock()
+	defer c.routeMu.Unlock()
+	c.routeOp = operation
+	c.routeSpace = space
+	c.routeSeg = segment
+}
+
+func (c *MuxerBidiStream) routeDebugDetails() (operation, space, segment string) {
+	c.routeMu.RLock()
+	defer c.routeMu.RUnlock()
+	return c.routeOp, c.routeSpace, c.routeSeg
 }

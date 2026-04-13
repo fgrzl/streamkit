@@ -192,11 +192,13 @@ func TestShouldMuxerReceivePressureOptionsOverrideDefaults(t *testing.T) {
 		WithStreamRecvQueueSize(9),
 		WithStreamRecvOfferTimeout(5*time.Millisecond),
 		WithStreamRecvSaturationThreshold(4),
+		WithStreamRecvSaturationPolicy(StreamRecvSaturationPolicyClose),
 	)
 
 	assert.Equal(t, 9, m.streamRecvQueueSize)
 	assert.Equal(t, 5*time.Millisecond, m.streamRecvOfferTimeout)
 	assert.Equal(t, int64(4), m.streamRecvSaturationThreshold)
+	assert.Equal(t, StreamRecvSaturationPolicyClose, m.streamRecvSaturationPolicy)
 }
 
 func TestShouldValidateInboundMessageRejectsOversizedPayload(t *testing.T) {
@@ -569,6 +571,7 @@ func TestShouldDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
 		done:                          make(chan struct{}),
 		streamRecvOfferTimeout:        5 * time.Millisecond,
 		streamRecvSaturationThreshold: 2,
+		streamRecvSaturationPolicy:    StreamRecvSaturationPolicyClose,
 		sendJSON: func(_ *websocket.Conn, v interface{}) error {
 			if msg, ok := v.(*MuxerMsg); ok {
 				sent <- *msg
@@ -691,6 +694,63 @@ func TestShouldDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 	var fastValue string
 	require.NoError(t, fast.Decode(&fastValue))
 	assert.Equal(t, "ok", fastValue)
+}
+
+func TestShouldDeliverToStreamWaitModeDoesNotCloseOnSustainedBackpressure(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:                       context.Background(),
+		name:                          "client",
+		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:                    make(map[uuid.UUID]error),
+		done:                          make(chan struct{}),
+		streamRecvOfferTimeout:        5 * time.Millisecond,
+		streamRecvSaturationThreshold: 1,
+		streamRecvSaturationPolicy:    StreamRecvSaturationPolicyWait,
+		sendJSON:                      func(_ *websocket.Conn, _ interface{}) error { return nil },
+	}
+
+	storeID := uuid.New()
+	slowID := uuid.New()
+	slow := m.register(context.Background(), storeID, slowID)
+
+	slow.recvChan = make(chan any, 1)
+	require.True(t, slow.Offer([]byte(`"blocked"`)))
+
+	done := make(chan struct{})
+	go func() {
+		m.deliverToStream(slow, context.Background(), &MuxerMsg{
+			ControlType: ControlTypeData,
+			StoreID:     storeID,
+			ChannelID:   slowID,
+			Payload:     []byte(`"recovered"`),
+		})
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("deliverToStream should keep waiting in wait policy under sustained pressure")
+	default:
+	}
+
+	assert.False(t, slow.IsClosed())
+	assert.Equal(t, int64(0), m.StreamRecvOverloads())
+
+	<-slow.recvChan
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("deliverToStream did not resume after wait-policy pressure resolved")
+	}
+
+	assert.False(t, slow.IsClosed())
+	var value string
+	require.NoError(t, slow.Decode(&value))
+	assert.Equal(t, "recovered", value)
+	assert.GreaterOrEqual(t, m.StreamRecvTimeouts(), int64(1))
+	assert.Equal(t, int64(0), m.StreamRecvOverloads())
 }
 
 func TestShouldGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {

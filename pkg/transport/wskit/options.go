@@ -7,6 +7,19 @@ import "time"
 // MuxerOption configures a WebSocketMuxer before it starts processing traffic.
 type MuxerOption func(*WebSocketMuxer)
 
+// StreamRecvSaturationPolicy controls what happens when a logical stream
+// receive queue remains saturated beyond the configured timeout threshold.
+type StreamRecvSaturationPolicy int
+
+const (
+	// StreamRecvSaturationPolicyWait keeps waiting for receive-buffer headroom
+	// and avoids force-closing slow consumers.
+	StreamRecvSaturationPolicyWait StreamRecvSaturationPolicy = iota + 1
+	// StreamRecvSaturationPolicyClose force-closes saturated streams after the
+	// configured timeout threshold has been exceeded.
+	StreamRecvSaturationPolicyClose
+)
+
 // WithStreamRecvQueueSize sets the inbound buffer size for logical streams.
 // Values less than or equal to zero are ignored.
 func WithStreamRecvQueueSize(size int) MuxerOption {
@@ -39,10 +52,31 @@ func WithStreamRecvSaturationThreshold(threshold int64) MuxerOption {
 	}
 }
 
+// WithStreamRecvSaturationPolicy sets the sustained receive-buffer saturation
+// policy for logical streams.
+func WithStreamRecvSaturationPolicy(policy StreamRecvSaturationPolicy) MuxerOption {
+	return func(m *WebSocketMuxer) {
+		if policy == StreamRecvSaturationPolicyWait || policy == StreamRecvSaturationPolicyClose {
+			m.streamRecvSaturationPolicy = policy
+		}
+	}
+}
+
 func applyMuxerOptions(m *WebSocketMuxer, opts ...MuxerOption) {
 	for _, opt := range opts {
 		if opt != nil {
 			opt(m)
 		}
+	}
+}
+
+func streamRecvSaturationPolicyString(policy StreamRecvSaturationPolicy) string {
+	switch policy {
+	case StreamRecvSaturationPolicyWait:
+		return "wait"
+	case StreamRecvSaturationPolicyClose:
+		return "close"
+	default:
+		return "unknown"
 	}
 }

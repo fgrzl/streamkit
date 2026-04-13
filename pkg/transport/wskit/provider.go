@@ -164,6 +164,10 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 		}
 		channelID := uuid.New()
 		bidi := muxer.RegisterWithContext(ctx, storeID, channelID)
+		if wsBidi, ok := bidi.(*MuxerBidiStream); ok {
+			op, space, segment := routeableStreamDetails(msg)
+			wsBidi.SetRouteDebugDetails(op, space, segment)
+		}
 
 		// we use a polymorphic envelope so that we can
 		// unmarshal server side and route the msg
@@ -233,6 +237,42 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 	err := errors.New("failed to call stream")
 	telemetry.RecordError(span, err)
 	return nil, err
+}
+
+func routeableStreamDetails(msg api.Routeable) (operation, space, segment string) {
+	if msg == nil {
+		return "", "", ""
+	}
+
+	operation = shortDiscriminator(msg.GetDiscriminator())
+
+	switch typed := msg.(type) {
+	case *api.ConsumeSegment:
+		return operation, typed.Space, typed.Segment
+	case *api.ConsumeSpace:
+		return operation, typed.Space, "*"
+	case *api.Peek:
+		return operation, typed.Space, typed.Segment
+	case *api.Produce:
+		return operation, typed.Space, typed.Segment
+	case *api.SubscribeToSegmentStatus:
+		return operation, typed.Space, typed.Segment
+	case *api.GetSegments:
+		return operation, typed.Space, ""
+	default:
+		return operation, "", ""
+	}
+}
+
+func shortDiscriminator(discriminator string) string {
+	if discriminator == "" {
+		return ""
+	}
+	idx := strings.LastIndex(discriminator, "/")
+	if idx >= 0 && idx < len(discriminator)-1 {
+		return discriminator[idx+1:]
+	}
+	return discriminator
 }
 
 // randInt63n returns a thread-safe random int64 in [0,n)

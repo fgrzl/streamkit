@@ -284,6 +284,47 @@ func TestShouldGetOrCreateMuxerInvokesOnDialFailureForInlineErrors(t *testing.T)
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestShouldExtractRouteableStreamDetails(t *testing.T) {
+	tests := []struct {
+		name    string
+		msg     api.Routeable
+		op      string
+		space   string
+		segment string
+	}{
+		{
+			name:    "consume segment",
+			msg:     &api.ConsumeSegment{Space: "orders", Segment: "s0"},
+			op:      "consume_segment",
+			space:   "orders",
+			segment: "s0",
+		},
+		{
+			name:    "subscribe segment status",
+			msg:     &api.SubscribeToSegmentStatus{Space: "orders", Segment: "*"},
+			op:      "subscribe_to_segment_status",
+			space:   "orders",
+			segment: "*",
+		},
+		{
+			name:    "get status",
+			msg:     &api.GetStatus{},
+			op:      "get_status",
+			space:   "",
+			segment: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op, space, segment := routeableStreamDetails(tt.msg)
+			assert.Equal(t, tt.op, op)
+			assert.Equal(t, tt.space, space)
+			assert.Equal(t, tt.segment, segment)
+		})
+	}
+}
+
 // fakeMuxer implements providerMuxer for tests
 type fakeMuxer struct {
 	pingFn     func() bool

@@ -112,6 +112,7 @@ type WebSocketMuxer struct {
 	streamRecvQueueSize           int
 	streamRecvOfferTimeout        time.Duration
 	streamRecvSaturationThreshold int64
+	streamRecvSaturationPolicy    StreamRecvSaturationPolicy
 	logger                        *slog.Logger
 	rng                           *rand.Rand
 	// JSON send/receive hooks (set to websocket.JSON.Send/Receive by default).
@@ -140,6 +141,7 @@ const (
 	defaultStreamRecvQueueSize                 = 1024
 	defaultStreamRecvOfferTimeout              = 100 * time.Millisecond
 	defaultStreamRecvSaturationThreshold       = 3
+	defaultStreamRecvSaturationPolicy          = StreamRecvSaturationPolicyWait
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -164,6 +166,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		streamRecvQueueSize:           defaultStreamRecvQueueSize,
 		streamRecvOfferTimeout:        defaultStreamRecvOfferTimeout,
 		streamRecvSaturationThreshold: defaultStreamRecvSaturationThreshold,
+		streamRecvSaturationPolicy:    defaultStreamRecvSaturationPolicy,
 		lastPongUnix:                  timestamp.GetTimestamp(),
 		heartbeatStop:                 make(chan struct{}),
 		cancelFunc:                    cancel,
@@ -179,6 +182,9 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	}
 	if m.streamRecvSaturationThreshold <= 0 {
 		m.streamRecvSaturationThreshold = defaultStreamRecvSaturationThreshold
+	}
+	if m.streamRecvSaturationPolicy != StreamRecvSaturationPolicyWait && m.streamRecvSaturationPolicy != StreamRecvSaturationPolicyClose {
+		m.streamRecvSaturationPolicy = defaultStreamRecvSaturationPolicy
 	}
 
 	// write pump defaults
@@ -227,6 +233,7 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		streamRecvQueueSize:           defaultStreamRecvQueueSize,
 		streamRecvOfferTimeout:        defaultStreamRecvOfferTimeout,
 		streamRecvSaturationThreshold: defaultStreamRecvSaturationThreshold,
+		streamRecvSaturationPolicy:    defaultStreamRecvSaturationPolicy,
 		lastPongUnix:                  timestamp.GetTimestamp(),
 		heartbeatStop:                 make(chan struct{}),
 		cancelFunc:                    cancel,
@@ -242,6 +249,9 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	}
 	if m.streamRecvSaturationThreshold <= 0 {
 		m.streamRecvSaturationThreshold = defaultStreamRecvSaturationThreshold
+	}
+	if m.streamRecvSaturationPolicy != StreamRecvSaturationPolicyWait && m.streamRecvSaturationPolicy != StreamRecvSaturationPolicyClose {
+		m.streamRecvSaturationPolicy = defaultStreamRecvSaturationPolicy
 	}
 	m.Context = cctx
 	m.logger = slog.With(slog.String("muxer", m.name))
@@ -421,6 +431,13 @@ func (m *WebSocketMuxer) streamRecvCloseThreshold() int64 {
 		return m.streamRecvSaturationThreshold
 	}
 	return defaultStreamRecvSaturationThreshold
+}
+
+func (m *WebSocketMuxer) streamRecvSaturationMode() StreamRecvSaturationPolicy {
+	if m.streamRecvSaturationPolicy == StreamRecvSaturationPolicyWait || m.streamRecvSaturationPolicy == StreamRecvSaturationPolicyClose {
+		return m.streamRecvSaturationPolicy
+	}
+	return defaultStreamRecvSaturationPolicy
 }
 
 func (m *WebSocketMuxer) snapshotStreamRecvDepth(bidi *MuxerBidiStream) int64 {
@@ -722,6 +739,24 @@ func (m *WebSocketMuxer) msgLogFields(msg *MuxerMsg, extras ...any) []any {
 	return fields
 }
 
+func (m *WebSocketMuxer) streamRouteLogFields(bidi *MuxerBidiStream) []any {
+	if bidi == nil {
+		return nil
+	}
+	op, space, segment := bidi.routeDebugDetails()
+	fields := make([]any, 0, 3)
+	if op != "" {
+		fields = append(fields, slog.String("stream_operation", op))
+	}
+	if space != "" {
+		fields = append(fields, slog.String("stream_space", space))
+	}
+	if segment != "" {
+		fields = append(fields, slog.String("stream_segment", segment))
+	}
+	return fields
+}
+
 // processMessage handles a single decoded MuxerMsg. It contains the large
 // control-type switch extracted from readLoop so the loop itself stays concise.
 // For data messages, trace context is extracted from the frame and attached to context.
@@ -1002,6 +1037,7 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		return
 	}
 	threshold := m.streamRecvCloseThreshold()
+	mode := m.streamRecvSaturationMode()
 	if threshold < 1 {
 		threshold = 1
 	}
@@ -1035,23 +1071,47 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		}
 
 		if consecutiveTimeouts <= threshold {
+			extras := []any{
+				slog.Int64("consecutive_timeouts", consecutiveTimeouts),
+				slog.Int64("saturation_threshold", threshold),
+				slog.String("saturation_policy", streamRecvSaturationPolicyString(mode)),
+				slog.Duration("offer_timeout", offerTimeout),
+				slog.Duration("blocked_for", blockedFor),
+				slog.Int64("queue_depth", queueDepth),
+			}
+			extras = append(extras, m.streamRouteLogFields(bidi)...)
 			slog.DebugContext(ctx, "muxer: stream receive buffer saturated; retrying",
-				m.msgLogFields(msg,
-					slog.Int64("consecutive_timeouts", consecutiveTimeouts),
-					slog.Int64("saturation_threshold", threshold),
-					slog.Duration("offer_timeout", offerTimeout),
-					slog.Duration("blocked_for", blockedFor),
-					slog.Int64("queue_depth", queueDepth))...)
+				m.msgLogFields(msg, extras...)...)
 			continue
 		}
 
-		slog.WarnContext(ctx, "muxer: stream receive buffer overloaded; closing channel",
-			m.msgLogFields(msg,
-				slog.String("error_type", classifyTransportError(ErrStreamOverloaded)),
+		if mode == StreamRecvSaturationPolicyWait {
+			extras := []any{
 				slog.Int64("consecutive_timeouts", consecutiveTimeouts),
 				slog.Int64("saturation_threshold", threshold),
+				slog.String("saturation_policy", streamRecvSaturationPolicyString(mode)),
 				slog.Duration("offer_timeout", offerTimeout),
-				slog.Duration("blocked_for", blockedFor))...)
+				slog.Duration("blocked_for", blockedFor),
+				slog.Int64("queue_depth", queueDepth),
+			}
+			extras = append(extras, m.streamRouteLogFields(bidi)...)
+			slog.DebugContext(ctx, "muxer: stream receive buffer remains saturated; continuing to wait",
+				m.msgLogFields(msg, extras...)...)
+			continue
+		}
+
+		extras := []any{
+			slog.String("error_type", classifyTransportError(ErrStreamOverloaded)),
+			slog.Int64("consecutive_timeouts", consecutiveTimeouts),
+			slog.Int64("saturation_threshold", threshold),
+			slog.String("saturation_policy", streamRecvSaturationPolicyString(mode)),
+			slog.Duration("offer_timeout", offerTimeout),
+			slog.Duration("blocked_for", blockedFor),
+			slog.Int64("queue_depth", queueDepth),
+		}
+		extras = append(extras, m.streamRouteLogFields(bidi)...)
+		slog.WarnContext(ctx, "muxer: stream receive buffer overloaded; closing channel",
+			m.msgLogFields(msg, extras...)...)
 		m.recordStreamRecvOverload()
 		m.tombstoneStream(msg.ChannelID, ErrStreamOverloaded)
 
