@@ -132,7 +132,7 @@ func TestShouldCreateSegmentStatusFromFirstAndLastEntry(t *testing.T) {
 	assert.Equal(t, int64(1200), status.LastTimestamp)
 }
 
-func TestNormalizeSpaceOffsetRowKeyShouldStripSpacePrefix(t *testing.T) {
+func TestShouldStripSpacePrefixWhenNormalizeSpaceOffsetRowKey(t *testing.T) {
 	entry := &api.Entry{
 		Space:     "space-a",
 		Segment:   "segment-a",
@@ -372,7 +372,7 @@ func TestShouldRejectProduceWhenStoreIsClosing(t *testing.T) {
 	assert.ErrorContains(t, err, ErrStoreClosing)
 }
 
-func TestProcessChunkShouldReturnStoreClosingWhenShuttingDown(t *testing.T) {
+func TestShouldReturnStoreClosingWhenShuttingDownWhenProcessChunk(t *testing.T) {
 	store := &AzureStore{}
 	store.shuttingDown.Store(true)
 

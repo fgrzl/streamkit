@@ -105,7 +105,7 @@ func TestShouldRemoveChannelOnOnClose(t *testing.T) {
 	assert.False(t, ok, "expected channel to be removed after onClose")
 }
 
-func TestGetOrCreateStreamRejectsWhenStreamLimitExceeded(t *testing.T) {
+func TestShouldGetOrCreateStreamRejectsWhenStreamLimitExceeded(t *testing.T) {
 	manager := &fakeNodeManager{}
 	m := &WebSocketMuxer{
 		Context:     context.Background(),
@@ -186,7 +186,7 @@ func TestShouldRejectOfferAfterClose(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestMuxerReceivePressureOptionsOverrideDefaults(t *testing.T) {
+func TestShouldMuxerReceivePressureOptionsOverrideDefaults(t *testing.T) {
 	m := &WebSocketMuxer{}
 	applyMuxerOptions(m,
 		WithStreamRecvQueueSize(9),
@@ -199,7 +199,7 @@ func TestMuxerReceivePressureOptionsOverrideDefaults(t *testing.T) {
 	assert.Equal(t, int64(4), m.streamRecvSaturationThreshold)
 }
 
-func TestValidateInboundMessageRejectsOversizedPayload(t *testing.T) {
+func TestShouldValidateInboundMessageRejectsOversizedPayload(t *testing.T) {
 	m := &WebSocketMuxer{maxMessagePayloadBytes: 4}
 
 	err := m.validateInboundMessage(&MuxerMsg{Payload: []byte("12345")})
@@ -207,7 +207,7 @@ func TestValidateInboundMessageRejectsOversizedPayload(t *testing.T) {
 	require.ErrorIs(t, err, ErrPayloadTooLarge)
 }
 
-func TestRegisterStoresAndCleanupRemovesChannel(t *testing.T) {
+func TestShouldRegisterStoresAndCleanupRemovesChannel(t *testing.T) {
 	// Arrange: create a lightweight muxer with initialized channels map
 	m := &WebSocketMuxer{
 		Context:  context.Background(),
@@ -241,7 +241,7 @@ func TestRegisterStoresAndCleanupRemovesChannel(t *testing.T) {
 	assert.False(t, exists, "expected channel to be removed after CloseLocal")
 }
 
-func TestHeartbeatReturnsImmediatelyWhenDisabled(t *testing.T) {
+func TestShouldHeartbeatReturnsImmediatelyWhenDisabled(t *testing.T) {
 	m := &WebSocketMuxer{
 		Context:       context.Background(),
 		pingInterval:  0,
@@ -559,7 +559,7 @@ func TestShouldReleaseStreamOnPeerCloseWithoutDroppingBufferedMessages(t *testin
 	assert.Equal(t, io.EOF, bidi.Decode(&value))
 }
 
-func TestDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
+func TestShouldDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
 	sent := make(chan MuxerMsg, 4)
 	m := &WebSocketMuxer{
 		Context:                       context.Background(),
@@ -629,7 +629,7 @@ func TestDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
+func TestShouldDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 	m := &WebSocketMuxer{
 		Context:                       context.Background(),
 		name:                          "client",
@@ -693,7 +693,7 @@ func TestDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 	assert.Equal(t, "ok", fastValue)
 }
 
-func TestGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {
+func TestShouldGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {
 	manager := &fakeNodeManager{}
 	channelID := uuid.New()
 	m := &WebSocketMuxer{
@@ -717,7 +717,7 @@ func TestGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {
 	assert.Equal(t, int32(0), manager.getCalls.Load())
 }
 
-func TestSuccessfulWritesDoNotRefreshHeartbeatTimeout(t *testing.T) {
+func TestShouldSuccessfulWritesDoNotRefreshHeartbeatTimeout(t *testing.T) {
 	m := &WebSocketMuxer{
 		Context:     context.Background(),
 		done:        make(chan struct{}),
@@ -730,7 +730,7 @@ func TestSuccessfulWritesDoNotRefreshHeartbeatTimeout(t *testing.T) {
 	assert.True(t, m.checkHeartbeatTimeout())
 }
 
-func TestMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {
+func TestShouldMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {
 	m := &WebSocketMuxer{
 		Context:        context.Background(),
 		name:           "test",
@@ -798,7 +798,7 @@ func TestMuxerNoPanicOnConcurrentSendAndShutdown(t *testing.T) {
 // on a muxer that has already been shut down returns a stream that immediately
 // fails on Encode with ErrMuxerClosed, rather than creating an orphaned entry
 // in the channels map.
-func TestRegisterOnClosedMuxerReturnsFailingStream(t *testing.T) { // Arrange
+func TestShouldRegisterOnClosedMuxerReturnsFailingStream(t *testing.T) { // Arrange
 	done := make(chan struct{})
 	close(done) // muxer is already shut down
 	m := &WebSocketMuxer{
@@ -825,7 +825,7 @@ func TestRegisterOnClosedMuxerReturnsFailingStream(t *testing.T) { // Arrange
 	assert.False(t, exists, "Register on closed muxer should not add stream to channels map")
 }
 
-func TestShutdownWithOpenStreamDoesNotDeadlock(t *testing.T) {
+func TestShouldShutdownWithOpenStreamDoesNotDeadlock(t *testing.T) {
 	// Arrange: a muxer with a real registered stream whose cleanup acquires channelsMu.Lock.
 	m := &WebSocketMuxer{
 		Context:        context.Background(),

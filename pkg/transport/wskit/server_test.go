@@ -52,7 +52,7 @@ func signWebSocketToken(t *testing.T, secret []byte, scope string) string {
 	return token
 }
 
-func TestConfigureWebSocketServerShouldRejectMissingAuthentication(t *testing.T) {
+func TestShouldRejectMissingAuthenticationWhenConfigureWebSocketServer(t *testing.T) {
 	ts, _ := newWebSocketTestServer(t)
 
 	resp, err := ts.Client().Get(ts.URL + "/streamz")
@@ -64,7 +64,7 @@ func TestConfigureWebSocketServerShouldRejectMissingAuthentication(t *testing.T)
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
-func TestConfigureWebSocketServerShouldRejectPrincipalWithoutStreamkitScope(t *testing.T) {
+func TestShouldRejectPrincipalWithoutStreamkitScopeWhenConfigureWebSocketServer(t *testing.T) {
 	ts, secret := newWebSocketTestServer(t)
 	token := signWebSocketToken(t, secret, "other::*")
 
@@ -81,7 +81,7 @@ func TestConfigureWebSocketServerShouldRejectPrincipalWithoutStreamkitScope(t *t
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
-func TestConfigureWebSocketServerShouldAcceptAuthorizedWebSocketHandshake(t *testing.T) {
+func TestShouldAcceptAuthorizedWebSocketHandshakeWhenConfigureWebSocketServer(t *testing.T) {
 	ts, secret := newWebSocketTestServer(t)
 	token := signWebSocketToken(t, secret, ScopeAllStores)
 

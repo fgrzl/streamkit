@@ -74,7 +74,7 @@ type localChaosSoakState struct {
 	lastSubUnix        atomic.Int64
 }
 
-func TestLocalWebSocketChaosSoak(t *testing.T) {
+func TestShouldLocalWebSocketChaosSoak(t *testing.T) {
 	cfg := loadLocalChaosSoakConfig(t)
 	rng := rand.New(rand.NewSource(cfg.seed))
 	t.Logf("local websocket chaos soak duration=%s seed=%d endpoint=%s", cfg.duration, cfg.seed, cfg.endpoint)

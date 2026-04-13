@@ -132,7 +132,7 @@ func (f *fakeClient) Close() error {
 	return nil
 }
 
-func TestLoadEventsShouldUnmarshalDomainEvents(t *testing.T) {
+func TestShouldUnmarshalDomainEventsWhenLoadEvents(t *testing.T) {
 	// Arrange
 	polymorphic.RegisterType[fakeDomainEvent]()
 	evt := &fakeDomainEvent{seq: 5}
@@ -156,7 +156,7 @@ func TestLoadEventsShouldUnmarshalDomainEvents(t *testing.T) {
 	assert.Equal(t, uint64(5), de.GetSequence())
 }
 
-func TestSaveEventsShouldProduceMarshaledRecords(t *testing.T) {
+func TestShouldProduceMarshaledRecordsWhenSaveEvents(t *testing.T) {
 	// Arrange
 	polymorphic.RegisterType[fakeDomainEvent]()
 	events := []es.DomainEvent{&fakeDomainEvent{seq: 7}, &fakeDomainEvent{seq: 8}}
@@ -174,7 +174,7 @@ func TestSaveEventsShouldProduceMarshaledRecords(t *testing.T) {
 	assert.Equal(t, uint64(8), fc.produced[1].Sequence)
 }
 
-func TestSaveEventsShouldReturnErrorWhenProducerFailsWithSequenceMismatch(t *testing.T) {
+func TestShouldReturnErrorWhenProducerFailsWithSequenceMismatchWhenSaveEvents(t *testing.T) {
 	// Arrange
 	sequenceMismatchErr := errors.New("sequence mismatch")
 	polymorphic.RegisterType[fakeDomainEvent]()
@@ -197,7 +197,7 @@ func TestSaveEventsShouldReturnErrorWhenProducerFailsWithSequenceMismatch(t *tes
 	assert.ErrorIs(t, err, sequenceMismatchErr)
 }
 
-func TestSaveEventsValidatesExpectedSequence(t *testing.T) {
+func TestShouldSaveEventsValidatesExpectedSequence(t *testing.T) {
 	polymorphic.RegisterType[fakeDomainEvent]()
 	fc := &fakeClient{}
 	s := &streamStore{client: fc}
@@ -207,7 +207,7 @@ func TestSaveEventsValidatesExpectedSequence(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestSaveEventsValidatesContiguousSequences(t *testing.T) {
+func TestShouldSaveEventsValidatesContiguousSequences(t *testing.T) {
 	polymorphic.RegisterType[fakeDomainEvent]()
 	fc := &fakeClient{}
 	s := &streamStore{client: fc}
@@ -217,7 +217,7 @@ func TestSaveEventsValidatesContiguousSequences(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestSaveEventsShouldReturnErrorWhenNoStatusUpdatesReceived(t *testing.T) {
+func TestShouldReturnErrorWhenNoStatusUpdatesReceivedWhenSaveEvents(t *testing.T) {
 	// Arrange
 	polymorphic.RegisterType[fakeDomainEvent]()
 	events := []es.DomainEvent{&fakeDomainEvent{seq: 1}}

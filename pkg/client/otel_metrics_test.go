@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-func TestNewOTelClientMetrics_RecordsWithoutPanic(t *testing.T) {
+func TestShouldNewOTelClientMetrics_RecordsWithoutPanic(t *testing.T) {
 	m := NewOTelClientMetrics()
 	if m == nil {
 		t.Fatal("NewOTelClientMetrics returned nil")

@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestBenignDisconnect(t *testing.T) {
+func TestShouldBenignDisconnect(t *testing.T) {
 	t.Parallel()
 	assert.True(t, benignDisconnect(io.EOF))
 	assert.True(t, benignDisconnect(fmt.Errorf("wrap: %w", io.EOF)))
@@ -27,7 +27,7 @@ func TestBenignDisconnect(t *testing.T) {
 	assert.False(t, benignDisconnect(errors.New("invalid payload")))
 }
 
-func TestClassifyTransportError(t *testing.T) {
+func TestShouldClassifyTransportError(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "context_canceled", classifyTransportError(context.Canceled))
 	assert.Equal(t, "deadline_exceeded", classifyTransportError(context.DeadlineExceeded))

@@ -32,7 +32,7 @@ func makeTraceID(fill byte) oteltrace.TraceID {
 	return traceID
 }
 
-func TestInitializeShouldInstallProvidersAndCompositePropagatorWhenEndpointEmpty(t *testing.T) {
+func TestShouldInstallProvidersAndCompositePropagatorWhenEndpointEmptyWhenInitialize(t *testing.T) {
 	restoreGlobalTelemetry(t)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
@@ -57,7 +57,7 @@ func TestInitializeShouldInstallProvidersAndCompositePropagatorWhenEndpointEmpty
 	require.NoError(t, shutdown(context.Background()))
 }
 
-func TestNewInMemoryTracerProviderShouldExportSpans(t *testing.T) {
+func TestShouldExportSpansWhenNewInMemoryTracerProvider(t *testing.T) {
 	tp, exporter, err := NewInMemoryTracerProvider()
 	require.NoError(t, err)
 	require.NotNil(t, tp)
@@ -73,7 +73,7 @@ func TestNewInMemoryTracerProviderShouldExportSpans(t *testing.T) {
 	assert.Equal(t, "in-memory-span", spans[0].Name)
 }
 
-func TestSamplerFromRatioShouldReturnExpectedDecisionsAndDescriptions(t *testing.T) {
+func TestShouldReturnExpectedDecisionsAndDescriptionsWhenSamplerFromRatio(t *testing.T) {
 	tests := []struct {
 		name         string
 		ratio        float64
@@ -115,7 +115,7 @@ func TestSamplerFromRatioShouldReturnExpectedDecisionsAndDescriptions(t *testing
 	}
 }
 
-func TestNewResourceShouldIncludeConfiguredServiceAttributes(t *testing.T) {
+func TestShouldIncludeConfiguredServiceAttributesWhenNewResource(t *testing.T) {
 	res, err := newResource("streamkit", "1.2.3")
 	require.NoError(t, err)
 
@@ -128,7 +128,7 @@ func TestNewResourceShouldIncludeConfiguredServiceAttributes(t *testing.T) {
 	assert.Equal(t, "1.2.3", attrs["service.version"])
 }
 
-func TestNewResourceShouldOmitServiceVersionWhenEmpty(t *testing.T) {
+func TestShouldOmitServiceVersionWhenEmptyWhenNewResource(t *testing.T) {
 	res, err := newResource("streamkit", "")
 	require.NoError(t, err)
 

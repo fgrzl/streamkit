@@ -16,7 +16,7 @@ import (
 
 // TestConcurrentCallStreamDuringMuxerReconnect verifies that concurrent CallStream
 // operations coordinate properly when the muxer is being replaced during reconnection.
-func TestConcurrentCallStreamDuringMuxerReconnect(t *testing.T) {
+func TestShouldConcurrentCallStreamDuringMuxerReconnect(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -92,7 +92,7 @@ func TestConcurrentCallStreamDuringMuxerReconnect(t *testing.T) {
 
 // TestRapidMuxerReplacementDuringHighLoad simulates the scenario where
 // the reconnect loop keeps replacing the muxer while operations are in flight.
-func TestRapidMuxerReplacementDuringHighLoad(t *testing.T) {
+func TestShouldRapidMuxerReplacementDuringHighLoad(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -184,7 +184,7 @@ func TestRapidMuxerReplacementDuringHighLoad(t *testing.T) {
 
 // TestMuxerGracePeriodPreventsRaceCondition verifies that the grace period
 // in replaceMuxer prevents immediate shutdown of in-flight operations.
-func TestMuxerGracePeriodPreventsRaceCondition(t *testing.T) {
+func TestShouldMuxerGracePeriodPreventsRaceCondition(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -243,7 +243,7 @@ func TestMuxerGracePeriodPreventsRaceCondition(t *testing.T) {
 
 // TestReconnectLoopCoordinatesWithGetOrCreateMuxer verifies that the
 // reconnect loop properly uses the dialing flag to avoid dial storms.
-func TestReconnectLoopCoordinatesWithGetOrCreateMuxer(t *testing.T) {
+func TestShouldReconnectLoopCoordinatesWithGetOrCreateMuxer(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -290,7 +290,7 @@ func TestReconnectLoopCoordinatesWithGetOrCreateMuxer(t *testing.T) {
 // TestInvalidateMuxerGracePeriodAllowsInflightEncode verifies that invalidateMuxer
 // does not immediately kill the old muxer, allowing in-flight encode operations on
 // other goroutines to complete within the grace period.
-func TestInvalidateMuxerGracePeriodAllowsInflightEncode(t *testing.T) {
+func TestShouldInvalidateMuxerGracePeriodAllowsInflightEncode(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -359,7 +359,7 @@ func (l *testReconnectListener) count() int {
 
 // TestBackgroundReconnectNotifiesListeners verifies that when the background
 // reconnect loop re-establishes a muxer, registered ReconnectListeners are notified.
-func TestBackgroundReconnectNotifiesListeners(t *testing.T) {
+func TestShouldBackgroundReconnectNotifiesListeners(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -386,7 +386,7 @@ func TestBackgroundReconnectNotifiesListeners(t *testing.T) {
 		}
 	}
 
-	// Act: Create initial muxer (foreground path — sets hasConnected)
+	// Act: Create initial muxer (foreground path - sets hasConnected)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	m1, err := p.getOrCreateMuxer(ctx)
@@ -414,7 +414,7 @@ func TestBackgroundReconnectNotifiesListeners(t *testing.T) {
 // TestGetOrCreateMuxerUsesProviderContext verifies that the muxer is created with
 // reconnectCtx (long-lived) rather than the caller's request context (short-lived).
 // A canceled request context must not kill the muxer that subsequent requests will use.
-func TestGetOrCreateMuxerUsesProviderContext(t *testing.T) {
+func TestShouldGetOrCreateMuxerUsesProviderContext(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -438,7 +438,7 @@ func TestGetOrCreateMuxerUsesProviderContext(t *testing.T) {
 	_, err := p.getOrCreateMuxer(reqCtx)
 	require.NoError(t, err)
 
-	// Cancel the request context — muxer should NOT be affected
+	// Cancel the request context - muxer should NOT be affected
 	reqCancel()
 
 	// Assert: The captured context should be reconnectCtx, not the request context

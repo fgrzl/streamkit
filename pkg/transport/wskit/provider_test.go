@@ -27,7 +27,7 @@ func TestShouldNormalizeAddressWhenCreatingProvider(t *testing.T) {
 	assert.Equal(t, "https://example.com/streamz", wp.addr)
 }
 
-func TestGetOrCreateMuxerRetries(t *testing.T) {
+func TestShouldGetOrCreateMuxerRetries(t *testing.T) {
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
 
@@ -51,7 +51,7 @@ func TestGetOrCreateMuxerRetries(t *testing.T) {
 	assert.ErrorContains(t, err, "dial failed")
 }
 
-func TestBackgroundReconnectRecreatesMuxer(t *testing.T) {
+func TestShouldBackgroundReconnectRecreatesMuxer(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 
@@ -102,7 +102,7 @@ func TestBackgroundReconnectRecreatesMuxer(t *testing.T) {
 	_ = p.Close()
 }
 
-func TestCallStreamRetriesOnMuxerClosed(t *testing.T) {
+func TestShouldCallStreamRetriesOnMuxerClosed(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -153,7 +153,7 @@ func TestCallStreamRetriesOnMuxerClosed(t *testing.T) {
 	_ = b.Close
 }
 
-func TestCallStreamRetriesOnBenignDisconnect(t *testing.T) {
+func TestShouldCallStreamRetriesOnBenignDisconnect(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
@@ -260,7 +260,7 @@ func TestShouldRetryAuthErrorsWhenRetryAuthFailuresEnabled(t *testing.T) {
 	}, 3*time.Second, 50*time.Millisecond, "expected background retries when RetryAuthFailures is enabled")
 }
 
-func TestGetOrCreateMuxerInvokesOnDialFailureForInlineErrors(t *testing.T) {
+func TestShouldGetOrCreateMuxerInvokesOnDialFailureForInlineErrors(t *testing.T) {
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	defer p.Close()
 
@@ -298,7 +298,7 @@ func (f *fakeMuxer) RegisterWithContext(context.Context, uuid.UUID, uuid.UUID) a
 }
 func (f *fakeMuxer) Close(_ error) { atomic.AddInt32(&f.closeCalls, 1) }
 
-func TestCloseMuxerClosesArbitraryProviderMuxer(t *testing.T) {
+func TestShouldCloseMuxerClosesArbitraryProviderMuxer(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
 	fake := &fakeMuxer{pingFn: func() bool { return true }}

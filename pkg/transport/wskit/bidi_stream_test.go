@@ -23,12 +23,12 @@ func newCapturingStream() (*MuxerBidiStream, *[]byte) {
 	return s, &last
 }
 
-func TestNewMuxerBidiStreamUsesConfiguredQueueSize(t *testing.T) {
+func TestShouldNewMuxerBidiStreamUsesConfiguredQueueSize(t *testing.T) {
 	s := NewMuxerBidiStream(func([]byte) error { return nil }, nil, 7)
 	assert.Equal(t, 7, cap(s.recvChan))
 }
 
-func TestEncodeUsesEncoder(t *testing.T) {
+func TestShouldEncodeUsesEncoder(t *testing.T) {
 	t.Run("Given a stream with a capturing encoder", func(t *testing.T) {
 		s, got := newCapturingStream()
 		assert.NoError(t, s.Encode(map[string]string{"a": "b"}))
@@ -39,7 +39,7 @@ func TestEncodeUsesEncoder(t *testing.T) {
 	})
 }
 
-func TestDecodePayloadTypes(t *testing.T) {
+func TestShouldDecodePayloadTypes(t *testing.T) {
 	t.Run("Given a stream", func(t *testing.T) {
 		s, _ := newCapturingStream()
 
@@ -66,7 +66,7 @@ func TestDecodePayloadTypes(t *testing.T) {
 	})
 }
 
-func TestDecodeErrorMessageTypes(t *testing.T) {
+func TestShouldDecodeErrorMessageTypes(t *testing.T) {
 	t.Run("Given ErrorMessage payloads", func(t *testing.T) {
 		s, _ := newCapturingStream()
 
@@ -96,7 +96,7 @@ func TestDecodeErrorMessageTypes(t *testing.T) {
 	})
 }
 
-func TestCloseSendEncodesCloseMessage(t *testing.T) {
+func TestShouldCloseSendEncodesCloseMessage(t *testing.T) {
 	t.Run("CloseSend encodes close message", func(t *testing.T) {
 		s, got := newCapturingStream()
 		assert.NoError(t, s.CloseSend(nil))
@@ -112,7 +112,7 @@ func TestCloseSendEncodesCloseMessage(t *testing.T) {
 	})
 }
 
-func TestCloseInvokesOnCloseAndIsIdempotent(t *testing.T) {
+func TestShouldCloseInvokesOnCloseAndIsIdempotent(t *testing.T) {
 	t.Run("Close should call onClose once and be idempotent", func(t *testing.T) {
 		called := 0
 		encCalled := 0
@@ -142,7 +142,7 @@ func TestCloseInvokesOnCloseAndIsIdempotent(t *testing.T) {
 	})
 }
 
-func TestRecvChanAndOfferBehavior(t *testing.T) {
+func TestShouldRecvChanAndOfferBehavior(t *testing.T) {
 	t.Run("RecvChan send should be readable and Offer should fail when closed", func(t *testing.T) {
 		s, _ := newCapturingStream()
 
@@ -161,7 +161,7 @@ func TestRecvChanAndOfferBehavior(t *testing.T) {
 	})
 }
 
-func TestOfferReturnsFalseWhenBufferIsFull(t *testing.T) {
+func TestShouldOfferReturnsFalseWhenBufferIsFull(t *testing.T) {
 	s, _ := newCapturingStream()
 	for i := 0; i < cap(s.recvChan); i++ {
 		require.True(t, s.Offer([]byte(`"x"`)))
@@ -170,7 +170,7 @@ func TestOfferReturnsFalseWhenBufferIsFull(t *testing.T) {
 	assert.False(t, s.Offer([]byte(`"overflow"`)))
 }
 
-func TestOfferWithinWaitsForBufferHeadroom(t *testing.T) {
+func TestShouldOfferWithinWaitsForBufferHeadroom(t *testing.T) {
 	s, _ := newCapturingStream()
 	s.recvChan = make(chan any, 1)
 	require.True(t, s.Offer([]byte(`"blocked"`)))
@@ -189,7 +189,7 @@ func TestOfferWithinWaitsForBufferHeadroom(t *testing.T) {
 	assert.Equal(t, "recovered", value)
 }
 
-func TestOfferWithinReturnsFalseWhenBufferStaysFull(t *testing.T) {
+func TestShouldOfferWithinReturnsFalseWhenBufferStaysFull(t *testing.T) {
 	s, _ := newCapturingStream()
 	s.recvChan = make(chan any, 1)
 	require.True(t, s.Offer([]byte(`"blocked"`)))
@@ -199,14 +199,14 @@ func TestOfferWithinReturnsFalseWhenBufferStaysFull(t *testing.T) {
 	assert.GreaterOrEqual(t, time.Since(start), 20*time.Millisecond)
 }
 
-func TestEndOfStreamError(t *testing.T) {
+func TestShouldEndOfStreamError(t *testing.T) {
 	t.Run("EndOfStreamError returns io.EOF", func(t *testing.T) {
 		s, _ := newCapturingStream()
 		assert.Equal(t, io.EOF, s.EndOfStreamError())
 	})
 }
 
-func TestCloseLocalDrainsBufferedMessages(t *testing.T) {
+func TestShouldCloseLocalDrainsBufferedMessages(t *testing.T) {
 	// Arrange
 	s, _ := newCapturingStream()
 	for i := 0; i < 5; i++ {
@@ -221,7 +221,7 @@ func TestCloseLocalDrainsBufferedMessages(t *testing.T) {
 	require.Equal(t, 0, len(s.recvChan), "expected recvChan to be drained by CloseLocal")
 }
 
-func TestCloseRemotePreservesBufferedMessages(t *testing.T) {
+func TestShouldCloseRemotePreservesBufferedMessages(t *testing.T) {
 	s, _ := newCapturingStream()
 	require.True(t, s.Offer([]byte(`"kept"`)))
 
@@ -233,7 +233,7 @@ func TestCloseRemotePreservesBufferedMessages(t *testing.T) {
 	assert.Equal(t, io.EOF, s.Decode(&value))
 }
 
-func TestDecodeReturnsLocalCloseError(t *testing.T) {
+func TestShouldDecodeReturnsLocalCloseError(t *testing.T) {
 	s, _ := newCapturingStream()
 
 	closeErr := errors.New("stream receive buffer overloaded")
@@ -243,8 +243,8 @@ func TestDecodeReturnsLocalCloseError(t *testing.T) {
 	assert.ErrorIs(t, s.Decode(&v), closeErr)
 }
 
-func TestDecodeIgnoresDomainObjectWithTypeField(t *testing.T) {
-	// Arrange: a domain object that has a "type" field — previously consumed
+func TestShouldDecodeIgnoresDomainObjectWithTypeField(t *testing.T) {
+	// Arrange: a domain object that has a "type" field - previously consumed
 	// as a control message, silently dropping the application payload.
 	s, _ := newCapturingStream()
 	s.Offer([]byte(`{"type":"close","data":"legit"}`))

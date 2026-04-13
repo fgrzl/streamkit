@@ -182,7 +182,7 @@ func withSubscriptionHeartbeatTiming(interval, timeout time.Duration, fn func())
 	fn()
 }
 
-func TestClientDoesNotRegisterReconnectListenerOnCreation(t *testing.T) {
+func TestShouldClientDoesNotRegisterReconnectListenerOnCreation(t *testing.T) {
 	provider := &mockProvider{}
 	c := NewClient(provider)
 	require.NotNil(t, c)
@@ -192,7 +192,7 @@ func TestClientDoesNotRegisterReconnectListenerOnCreation(t *testing.T) {
 	assert.Empty(t, listeners)
 }
 
-func TestSubscriptionTrackedInRegistry(t *testing.T) {
+func TestShouldSubscriptionTrackedInRegistry(t *testing.T) {
 	// Arrange
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -254,7 +254,7 @@ func TestSubscriptionTrackedInRegistry(t *testing.T) {
 	assert.Equal(t, 0, activeSubs)
 }
 
-func TestSubscriptionStopsAfterStreamDisconnect(t *testing.T) {
+func TestShouldSubscriptionStopsAfterStreamDisconnect(t *testing.T) {
 	var streamAttempts atomic.Int32
 	updates := make(chan uint64, 2)
 	firstStreamReady := make(chan *mockBidiStream, 1)
@@ -319,7 +319,7 @@ func TestSubscriptionStopsAfterStreamDisconnect(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestOnReconnectedDoesNotRestoreStoppedSubscriptions(t *testing.T) {
+func TestShouldOnReconnectedDoesNotRestoreStoppedSubscriptions(t *testing.T) {
 	var streamAttempts atomic.Int32
 	firstStreamReady := make(chan *mockBidiStream, 1)
 
@@ -363,7 +363,7 @@ func TestOnReconnectedDoesNotRestoreStoppedSubscriptions(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestSubscriptionFiltersHeartbeats(t *testing.T) {
+func TestShouldSubscriptionFiltersHeartbeats(t *testing.T) {
 	var decodeCount atomic.Int32
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -412,7 +412,7 @@ func TestSubscriptionFiltersHeartbeats(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestSubscriptionDoesNotRequestHeartbeatsByDefault(t *testing.T) {
+func TestShouldSubscriptionDoesNotRequestHeartbeatsByDefault(t *testing.T) {
 	requested := make(chan *api.SubscribeToSegmentStatus, 1)
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -452,7 +452,7 @@ func TestSubscriptionDoesNotRequestHeartbeatsByDefault(t *testing.T) {
 	assert.Nil(t, c.GetSubscriptionStatus(sub.ID()))
 }
 
-func TestSubscriptionStopsWhenHeartbeatsStop(t *testing.T) {
+func TestShouldSubscriptionStopsWhenHeartbeatsStop(t *testing.T) {
 	withSubscriptionHeartbeatTiming(25*time.Millisecond, 80*time.Millisecond, func() {
 		var attempts atomic.Int32
 		provider := &mockProvider{
@@ -482,7 +482,7 @@ func TestSubscriptionStopsWhenHeartbeatsStop(t *testing.T) {
 	})
 }
 
-func TestHandlerPanicResilience(t *testing.T) {
+func TestShouldHandlerPanicResilience(t *testing.T) {
 	// Arrange
 	// This tests Critical Issue #1: Handler Panics Crash Subscriptions
 	// We ensure that a panicking handler doesn't crash the subscription goroutine
@@ -574,7 +574,7 @@ func TestHandlerPanicResilience(t *testing.T) {
 }
 
 // TestHealthStatusTracking tests Issue 4: Silent subscription failures detection
-func TestHealthStatusTracking(t *testing.T) {
+func TestShouldHealthStatusTracking(t *testing.T) {
 	// Arrange
 	// This tests Issue #4: Silent Subscription Failures
 	// Verify that SubscriptionStatus helper can check health of active subscriptions
@@ -628,7 +628,7 @@ func TestHealthStatusTracking(t *testing.T) {
 }
 
 // TestContextCancellationOnUnsubscribe tests Issue 5: Context mismatch
-func TestContextCancellationOnUnsubscribe(t *testing.T) {
+func TestShouldContextCancellationOnUnsubscribe(t *testing.T) {
 	// Arrange
 	// This tests Issue #5: Context Inheritance Mismatch
 	// Unsubscribe should properly cancel subscription context
@@ -686,7 +686,7 @@ func TestContextCancellationOnUnsubscribe(t *testing.T) {
 }
 
 // TestSubscriptionCleanupOnPanic tests Issue 6: Registry cleanup on handler panic
-func TestSubscriptionCleanupOnPanic(t *testing.T) {
+func TestShouldSubscriptionCleanupOnPanic(t *testing.T) {
 	// Arrange
 	// This tests Issue #6: Registry Never Cleaned on Handler Panic
 	// With panic recovery added (Issue 1), subscriptions should not crash entirely
@@ -749,7 +749,7 @@ func TestSubscriptionCleanupOnPanic(t *testing.T) {
 	assert.Equal(t, 0, countAfterUnsubscribe, "subscription should be unregistered after Unsubscribe")
 }
 
-func TestOffsetTracking(t *testing.T) {
+func TestShouldOffsetTracking(t *testing.T) {
 	// Arrange
 	// This tests Critical Issue #3: No Offset Tracking
 	// We verify that subscriptions track the last delivered sequence
@@ -820,7 +820,7 @@ func TestOffsetTracking(t *testing.T) {
 
 // TestHandlerTimeoutTracking verifies that slow handlers don't block subscriptions (Issue 7).
 // Handlers that exceed the timeout should be interrupted while maintaining message delivery.
-func TestHandlerTimeoutTracking(t *testing.T) {
+func TestShouldHandlerTimeoutTracking(t *testing.T) {
 	// Arrange
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -869,7 +869,7 @@ func TestHandlerTimeoutTracking(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestHandlerTimeoutCanBeDisabled(t *testing.T) {
+func TestShouldHandlerTimeoutCanBeDisabled(t *testing.T) {
 	c := NewClientWithHandlerTimeout(&mockProvider{}, 0).(*client)
 	t.Cleanup(func() {
 		require.NoError(t, c.Close())
@@ -907,7 +907,7 @@ func TestHandlerTimeoutCanBeDisabled(t *testing.T) {
 
 // TestHandlerTimeoutMetrics verifies that handler timeouts and panics are tracked (Issue 7).
 // Applications should be able to query subscription health including timeout/panic counts.
-func TestHandlerTimeoutMetrics(t *testing.T) {
+func TestShouldHandlerTimeoutMetrics(t *testing.T) {
 	// Arrange
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -975,7 +975,7 @@ func TestHandlerTimeoutMetrics(t *testing.T) {
 
 // TestSlowHandlerDoesNotBlockOtherMessages verifies handler backpressure (Issue 7).
 // Subscription receiving messages should continue processing even if handler is slow.
-func TestSlowHandlerDoesNotBlockOtherMessages(t *testing.T) {
+func TestShouldSlowHandlerDoesNotBlockOtherMessages(t *testing.T) {
 	// Arrange - test with slow handler that times out
 	callCount := int32(0)
 	provider := &mockProvider{
@@ -1027,7 +1027,7 @@ func TestSlowHandlerDoesNotBlockOtherMessages(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
+func TestShouldSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 	var decodeCount atomic.Int32
 	firstHandlerStarted := make(chan struct{})
 	releaseFirstHandler := make(chan struct{})
@@ -1128,7 +1128,7 @@ func TestSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestSubscriptionStatusHandlesDifferentConcreteErrorTypes(t *testing.T) {
+func TestShouldSubscriptionStatusHandlesDifferentConcreteErrorTypes(t *testing.T) {
 	c := NewClient(&mockProvider{}).(*client)
 	sub := &activeSubscription{id: "sub-1"}
 	sub.status.Store("failed")
@@ -1144,7 +1144,7 @@ func TestSubscriptionStatusHandlesDifferentConcreteErrorTypes(t *testing.T) {
 	assert.Equal(t, context.DeadlineExceeded.Error(), status.LastError.Error())
 }
 
-func TestExactSubscriptionUsesSinglePendingStatusSlot(t *testing.T) {
+func TestShouldExactSubscriptionUsesSinglePendingStatusSlot(t *testing.T) {
 	sub := &activeSubscription{}
 
 	coalesced := sub.queuePendingStatus(SegmentStatus{Space: "space", Segment: "segment", LastSequence: 1})
@@ -1167,7 +1167,7 @@ func TestExactSubscriptionUsesSinglePendingStatusSlot(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSaturate(t *testing.T) {
+func TestShouldSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSaturate(t *testing.T) {
 	var decodeCount atomic.Int32
 	firstHandlerStarted := make(chan struct{})
 	releaseFirstHandler := make(chan struct{})
@@ -1275,7 +1275,7 @@ func TestSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlersSatura
 }
 
 // TestConsumeSegmentResilient verifies that ConsumeSegment wraps with resilience (Issue 8)
-func TestConsumeSegmentResilient(t *testing.T) {
+func TestShouldConsumeSegmentResilient(t *testing.T) {
 	// Just verify that ConsumeSegment returns an enumerator
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -1303,7 +1303,7 @@ func TestConsumeSegmentResilient(t *testing.T) {
 }
 
 // TestConsumeSpaceResilient verifies that ConsumeSpace wraps with resilience (Issue 8)
-func TestConsumeSpaceResilient(t *testing.T) {
+func TestShouldConsumeSpaceResilient(t *testing.T) {
 	// Just verify that ConsumeSpace returns an enumerator
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -1330,7 +1330,7 @@ func TestConsumeSpaceResilient(t *testing.T) {
 }
 
 // TestConsumeResilient verifies that Consume wraps with resilience (Issue 8)
-func TestConsumeResilient(t *testing.T) {
+func TestShouldConsumeResilient(t *testing.T) {
 	// Just verify that Consume returns an enumerator
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -1358,7 +1358,7 @@ func TestConsumeResilient(t *testing.T) {
 
 // TestProduceSafetyAtomic verifies that Peek+Produce is atomic (Issue 9).
 // Concurrent publishers to the same segment should not create sequence conflicts.
-func TestProduceSafetyAtomic(t *testing.T) {
+func TestShouldProduceSafetyAtomic(t *testing.T) {
 	var peekSequence uint64 = 100
 	var callCount int32
 	sequences := make(chan uint64, 16)
@@ -1448,7 +1448,7 @@ func TestProduceSafetyAtomic(t *testing.T) {
 
 // TestProduceLockPreventsRaceCondition verifies that concurrent Peek+Produce operations
 // on the same segment don't race (Issue 9).
-func TestProduceLockPreventsRaceCondition(t *testing.T) {
+func TestShouldProduceLockPreventsRaceCondition(t *testing.T) {
 	var lastProducedSequence uint64
 
 	provider := &mockProvider{
@@ -1513,7 +1513,7 @@ func TestProduceLockPreventsRaceCondition(t *testing.T) {
 
 // TestProduceLockIsolatesBySegment verifies that locks are per-segment, not global (Issue 9).
 // Publishers to different segments should not block each other.
-func TestProduceLockIsolatesBySegment(t *testing.T) {
+func TestShouldProduceLockIsolatesBySegment(t *testing.T) {
 	var seg1Count, seg2Count int32
 	var mu sync.Mutex
 	started := sync.NewCond(&mu)
@@ -1594,7 +1594,7 @@ func TestProduceLockIsolatesBySegment(t *testing.T) {
 
 // --- New tests for RC hardening ---
 
-func TestConsumeSegmentStopsAfterDisconnectWithoutRetry(t *testing.T) {
+func TestShouldConsumeSegmentStopsAfterDisconnectWithoutRetry(t *testing.T) {
 	var calls atomic.Int32
 
 	provider := &mockProvider{
@@ -1640,7 +1640,7 @@ func TestConsumeSegmentStopsAfterDisconnectWithoutRetry(t *testing.T) {
 	assert.Equal(t, uint64(7), args.MinSequence, "caller offsets should remain unchanged after a disconnect")
 }
 
-func TestConsumeReturnsNoEntryWhenStreamEndsImmediately(t *testing.T) {
+func TestShouldConsumeReturnsNoEntryWhenStreamEndsImmediately(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
@@ -1661,7 +1661,7 @@ func TestConsumeReturnsNoEntryWhenStreamEndsImmediately(t *testing.T) {
 	require.NoError(t, enum.Err())
 }
 
-func TestConsumeRejectsZeroValueEntry(t *testing.T) {
+func TestShouldConsumeRejectsZeroValueEntry(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
@@ -1686,7 +1686,7 @@ func TestConsumeRejectsZeroValueEntry(t *testing.T) {
 	require.ErrorIs(t, enum.Err(), errInvalidConsumeEntry)
 }
 
-func TestConsumeDoesNotMutateCallerOffsetsOnDisconnect(t *testing.T) {
+func TestShouldConsumeDoesNotMutateCallerOffsetsOnDisconnect(t *testing.T) {
 	var calls atomic.Int32
 	initialOffset := lexkey.Encode("space", "segment", 1)
 
@@ -1713,7 +1713,7 @@ func TestConsumeDoesNotMutateCallerOffsetsOnDisconnect(t *testing.T) {
 	assert.Equal(t, initialOffset, args.Offsets["space"], "consume arguments should remain owned by the caller")
 }
 
-func TestProduceLockEviction(t *testing.T) {
+func TestShouldProduceLockEviction(t *testing.T) {
 	prev := MaxProduceLocks
 	MaxProduceLocks = 100 // shrink for test
 	defer func() { MaxProduceLocks = prev }()
@@ -1736,7 +1736,7 @@ func TestProduceLockEviction(t *testing.T) {
 	assert.LessOrEqual(t, size, MaxProduceLocks)
 }
 
-func TestPeekReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
+func TestShouldPeekReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
 	var calls atomic.Int32
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -1757,7 +1757,7 @@ func TestPeekReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
 	assert.Equal(t, int32(1), calls.Load(), "permanent remote errors should not trigger unary retries")
 }
 
-func TestConsumeSegmentReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
+func TestShouldConsumeSegmentReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
 	var calls atomic.Int32
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -1783,7 +1783,7 @@ func TestConsumeSegmentReturnsPermanentRemoteErrorWithoutRetry(t *testing.T) {
 	assert.Equal(t, int32(1), calls.Load(), "permanent stream errors should not trigger consume retries")
 }
 
-func TestSubscriptionInitialCallStreamReturnsErrorAfterRetries(t *testing.T) {
+func TestShouldSubscriptionInitialCallStreamReturnsErrorAfterRetries(t *testing.T) {
 	var attempts atomic.Int32
 
 	provider := &mockProvider{
@@ -1808,7 +1808,7 @@ func TestSubscriptionInitialCallStreamReturnsErrorAfterRetries(t *testing.T) {
 	assert.Equal(t, 0, c.subscriptionCount(), "failed initial subscription opens must not leave registry entries behind")
 }
 
-func TestSubscriptionStopsOnPermanentRemoteError(t *testing.T) {
+func TestShouldSubscriptionStopsOnPermanentRemoteError(t *testing.T) {
 	var attempts atomic.Int32
 	handlerCalled := make(chan struct{}, 1)
 
@@ -1846,7 +1846,7 @@ func TestSubscriptionStopsOnPermanentRemoteError(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestSubscriptionCancelsOnPermanentCallStreamError(t *testing.T) {
+func TestShouldSubscriptionCancelsOnPermanentCallStreamError(t *testing.T) {
 	var attempts atomic.Int32
 	handlerCalled := make(chan struct{}, 1)
 
@@ -1877,7 +1877,7 @@ func TestSubscriptionCancelsOnPermanentCallStreamError(t *testing.T) {
 	assert.Equal(t, 0, c.subscriptionCount(), "failed initial subscription opens must not register a subscription")
 }
 
-func TestSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
+func TestShouldSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
 	var attempts atomic.Int32
 	handlerCalled := make(chan struct{}, 1)
 
@@ -1915,7 +1915,7 @@ func TestSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestRetryFailedSubscriptionReturnsError(t *testing.T) {
+func TestShouldRetryFailedSubscriptionReturnsError(t *testing.T) {
 	var attempts atomic.Int32
 
 	provider := &mockProvider{
@@ -1955,7 +1955,7 @@ func TestRetryFailedSubscriptionReturnsError(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestClientCloseCancelsActiveSubscriptions(t *testing.T) {
+func TestShouldClientCloseCancelsActiveSubscriptions(t *testing.T) {
 	var closedCount atomic.Int32
 	connected := make(chan struct{}, 1)
 
@@ -2001,7 +2001,7 @@ func TestClientCloseCancelsActiveSubscriptions(t *testing.T) {
 	sub.Unsubscribe()
 }
 
-func TestClientCloseReturnsWhenCalledFromHandler(t *testing.T) {
+func TestShouldClientCloseReturnsWhenCalledFromHandler(t *testing.T) {
 	closeResult := make(chan error, 1)
 	connected := make(chan struct{}, 1)
 	metrics := &testClientMetrics{}
@@ -2062,7 +2062,7 @@ func TestClientCloseReturnsWhenCalledFromHandler(t *testing.T) {
 }
 
 // TestWithLeaseNotAcquired verifies that when server returns Ok false on acquire, WithLease returns ErrLeaseNotAcquired.
-func TestWithLeaseNotAcquired(t *testing.T) {
+func TestShouldWithLeaseNotAcquired(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
@@ -2086,7 +2086,7 @@ func TestWithLeaseNotAcquired(t *testing.T) {
 }
 
 // TestWithLeaseRenewAndRelease verifies that WithLease runs the renew loop and sends LeaseRelease when the callback returns.
-func TestWithLeaseRenewAndRelease(t *testing.T) {
+func TestShouldWithLeaseRenewAndRelease(t *testing.T) {
 	var acquireCount, renewCount, releaseCount atomic.Int32
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -2124,7 +2124,7 @@ func TestWithLeaseRenewAndRelease(t *testing.T) {
 }
 
 // TestWithLeaseRunsCallbackThenReleases verifies that WithLease acquires, runs fn with a context, then releases.
-func TestWithLeaseRunsCallbackThenReleases(t *testing.T) {
+func TestShouldWithLeaseRunsCallbackThenReleases(t *testing.T) {
 	var acquireCount, releaseCount atomic.Int32
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -2165,7 +2165,7 @@ func TestWithLeaseRunsCallbackThenReleases(t *testing.T) {
 }
 
 // TestWithLeaseContextCanceledWhenParentCanceled verifies that when the parent context is canceled, fn's context is canceled.
-func TestWithLeaseContextCanceledWhenParentCanceled(t *testing.T) {
+func TestShouldWithLeaseContextCanceledWhenParentCanceled(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
@@ -2203,7 +2203,7 @@ func TestWithLeaseContextCanceledWhenParentCanceled(t *testing.T) {
 	}
 }
 
-func TestIsRetryable(t *testing.T) {
+func TestShouldIsRetryable(t *testing.T) {
 	assert.False(t, IsRetryable(context.Canceled))
 	assert.False(t, IsRetryable(fmt.Errorf("not found")))
 	assert.False(t, IsRetryable(fmt.Errorf("invalid argument: foo")))

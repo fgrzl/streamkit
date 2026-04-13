@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestNewGlobalRouteShouldSetGlobalScopeAndFormatWithoutID(t *testing.T) {
+func TestShouldSetGlobalScopeAndFormatWithoutIDWhenNewGlobalRoute(t *testing.T) {
 	route := NewGlobalRoute("billing", "settled")
 
 	assert.Equal(t, ScopeGlobal, route.Scope)
@@ -17,7 +17,7 @@ func TestNewGlobalRouteShouldSetGlobalScopeAndFormatWithoutID(t *testing.T) {
 	assert.Equal(t, "global.billing.settled", route.String())
 }
 
-func TestNewInternalRouteShouldSetInternalScopeAndFormatWithoutID(t *testing.T) {
+func TestShouldSetInternalScopeAndFormatWithoutIDWhenNewInternalRoute(t *testing.T) {
 	route := NewInternalRoute("streams", "rebalance")
 
 	assert.Equal(t, ScopeInternal, route.Scope)
@@ -27,7 +27,7 @@ func TestNewInternalRouteShouldSetInternalScopeAndFormatWithoutID(t *testing.T) 
 	assert.Equal(t, "internal.streams.rebalance", route.String())
 }
 
-func TestNewTenantRouteShouldSetTenantScopeAndFormatWithID(t *testing.T) {
+func TestShouldSetTenantScopeAndFormatWithIDWhenNewTenantRoute(t *testing.T) {
 	tenantID := uuid.New()
 	route := NewTenantRoute("tenant", "updated", &tenantID)
 
@@ -38,7 +38,7 @@ func TestNewTenantRouteShouldSetTenantScopeAndFormatWithID(t *testing.T) {
 	assert.Equal(t, "tenant.tenant.updated["+tenantID.String()+"]", route.String())
 }
 
-func TestNewInboxRouteShouldSetInboxScopeAndFormatWithID(t *testing.T) {
+func TestShouldSetInboxScopeAndFormatWithIDWhenNewInboxRoute(t *testing.T) {
 	inboxID := uuid.New()
 	route := NewInboxRoute("notifications", "queued", &inboxID)
 

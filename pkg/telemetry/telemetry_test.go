@@ -68,7 +68,7 @@ func collectSpan(t *testing.T, fn func(oteltrace.Span)) tracetest.SpanStub {
 	return spans[0]
 }
 
-func TestGetTracerReturnsGlobalTracer(t *testing.T) {
+func TestShouldGetTracerReturnsGlobalTracer(t *testing.T) {
 	// Arrange
 	exporter := tracetest.NewInMemoryExporter()
 	tp := trace.NewTracerProvider(
@@ -86,7 +86,7 @@ func TestGetTracerReturnsGlobalTracer(t *testing.T) {
 	require.Equal(t, tracer1, tracer2, "GetTracer should return the same instance")
 }
 
-func TestRequestIDFromContextReturnsFalseWhenNotPresent(t *testing.T) {
+func TestShouldRequestIDFromContextReturnsFalseWhenNotPresent(t *testing.T) {
 	// Arrange
 	ctx := context.Background()
 
@@ -97,7 +97,7 @@ func TestRequestIDFromContextReturnsFalseWhenNotPresent(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestTraceIDFromContextExtractsFromSpan(t *testing.T) {
+func TestShouldTraceIDFromContextExtractsFromSpan(t *testing.T) {
 	// Arrange
 	exporter := tracetest.NewInMemoryExporter()
 	tp := trace.NewTracerProvider(
@@ -117,7 +117,7 @@ func TestTraceIDFromContextExtractsFromSpan(t *testing.T) {
 	assert.Equal(t, span.SpanContext().TraceID().String(), traceID)
 }
 
-func TestAttributeBuilders(t *testing.T) {
+func TestShouldAttributeBuilders(t *testing.T) {
 	// Test that all attribute builder functions work without panicking
 
 	// Act & Assert
@@ -131,7 +131,7 @@ func TestAttributeBuilders(t *testing.T) {
 	assert.NotPanics(t, func() { telemetry.WithBackendType("azure") })
 }
 
-func TestAddTraceContextToLogger(t *testing.T) {
+func TestShouldAddTraceContextToLogger(t *testing.T) {
 	// Arrange
 	exporter := tracetest.NewInMemoryExporter()
 	tp := trace.NewTracerProvider(
@@ -150,7 +150,7 @@ func TestAddTraceContextToLogger(t *testing.T) {
 	assert.Len(t, attrs, 2) // trace_id and span_id
 }
 
-func TestAddTraceContextToLoggerWithoutSpan(t *testing.T) {
+func TestShouldAddTraceContextToLoggerWithoutSpan(t *testing.T) {
 	// Arrange
 	ctx := context.Background()
 
@@ -161,7 +161,7 @@ func TestAddTraceContextToLoggerWithoutSpan(t *testing.T) {
 	assert.Empty(t, attrs)
 }
 
-func TestAddTraceContextToLoggerIncludesRequestIDWithoutSpan(t *testing.T) {
+func TestShouldAddTraceContextToLoggerIncludesRequestIDWithoutSpan(t *testing.T) {
 	// Arrange
 	id := uuid.New()
 	ctx := telemetry.WithRequestIDContext(context.Background(), id)
@@ -177,7 +177,7 @@ func TestAddTraceContextToLoggerIncludesRequestIDWithoutSpan(t *testing.T) {
 	assert.Equal(t, id.String(), requestIDAttr.Value.String())
 }
 
-func TestWithRequestIDContextRoundtrip(t *testing.T) {
+func TestShouldWithRequestIDContextRoundtrip(t *testing.T) {
 	// Arrange
 	ctx := context.Background()
 	id := uuid.New()
@@ -191,7 +191,7 @@ func TestWithRequestIDContextRoundtrip(t *testing.T) {
 	assert.Equal(t, id, got)
 }
 
-func TestTraceContextHandlerAddsTraceAndRequestID(t *testing.T) {
+func TestShouldTraceContextHandlerAddsTraceAndRequestID(t *testing.T) {
 	// Arrange
 	exporter := tracetest.NewInMemoryExporter()
 	tp := trace.NewTracerProvider(
@@ -220,7 +220,7 @@ func TestTraceContextHandlerAddsTraceAndRequestID(t *testing.T) {
 	assert.Equal(t, "true", attrs["traced"])
 }
 
-func TestGetMeterReturnsNonNil(t *testing.T) {
+func TestShouldGetMeterReturnsNonNil(t *testing.T) {
 	// Act
 	meter := telemetry.GetMeter()
 
@@ -228,7 +228,7 @@ func TestGetMeterReturnsNonNil(t *testing.T) {
 	require.NotNil(t, meter)
 }
 
-func TestRecordErrorSetsErrorStatusAndRecordsEvent(t *testing.T) {
+func TestShouldRecordErrorSetsErrorStatusAndRecordsEvent(t *testing.T) {
 	span := collectSpan(t, func(span oteltrace.Span) {
 		telemetry.RecordError(span, errors.New("boom"))
 	})
@@ -238,7 +238,7 @@ func TestRecordErrorSetsErrorStatusAndRecordsEvent(t *testing.T) {
 	require.NotEmpty(t, span.Events)
 }
 
-func TestRecordErrorIgnoresNilError(t *testing.T) {
+func TestShouldRecordErrorIgnoresNilError(t *testing.T) {
 	span := collectSpan(t, func(span oteltrace.Span) {
 		telemetry.RecordError(span, nil)
 	})
@@ -248,7 +248,7 @@ func TestRecordErrorIgnoresNilError(t *testing.T) {
 	assert.Empty(t, span.Events)
 }
 
-func TestRecordErrorMsgUsesCustomMessageAndMarksOKForNilError(t *testing.T) {
+func TestShouldRecordErrorMsgUsesCustomMessageAndMarksOKForNilError(t *testing.T) {
 	t.Run("error", func(t *testing.T) {
 		span := collectSpan(t, func(span oteltrace.Span) {
 			telemetry.RecordErrorMsg(span, errors.New("boom"), "custom message")
@@ -270,7 +270,7 @@ func TestRecordErrorMsgUsesCustomMessageAndMarksOKForNilError(t *testing.T) {
 	})
 }
 
-func TestSetSpanStatusOKAndAddEventUpdateSpan(t *testing.T) {
+func TestShouldSetSpanStatusOKAndAddEventUpdateSpan(t *testing.T) {
 	span := collectSpan(t, func(span oteltrace.Span) {
 		telemetry.SetSpanStatusOK(span)
 		telemetry.AddEvent(span, "checkpoint")

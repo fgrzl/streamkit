@@ -204,7 +204,7 @@ func (m *mockBidi) Close(err error) {
 func (m *mockBidi) EndOfStreamError() error { return io.EOF }
 func (m *mockBidi) Closed() <-chan struct{} { return m.closed }
 
-func TestGetSpacesStreamsNames(t *testing.T) {
+func TestShouldGetSpacesStreamsNames(t *testing.T) {
 	// Arrange
 	store := &mockStore{spaces: []string{"one", "two"}}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
@@ -220,7 +220,7 @@ func TestGetSpacesStreamsNames(t *testing.T) {
 	require.NoError(t, bidi.closeSendErr)
 }
 
-func TestPeekReturnsEntryOrEmpty(t *testing.T) {
+func TestShouldPeekReturnsEntryOrEmpty(t *testing.T) {
 	// case: nil entry - should encode empty entry with space/segment
 	store := &mockStore{peekEntry: nil}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
@@ -246,7 +246,7 @@ func TestPeekReturnsEntryOrEmpty(t *testing.T) {
 	require.Len(t, bidi2.encoded, 1, "expected 1 encoded message")
 }
 
-func TestProduceNotifiesBus(t *testing.T) {
+func TestShouldProduceNotifiesBus(t *testing.T) {
 	statuses := []*api.SegmentStatus{{Space: "s", Segment: "seg"}}
 	store := &mockStore{statuses: statuses}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
@@ -268,7 +268,7 @@ func TestProduceNotifiesBus(t *testing.T) {
 	// (notification behavior is exercised elsewhere with an actual bus)
 }
 
-func TestProduceOpensNotificationCircuitAfterRepeatedBusFailures(t *testing.T) {
+func TestShouldProduceOpensNotificationCircuitAfterRepeatedBusFailures(t *testing.T) {
 	statuses := []*api.SegmentStatus{{Space: "s", Segment: "seg", LastSequence: 1}}
 	store := &mockStore{statuses: statuses}
 	messageBus := &mockMessageBus{notifyErr: errors.New("notify failed")}
@@ -307,7 +307,7 @@ func TestProduceOpensNotificationCircuitAfterRepeatedBusFailures(t *testing.T) {
 	require.Equal(t, 0, node.notifyFailureCount)
 }
 
-func TestHandleInvalidMsgType(t *testing.T) {
+func TestShouldHandleInvalidMsgType(t *testing.T) {
 	store := &mockStore{}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
@@ -320,7 +320,7 @@ func TestHandleInvalidMsgType(t *testing.T) {
 	require.Error(t, bidi.closeErr, "expected Close to be called with error for invalid msg type")
 }
 
-func TestLeaseAcquireReturnsOk(t *testing.T) {
+func TestShouldLeaseAcquireReturnsOk(t *testing.T) {
 	store := &mockStore{}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.LeaseAcquire{Key: "k", Holder: "h1", TTLSeconds: 30}}
@@ -334,7 +334,7 @@ func TestLeaseAcquireReturnsOk(t *testing.T) {
 	require.True(t, result.Ok)
 }
 
-func TestLeaseAcquireConflictReturnsNotOk(t *testing.T) {
+func TestShouldLeaseAcquireConflictReturnsNotOk(t *testing.T) {
 	leaseStore := lease.NewStore()
 	_ = leaseStore.Acquire("k", "h0", 30*time.Second)
 	store := &mockStore{}
@@ -353,7 +353,7 @@ func TestLeaseAcquireConflictReturnsNotOk(t *testing.T) {
 	require.False(t, bidi2.encoded[0].(*api.LeaseResult).Ok)
 }
 
-func TestLeaseRenewAndReleaseReturnOk(t *testing.T) {
+func TestShouldLeaseRenewAndReleaseReturnOk(t *testing.T) {
 	leaseStore := lease.NewStore()
 	_ = leaseStore.Acquire("k", "h1", 30*time.Second)
 	store := &mockStore{}
@@ -372,7 +372,7 @@ func TestLeaseRenewAndReleaseReturnOk(t *testing.T) {
 	require.True(t, bidiRelease.encoded[0].(*api.LeaseResult).Ok)
 }
 
-func TestLeaseAcquireValidationFailures(t *testing.T) {
+func TestShouldLeaseAcquireValidationFailures(t *testing.T) {
 	store := &mockStore{}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
@@ -412,7 +412,7 @@ func TestLeaseAcquireValidationFailures(t *testing.T) {
 	}
 }
 
-func TestLeaseReleaseValidationFailures(t *testing.T) {
+func TestShouldLeaseReleaseValidationFailures(t *testing.T) {
 	store := &mockStore{}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
@@ -446,7 +446,7 @@ func (p *panickingStore) Produce(ctx context.Context, args *api.Produce, entries
 }
 func (p *panickingStore) Close() {}
 
-func TestHandlePanicRecovered(t *testing.T) {
+func TestShouldHandlePanicRecovered(t *testing.T) {
 	node := NewNode(uuid.New(), &panickingStore{}, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.GetSpaces{}}
 	bidi := newMockBidi(env)
@@ -457,7 +457,7 @@ func TestHandlePanicRecovered(t *testing.T) {
 	require.Error(t, bidi.closeErr, "expected Close to be called with panic error")
 }
 
-func TestSubscribeNoBusConfigured(t *testing.T) {
+func TestShouldSubscribeNoBusConfigured(t *testing.T) {
 	store := &mockStore{}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
@@ -470,7 +470,7 @@ func TestSubscribeNoBusConfigured(t *testing.T) {
 	require.Error(t, bidi.closeSendErr, "expected CloseSend with error when bus factory is nil")
 }
 
-func TestSubscribeEmitsHeartbeats(t *testing.T) {
+func TestShouldSubscribeEmitsHeartbeats(t *testing.T) {
 	store := &mockStore{}
 	messageBus := &mockMessageBus{}
 	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
@@ -504,7 +504,7 @@ func TestSubscribeEmitsHeartbeats(t *testing.T) {
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
-func TestSubscribeSendsInitialSegmentSnapshot(t *testing.T) {
+func TestShouldSubscribeSendsInitialSegmentSnapshot(t *testing.T) {
 	store := &mockStore{
 		entries: []*api.Entry{
 			{Space: "s", Segment: "seg", Sequence: 1, Timestamp: 100},
@@ -544,7 +544,7 @@ func TestSubscribeSendsInitialSegmentSnapshot(t *testing.T) {
 	waitForClosed(t, bidi)
 }
 
-func TestSubscribeSendsInitialSpaceSnapshots(t *testing.T) {
+func TestShouldSubscribeSendsInitialSpaceSnapshots(t *testing.T) {
 	store := &spaceSnapshotStore{
 		segments: []string{"seg-b", "seg-a"},
 		first: map[string]*api.Entry{
@@ -592,7 +592,7 @@ func TestSubscribeSendsInitialSpaceSnapshots(t *testing.T) {
 	waitForClosed(t, bidi)
 }
 
-func TestSubscribeBuffersNotificationsUntilSnapshotCompletes(t *testing.T) {
+func TestShouldSubscribeBuffersNotificationsUntilSnapshotCompletes(t *testing.T) {
 	store := &blockingSpaceSnapshotStore{
 		spaceSnapshotStore: &spaceSnapshotStore{
 			segments: []string{"seg-b", "seg-a"},
@@ -704,7 +704,7 @@ func TestSubscribeBuffersNotificationsUntilSnapshotCompletes(t *testing.T) {
 	waitForClosed(t, bidi)
 }
 
-func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
+func TestShouldSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 	store := &mockStore{}
 	messageBus := &mockMessageBus{}
 	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
@@ -727,7 +727,7 @@ func TestSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
-func TestSubscribeSharesBusSubscriptionPerSpace(t *testing.T) {
+func TestShouldSubscribeSharesBusSubscriptionPerSpace(t *testing.T) {
 	messageBus := &mockMessageBus{}
 	storeID := uuid.New()
 	node := NewNode(storeID, &mockStore{}, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
@@ -802,7 +802,7 @@ func TestSubscribeSharesBusSubscriptionPerSpace(t *testing.T) {
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
-func TestSubscribeRoutesNotificationsToWildcardAndExactSubscribers(t *testing.T) {
+func TestShouldSubscribeRoutesNotificationsToWildcardAndExactSubscribers(t *testing.T) {
 	messageBus := &mockMessageBus{}
 	storeID := uuid.New()
 	node := NewNode(storeID, &mockStore{}, &mockMessageBusFactory{bus: messageBus}, lease.NewStore())
@@ -895,7 +895,7 @@ func TestSubscribeRoutesNotificationsToWildcardAndExactSubscribers(t *testing.T)
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
 }
 
-func TestClampSubscriptionHeartbeatIntervalSeconds(t *testing.T) {
+func TestShouldClampSubscriptionHeartbeatIntervalSeconds(t *testing.T) {
 	assert.Equal(t, int64(0), clampSubscriptionHeartbeatIntervalSeconds(0))
 	assert.Equal(t, int64(1), clampSubscriptionHeartbeatIntervalSeconds(1))
 	assert.Equal(t, int64(maxSubscriptionHeartbeatIntervalSeconds), clampSubscriptionHeartbeatIntervalSeconds(3600))
@@ -977,7 +977,7 @@ func (e *errorEnumerator[T]) Current() (T, error) { var zero T; return zero, e.e
 func (e *errorEnumerator[T]) Dispose()            {}
 func (e *errorEnumerator[T]) Err() error          { return e.err }
 
-func TestStreamNamesCurrentError(t *testing.T) {
+func TestShouldStreamNamesCurrentError(t *testing.T) {
 	// override GetSpaces to return an error enumerator
 	storeGetter := func(ctx context.Context) enumerators.Enumerator[string] {
 		return &errorEnumerator[string]{err: errors.New("bad current")}
@@ -1084,7 +1084,7 @@ type bidiEncodeFail struct {
 
 func (b *bidiEncodeFail) Encode(m any) error { return b.fail }
 
-func TestStreamEntriesEncodeError(t *testing.T) {
+func TestShouldStreamEntriesEncodeError(t *testing.T) {
 	store := &mockStore{entries: []*api.Entry{{Space: "s", Segment: "seg"}}}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
@@ -1096,7 +1096,7 @@ func TestStreamEntriesEncodeError(t *testing.T) {
 	require.Error(t, bidi.closeSendErr, "expected CloseSend with encode error")
 }
 
-func TestHandlePeekWithCanceledContext(t *testing.T) {
+func TestShouldHandlePeekWithCanceledContext(t *testing.T) {
 	store := &mockStore{peekEntry: nil}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
 
@@ -1110,7 +1110,7 @@ func TestHandlePeekWithCanceledContext(t *testing.T) {
 	require.Error(t, bidi.closeSendErr, "expected CloseSend with context canceled error")
 }
 
-func TestHandleDecodeErrorClosesStream(t *testing.T) {
+func TestShouldHandleDecodeErrorClosesStream(t *testing.T) {
 	mb := &mockBidi{closed: make(chan struct{})}
 	bidi := &badBidi{mockBidi: mb, decErr: errors.New("decode failed")}
 	node := NewNode(uuid.New(), &mockStore{}, nil, lease.NewStore())
@@ -1119,7 +1119,7 @@ func TestHandleDecodeErrorClosesStream(t *testing.T) {
 	require.Error(t, bidi.closeErr, "expected Close called with decode error")
 }
 
-func TestStreamEntriesCurrentError(t *testing.T) {
+func TestShouldStreamEntriesCurrentError(t *testing.T) {
 	node := NewNode(uuid.New(), &badSegStore{}, nil, lease.NewStore())
 	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
 	bidi := newMockBidi(env)
@@ -1207,7 +1207,7 @@ func TestShouldEndConsumeSegmentSpanBeforeStreamingCompletes(t *testing.T) {
 	waitForClosed(t, bidi)
 }
 
-func TestNodeCloseAndManagerClose(t *testing.T) {
+func TestShouldNodeCloseAndManagerClose(t *testing.T) {
 	// test Node.Close calls store.Close
 	closed := false
 	s := &closableStore{closed: &closed}

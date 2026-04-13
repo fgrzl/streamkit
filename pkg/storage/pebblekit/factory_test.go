@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewStoreFactoryShouldKeepProvidedOptions(t *testing.T) {
+func TestShouldKeepProvidedOptionsWhenNewStoreFactory(t *testing.T) {
 	options := &PebbleStoreOptions{Path: t.TempDir()}
 
 	factory, err := NewStoreFactory(options)
@@ -20,7 +20,7 @@ func TestNewStoreFactoryShouldKeepProvidedOptions(t *testing.T) {
 	assert.Same(t, options, factory.options)
 }
 
-func TestStoreFactoryShouldCreateStoreInStoreScopedDirectory(t *testing.T) {
+func TestShouldCreateStoreInStoreScopedDirectoryWhenStoreFactory(t *testing.T) {
 	options := &PebbleStoreOptions{Path: t.TempDir()}
 	factory, err := NewStoreFactory(options)
 	require.NoError(t, err)
@@ -39,7 +39,7 @@ func TestStoreFactoryShouldCreateStoreInStoreScopedDirectory(t *testing.T) {
 	assert.DirExists(t, filepath.Join(options.Path, storeID.String(), "streams"))
 }
 
-func TestStoreFactoryShouldCreateDistinctDirectoriesPerStoreID(t *testing.T) {
+func TestShouldCreateDistinctDirectoriesPerStoreIDWhenStoreFactory(t *testing.T) {
 	options := &PebbleStoreOptions{Path: t.TempDir()}
 	factory, err := NewStoreFactory(options)
 	require.NoError(t, err)

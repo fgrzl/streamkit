@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewStoreFactoryShouldRequireAccountNameWithoutHTTPClient(t *testing.T) {
+func TestShouldRequireAccountNameWithoutHTTPClientWhenNewStoreFactory(t *testing.T) {
 	factory, err := NewStoreFactory(context.Background(), &AzureStoreOptions{})
 
 	require.Error(t, err)
@@ -18,7 +18,7 @@ func TestNewStoreFactoryShouldRequireAccountNameWithoutHTTPClient(t *testing.T) 
 	assert.ErrorContains(t, err, "account name is required")
 }
 
-func TestNewStoreFactoryShouldRequireAccountKeyWhenNotUsingManagedIdentity(t *testing.T) {
+func TestShouldRequireAccountKeyWhenNotUsingManagedIdentityWhenNewStoreFactory(t *testing.T) {
 	factory, err := NewStoreFactory(context.Background(), &AzureStoreOptions{AccountName: "account"})
 
 	require.Error(t, err)
@@ -26,7 +26,7 @@ func TestNewStoreFactoryShouldRequireAccountKeyWhenNotUsingManagedIdentity(t *te
 	assert.ErrorContains(t, err, "account key is required")
 }
 
-func TestNewStoreFactoryShouldAllowManagedIdentityWithoutAccountKey(t *testing.T) {
+func TestShouldAllowManagedIdentityWithoutAccountKeyWhenNewStoreFactory(t *testing.T) {
 	factory, err := NewStoreFactory(context.Background(), &AzureStoreOptions{
 		AccountName:        "account",
 		UseManagedIdentity: true,
@@ -37,7 +37,7 @@ func TestNewStoreFactoryShouldAllowManagedIdentityWithoutAccountKey(t *testing.T
 	assert.True(t, factory.options.UseManagedIdentity)
 }
 
-func TestNewStoreFactoryShouldAllowInjectedHTTPClientWithoutCredentials(t *testing.T) {
+func TestShouldAllowInjectedHTTPClientWithoutCredentialsWhenNewStoreFactory(t *testing.T) {
 	factory, err := NewStoreFactory(context.Background(), &AzureStoreOptions{
 		HTTPClient: &client.HTTPTableClient{},
 	})
@@ -47,7 +47,7 @@ func TestNewStoreFactoryShouldAllowInjectedHTTPClientWithoutCredentials(t *testi
 	assert.NotNil(t, factory.options.HTTPClient)
 }
 
-func TestSanitizeTableNameShouldNormalizeAccordingToAzureRules(t *testing.T) {
+func TestShouldNormalizeAccordingToAzureRulesWhenSanitizeTableName(t *testing.T) {
 	longName := "a" + strings.Repeat("b", 80)
 
 	tests := []struct {

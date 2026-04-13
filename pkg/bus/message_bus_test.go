@@ -70,7 +70,7 @@ func (m *otherTestMessage) GetRoute() Route {
 	return m.route
 }
 
-func TestSubscribeShouldDelegateToUnderlyingBus(t *testing.T) {
+func TestShouldDelegateToUnderlyingBusWhenSubscribe(t *testing.T) {
 	route := NewGlobalRoute("streams", "segment-updated")
 	bus := &testMessageBus{}
 
@@ -85,7 +85,7 @@ func TestSubscribeShouldDelegateToUnderlyingBus(t *testing.T) {
 	assert.Equal(t, 1, bus.subscribeCalls)
 }
 
-func TestSubscribeShouldDispatchMatchingTypedMessages(t *testing.T) {
+func TestShouldDispatchMatchingTypedMessagesWhenSubscribe(t *testing.T) {
 	route := NewGlobalRoute("streams", "segment-updated")
 	bus := &testMessageBus{}
 	message := &testMessage{route: route, value: "ok"}
@@ -103,7 +103,7 @@ func TestSubscribeShouldDispatchMatchingTypedMessages(t *testing.T) {
 	assert.Same(t, message, handled)
 }
 
-func TestSubscribeShouldReturnErrorForUnexpectedMessageType(t *testing.T) {
+func TestShouldReturnErrorForUnexpectedMessageTypeWhenSubscribe(t *testing.T) {
 	route := NewGlobalRoute("streams", "segment-updated")
 	bus := &testMessageBus{}
 
@@ -119,7 +119,7 @@ func TestSubscribeShouldReturnErrorForUnexpectedMessageType(t *testing.T) {
 	assert.ErrorContains(t, err, "otherTestMessage")
 }
 
-func TestSubscribeShouldPropagateUnderlyingSubscribeError(t *testing.T) {
+func TestShouldPropagateUnderlyingSubscribeErrorWhenSubscribe(t *testing.T) {
 	expectedErr := errors.New("subscribe failed")
 	bus := &testMessageBus{subscribeErr: expectedErr}
 	route := NewGlobalRoute("streams", "segment-updated")

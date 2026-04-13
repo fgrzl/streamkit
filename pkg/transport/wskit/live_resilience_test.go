@@ -797,7 +797,7 @@ func runLiveConsumeRetryScenario(t *testing.T, tc liveConsumeCase, disruption st
 	assert.Equal(t, tc.expected, got)
 }
 
-func TestLiveConsumeEnumeratorsRequireRetryAfterWebSocketDrop(t *testing.T) {
+func TestShouldLiveConsumeEnumeratorsRequireRetryAfterWebSocketDrop(t *testing.T) {
 	for _, tc := range liveConsumeCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			runLiveConsumeRetryScenario(t, tc, "websocket-drop")
@@ -805,7 +805,7 @@ func TestLiveConsumeEnumeratorsRequireRetryAfterWebSocketDrop(t *testing.T) {
 	}
 }
 
-func TestLiveConsumeEnumeratorsRequireRetryAfterServerRestart(t *testing.T) {
+func TestShouldLiveConsumeEnumeratorsRequireRetryAfterServerRestart(t *testing.T) {
 	for _, tc := range liveConsumeCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			runLiveConsumeRetryScenario(t, tc, "server-restart")
@@ -813,7 +813,7 @@ func TestLiveConsumeEnumeratorsRequireRetryAfterServerRestart(t *testing.T) {
 	}
 }
 
-func TestLiveConsumeEnumeratorsRequireRetryAfterAuthFailureOnReconnect(t *testing.T) {
+func TestShouldLiveConsumeEnumeratorsRequireRetryAfterAuthFailureOnReconnect(t *testing.T) {
 	for _, tc := range liveConsumeCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			runLiveConsumeRetryScenario(t, tc, "auth-refresh")
@@ -821,7 +821,7 @@ func TestLiveConsumeEnumeratorsRequireRetryAfterAuthFailureOnReconnect(t *testin
 	}
 }
 
-func TestLiveClientRecoversAfterWebSocketDrop(t *testing.T) {
+func TestShouldLiveClientRecoversAfterWebSocketDrop(t *testing.T) {
 	secret := []byte("drop-secret")
 	server := newLivePebbleWebSocketServer(t, t.TempDir(), &jwtkit.HMAC256Validator{Secret: secret})
 	token := signWebSocketToken(t, secret, ScopeAllStores)
@@ -851,7 +851,7 @@ func TestLiveClientRecoversAfterWebSocketDrop(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond)
 }
 
-func TestLiveClientRecoversAfterServerRestart(t *testing.T) {
+func TestShouldLiveClientRecoversAfterServerRestart(t *testing.T) {
 	path := t.TempDir()
 	secret := []byte("restart-secret")
 	server := newLivePebbleWebSocketServer(t, path, &jwtkit.HMAC256Validator{Secret: secret})
@@ -892,7 +892,7 @@ func TestLiveClientRecoversAfterServerRestart(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond)
 }
 
-func TestLiveClientRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T) {
+func TestShouldLiveClientRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T) {
 	secretA := []byte("rotate-secret-a")
 	secretB := []byte("rotate-secret-b")
 	validator := &jwtkit.HMAC256Validator{Secret: secretA}
@@ -943,7 +943,7 @@ func TestLiveClientRefreshesTokenAfterAuthFailureOnReconnect(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond)
 }
 
-func TestLiveSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *testing.T) {
+func TestShouldLiveSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *testing.T) {
 	secretA := []byte("subscription-rotate-secret-a")
 	secretB := []byte("subscription-rotate-secret-b")
 	validator := &jwtkit.HMAC256Validator{Secret: secretA}
@@ -1043,7 +1043,7 @@ func TestLiveSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *testing.
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
-func TestLiveSpaceSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *testing.T) {
+func TestShouldLiveSpaceSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *testing.T) {
 	secretA := []byte("space-subscription-rotate-secret-a")
 	secretB := []byte("space-subscription-rotate-secret-b")
 	validator := &jwtkit.HMAC256Validator{Secret: secretA}
@@ -1157,7 +1157,7 @@ func TestLiveSpaceSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *tes
 	assert.Equal(t, uint64(1), recovered["seg-b"].LastSequence)
 }
 
-func TestLiveSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) {
+func TestShouldLiveSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) {
 	secret := []byte("subscription-drop-secret")
 	server := newLivePebbleWebSocketServer(t, t.TempDir(), &jwtkit.HMAC256Validator{Secret: secret})
 	token := signWebSocketToken(t, secret, ScopeAllStores)
@@ -1230,7 +1230,7 @@ func TestLiveSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) {
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
-func TestLiveSubscriptionRequiresRecreateAfterServerRestart(t *testing.T) {
+func TestShouldLiveSubscriptionRequiresRecreateAfterServerRestart(t *testing.T) {
 	path := t.TempDir()
 	secret := []byte("subscription-restart-secret")
 	server := newLivePebbleWebSocketServer(t, path, &jwtkit.HMAC256Validator{Secret: secret})
@@ -1313,7 +1313,7 @@ func TestLiveSubscriptionRequiresRecreateAfterServerRestart(t *testing.T) {
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
-func TestLiveSpaceSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) {
+func TestShouldLiveSpaceSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) {
 	secret := []byte("space-subscription-drop-secret")
 	server := newLivePebbleWebSocketServer(t, t.TempDir(), &jwtkit.HMAC256Validator{Secret: secret})
 	token := signWebSocketToken(t, secret, ScopeAllStores)
