@@ -9,9 +9,14 @@ import (
 	"time"
 
 	"github.com/fgrzl/streamkit/pkg/api"
+	"github.com/fgrzl/streamkit/pkg/telemetry"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/websocket"
 )
 
@@ -199,6 +204,82 @@ func TestShouldCallStreamRetriesOnBenignDisconnect(t *testing.T) {
 	_ = b.Close
 }
 
+func TestShouldDetachCallStreamSpanFromCaller(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+	})
+
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)))
+	otel.SetTracerProvider(tp)
+	defer tp.Shutdown(context.Background())
+
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+
+	capture := &capturingMuxer{
+		bidi: &testBidi{
+			encodeFn: func(any) error { return nil },
+		},
+	}
+	p.dialFn = func() (*websocket.Conn, error) { return nil, nil }
+	p.newClientMuxer = func(ctx context.Context, session MuxerSession, conn *websocket.Conn) providerMuxer {
+		return capture
+	}
+
+	requestID := uuid.New()
+	tracer := telemetry.GetTracer()
+	parentCtx := telemetry.WithRequestIDContext(context.Background(), requestID)
+	parentCtx, parentSpan := tracer.Start(parentCtx, "caller")
+
+	for i := 0; i < 2; i++ {
+		bidi, err := p.CallStream(parentCtx, uuid.New(), &api.GetStatus{})
+		require.NoError(t, err)
+		if bidi != nil {
+			bidi.Close(nil)
+		}
+	}
+	parentSpan.End()
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exporter.GetSpans()
+
+	var callerSpan *tracetest.SpanStub
+	transportSpans := make([]*tracetest.SpanStub, 0, 2)
+	for i := range spans {
+		s := &spans[i]
+		switch s.Name {
+		case "caller":
+			callerSpan = s
+		case "streamkit.transport.call_stream":
+			transportSpans = append(transportSpans, s)
+		}
+	}
+
+	require.NotNil(t, callerSpan, "expected parent span to be exported")
+	require.Len(t, transportSpans, 2, "expected one transport span per CallStream invocation")
+
+	parentTraceID := callerSpan.SpanContext.TraceID()
+	seenTransportTraceIDs := make(map[string]struct{}, len(transportSpans))
+	for _, transportSpan := range transportSpans {
+		assert.NotEqual(t, parentTraceID, transportSpan.SpanContext.TraceID(), "transport span should start a new trace")
+		require.Len(t, transportSpan.Links, 1, "transport span should keep a link to the caller span")
+		assert.Equal(t, parentTraceID, transportSpan.Links[0].SpanContext.TraceID())
+		seenTransportTraceIDs[transportSpan.SpanContext.TraceID().String()] = struct{}{}
+	}
+	assert.Len(t, seenTransportTraceIDs, 2, "each CallStream should create its own transport trace")
+
+	require.Len(t, capture.contexts, 2)
+	for _, capturedCtx := range capture.contexts {
+		gotRequestID, ok := telemetry.RequestIDFromContext(capturedCtx)
+		require.True(t, ok, "expected request ID to survive detachment")
+		assert.Equal(t, requestID, gotRequestID)
+		assert.True(t, oteltrace.SpanFromContext(capturedCtx).SpanContext().IsValid())
+		assert.NotEqual(t, parentTraceID, oteltrace.SpanFromContext(capturedCtx).SpanContext().TraceID())
+	}
+}
+
 // testBidi implements api.BidiStream for tests
 type testBidi struct {
 	encodeFn func(any) error
@@ -338,6 +419,19 @@ func (f *fakeMuxer) RegisterWithContext(context.Context, uuid.UUID, uuid.UUID) a
 	return f.bidi
 }
 func (f *fakeMuxer) Close(_ error) { atomic.AddInt32(&f.closeCalls, 1) }
+
+type capturingMuxer struct {
+	bidi     api.BidiStream
+	contexts []context.Context
+}
+
+func (m *capturingMuxer) Ping() bool                                   { return true }
+func (m *capturingMuxer) Register(uuid.UUID, uuid.UUID) api.BidiStream { return m.bidi }
+func (m *capturingMuxer) RegisterWithContext(ctx context.Context, _, _ uuid.UUID) api.BidiStream {
+	m.contexts = append(m.contexts, ctx)
+	return m.bidi
+}
+func (m *capturingMuxer) Close(_ error) {}
 
 func TestShouldCloseMuxerClosesArbitraryProviderMuxer(t *testing.T) {
 	// Arrange

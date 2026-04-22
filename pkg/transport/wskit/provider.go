@@ -106,13 +106,11 @@ func NewBidiStreamProvider(addr string, fetchJWT func() (string, error), opts ..
 // CallStream opens or reuses a muxed stream over the WebSocket for a single logical interaction.
 // Implements resilient retry with exponential backoff for transient muxer closure.
 func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uuid.UUID, msg api.Routeable) (api.BidiStream, error) {
-	tracer := telemetry.GetTracer()
-	ctx, span := tracer.Start(ctx, "streamkit.transport.call_stream",
-		trace.WithAttributes(
-			telemetry.WithStoreID(storeID),
-			telemetry.WithTransportType("websocket"),
-		))
-	defer span.End()
+	ctx, span, cancel := p.operationContext(ctx, storeID)
+	defer func() {
+		cancel()
+		span.End()
+	}()
 
 	// Retry loop for transient muxer closure: if muxer closes during Encode,
 	// recreate the muxer and retry with exponential backoff.
@@ -401,7 +399,36 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 				}
 			}
 		}()
+
 	})
+}
+
+func (p *WebSocketBidiStreamProvider) operationContext(parent context.Context, storeID uuid.UUID) (context.Context, trace.Span, context.CancelFunc) {
+	detached := context.Background()
+	if requestID, ok := telemetry.RequestIDFromContext(parent); ok {
+		detached = telemetry.WithRequestIDContext(detached, requestID)
+	}
+
+	spanOpts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			telemetry.WithStoreID(storeID),
+			telemetry.WithTransportType("websocket"),
+		),
+	}
+	if requestID, ok := telemetry.RequestIDFromContext(parent); ok {
+		spanOpts = append(spanOpts, trace.WithAttributes(telemetry.WithRequestID(requestID)))
+	}
+	if callerSpanContext := trace.SpanContextFromContext(parent); callerSpanContext.IsValid() {
+		spanOpts = append(spanOpts, trace.WithLinks(trace.Link{SpanContext: callerSpanContext}))
+	}
+
+	opCtx, span := telemetry.GetTracer().Start(detached, "streamkit.transport.call_stream", spanOpts...)
+	bound, cancelBound := context.WithCancel(opCtx)
+	stopParentCancel := context.AfterFunc(parent, cancelBound)
+	return bound, span, func() {
+		stopParentCancel()
+		cancelBound()
+	}
 }
 
 // getOrCreateMuxer dials and initializes or returns the current muxer.
