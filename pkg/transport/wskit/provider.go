@@ -645,21 +645,41 @@ func (p *WebSocketBidiStreamProvider) dial() (*websocket.Conn, error) {
 
 // RegisterReconnectListener registers a listener to be notified when the provider reconnects.
 func (p *WebSocketBidiStreamProvider) RegisterReconnectListener(listener api.ReconnectListener) {
+	if listener == nil {
+		return
+	}
 	p.listenersMu.Lock()
 	defer p.listenersMu.Unlock()
+	for _, existing := range p.listeners {
+		if existing == listener {
+			return
+		}
+	}
 	p.listeners = append(p.listeners, listener)
 }
 
 // UnregisterReconnectListener removes a previously registered reconnect listener.
 func (p *WebSocketBidiStreamProvider) UnregisterReconnectListener(listener api.ReconnectListener) {
+	if listener == nil {
+		return
+	}
 	p.listenersMu.Lock()
 	defer p.listenersMu.Unlock()
-	for i, l := range p.listeners {
-		if l == listener {
-			p.listeners = append(p.listeners[:i], p.listeners[i+1:]...)
-			break
+	kept := p.listeners[:0]
+	for _, existing := range p.listeners {
+		if existing != listener {
+			kept = append(kept, existing)
 		}
 	}
+	p.listeners = kept
+}
+
+// ReconnectListenerCount returns the number of currently registered reconnect listeners.
+// Intended for diagnostics and tests.
+func (p *WebSocketBidiStreamProvider) ReconnectListenerCount() int {
+	p.listenersMu.RLock()
+	defer p.listenersMu.RUnlock()
+	return len(p.listeners)
 }
 
 // notifyReconnected calls all registered listeners to notify them of a successful reconnect.

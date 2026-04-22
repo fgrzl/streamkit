@@ -162,9 +162,20 @@ type AzureStore struct {
 	wg                  sync.WaitGroup
 	shuttingDown        atomic.Bool
 	closeOnce           sync.Once
+	activeTasks         atomic.Int64
+	walMonitorRestarts  atomic.Int32
 	opts                *AzureStoreOptions
 	stopWALMonitor      chan struct{}
 	walRecoveryComplete chan struct{}
+}
+
+// AzureStoreDiagnostics captures a point-in-time view of background lifecycle
+// and cardinality signals useful during leak triage.
+type AzureStoreDiagnostics struct {
+	ShuttingDown       bool
+	ActiveTasks        int64
+	WALMonitorRestarts int32
+	CacheCleanupPanics int32
 }
 
 // DiagnoseAuth exposes diagnostic information about the authentication
@@ -362,6 +373,22 @@ func (s *AzureStore) Close() {
 	})
 }
 
+// DiagnosticsSnapshot returns a thread-safe snapshot of Azure store lifecycle
+// counters for observability/debugging.
+func (s *AzureStore) DiagnosticsSnapshot() AzureStoreDiagnostics {
+	cleanupPanics := int32(0)
+	if s.cache != nil {
+		cleanupPanics = s.cache.CleanupPanicCount()
+	}
+
+	return AzureStoreDiagnostics{
+		ShuttingDown:       s.shuttingDown.Load(),
+		ActiveTasks:        s.activeTasks.Load(),
+		WALMonitorRestarts: s.walMonitorRestarts.Load(),
+		CacheCleanupPanics: cleanupPanics,
+	}
+}
+
 // Private Instance Methods
 
 func (s *AzureStore) processChunkWithRetry(ctx context.Context, space, segment string, chunk enumerators.Enumerator[*api.Record], lastSeq, lastTrx *uint64) (*api.SegmentStatus, error) {
@@ -514,10 +541,12 @@ func (s *AzureStore) beginTask() bool {
 		s.wg.Done()
 		return false
 	}
+	s.activeTasks.Add(1)
 	return true
 }
 
 func (s *AzureStore) endTask() {
+	s.activeTasks.Add(-1)
 	s.wg.Done()
 }
 
@@ -595,6 +624,7 @@ func (s *AzureStore) walMonitorLoop(ctx context.Context) {
 			slog.ErrorContext(ctx, "WAL monitor panicked, restarting",
 				slog.Any("panic", r), slog.Int("restarts", restartCount))
 			if restartCount < maxRestarts {
+				s.walMonitorRestarts.Add(1)
 				time.Sleep(time.Duration(restartCount+1) * time.Second) // Exponential backoff
 				restartCount++
 				go s.walMonitorLoopWithRestarts(ctx, restartCount)
@@ -639,6 +669,7 @@ func (s *AzureStore) walMonitorLoopWithRestarts(ctx context.Context, restartCoun
 			slog.ErrorContext(ctx, "WAL monitor panicked, restarting",
 				slog.Any("panic", r), slog.Int("restarts", restartCount))
 			if restartCount < maxRestarts {
+				s.walMonitorRestarts.Add(1)
 				time.Sleep(time.Duration(restartCount+1) * time.Second)
 				go s.walMonitorLoopWithRestarts(ctx, restartCount+1)
 			} else {

@@ -275,6 +275,37 @@ func TestShouldClassifyAzureErrorsAndConfigurationDefaults(t *testing.T) {
 	assert.Equal(t, 2048, configuredStore.maxTransactionPayloadBytes())
 }
 
+func TestShouldExposeAzureStoreDiagnosticsSnapshot(t *testing.T) {
+	c := cache.NewExpiringCache(50*time.Millisecond, 10*time.Millisecond)
+	t.Cleanup(c.Close)
+
+	store := &AzureStore{cache: c}
+	store.shuttingDown.Store(true)
+	store.activeTasks.Store(3)
+	store.walMonitorRestarts.Store(2)
+
+	snapshot := store.DiagnosticsSnapshot()
+
+	assert.True(t, snapshot.ShuttingDown)
+	assert.Equal(t, int64(3), snapshot.ActiveTasks)
+	assert.Equal(t, int32(2), snapshot.WALMonitorRestarts)
+	assert.Equal(t, int32(0), snapshot.CacheCleanupPanics)
+}
+
+func TestShouldTrackActiveTasksLifecycle(t *testing.T) {
+	store := &AzureStore{}
+
+	require.True(t, store.beginTask())
+	assert.Equal(t, int64(1), store.activeTasks.Load())
+
+	store.endTask()
+	assert.Equal(t, int64(0), store.activeTasks.Load())
+
+	store.shuttingDown.Store(true)
+	assert.False(t, store.beginTask())
+	assert.Equal(t, int64(0), store.activeTasks.Load())
+}
+
 func TestShouldCalculateAzureTimeAndSegmentBounds(t *testing.T) {
 	spaceBounds := calculateTimeBounds(100, 200, 0)
 	assert.Equal(t, int64(100), spaceBounds.Min)

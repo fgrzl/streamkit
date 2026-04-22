@@ -357,6 +357,33 @@ func (l *testReconnectListener) count() int {
 	return l.reconnected
 }
 
+func TestShouldRegisterReconnectListenerIdempotently(t *testing.T) {
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+
+	listener := &testReconnectListener{}
+	p.RegisterReconnectListener(listener)
+	p.RegisterReconnectListener(listener)
+
+	assert.Equal(t, 1, p.ReconnectListenerCount())
+}
+
+func TestShouldUnregisterReconnectListenerWithoutAffectingOthers(t *testing.T) {
+	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
+	defer p.Close()
+
+	listenerA := &testReconnectListener{}
+	listenerB := &testReconnectListener{}
+	p.RegisterReconnectListener(listenerA)
+	p.RegisterReconnectListener(listenerB)
+
+	p.UnregisterReconnectListener(listenerA)
+
+	assert.Equal(t, 1, p.ReconnectListenerCount())
+	p.UnregisterReconnectListener(listenerB)
+	assert.Equal(t, 0, p.ReconnectListenerCount())
+}
+
 // TestBackgroundReconnectNotifiesListeners verifies that when the background
 // reconnect loop re-establishes a muxer, registered ReconnectListeners are notified.
 func TestShouldBackgroundReconnectNotifiesListeners(t *testing.T) {

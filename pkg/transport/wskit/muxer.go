@@ -121,6 +121,25 @@ type WebSocketMuxer struct {
 	recvJSON func(conn *websocket.Conn, v interface{}) error
 }
 
+// MuxerDiagnostics provides a point-in-time snapshot of resource/cardinality
+// signals that are useful for leak triage in long-running processes.
+type MuxerDiagnostics struct {
+	ActiveStreams          int64
+	ChannelsCount          int
+	TombstonesCount        int
+	WriteQueueDepth        int64
+	WriteQueueCapacity     int
+	WriteQueueFallbacks    int64
+	WriteQueueBlocks       int64
+	StreamRecvDepth        int64
+	StreamRecvBlocks       int64
+	StreamRecvTimeouts     int64
+	StreamRecvOverloads    int64
+	SaturationWarnings     int64
+	StreamRecvQueueSize    int
+	StreamRecvOfferTimeout time.Duration
+}
+
 // sentinel errors
 var (
 	ErrMuxerClosed      = errors.New("muxer closed")
@@ -1548,6 +1567,37 @@ func (m *WebSocketMuxer) Close(err error) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	m.shutdown(err)
+}
+
+// DiagnosticsSnapshot returns a thread-safe snapshot of key muxer counters and
+// cardinalities for observability/debugging.
+func (m *WebSocketMuxer) DiagnosticsSnapshot() MuxerDiagnostics {
+	m.channelsMu.RLock()
+	channelsCount := len(m.channels)
+	tombstonesCount := len(m.tombstones)
+	m.channelsMu.RUnlock()
+
+	writeDepth := int64(0)
+	if m.writeQueue != nil {
+		writeDepth = int64(len(m.writeQueue))
+	}
+
+	return MuxerDiagnostics{
+		ActiveStreams:          atomic.LoadInt64(&m.activeStreams),
+		ChannelsCount:          channelsCount,
+		TombstonesCount:        tombstonesCount,
+		WriteQueueDepth:        writeDepth,
+		WriteQueueCapacity:     m.writeQueueCapacity(),
+		WriteQueueFallbacks:    atomic.LoadInt64(&m.writeQueueFallbacks),
+		WriteQueueBlocks:       atomic.LoadInt64(&m.writeQueueBlocks),
+		StreamRecvDepth:        atomic.LoadInt64(&m.streamRecvDepth),
+		StreamRecvBlocks:       atomic.LoadInt64(&m.streamRecvBlocks),
+		StreamRecvTimeouts:     atomic.LoadInt64(&m.streamRecvTimeouts),
+		StreamRecvOverloads:    atomic.LoadInt64(&m.streamRecvOverloads),
+		SaturationWarnings:     atomic.LoadInt64(&m.writeQueueSaturationWarnings),
+		StreamRecvQueueSize:    m.streamRecvQueueCapacity(),
+		StreamRecvOfferTimeout: m.streamRecvWaitTimeout(),
+	}
 }
 
 // Metrics accessors (atomic snapshots)

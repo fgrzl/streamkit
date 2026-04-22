@@ -334,6 +334,52 @@ func TestShouldShutdownOnSendDataError(t *testing.T) {
 	}, time.Second, 10*time.Millisecond, "expected muxer to be shutdown after send error")
 }
 
+func TestShouldReturnMuxerDiagnosticsSnapshot(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:                context.Background(),
+		name:                   "test",
+		done:                   make(chan struct{}),
+		channels:               make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:             make(map[uuid.UUID]error),
+		writeQueueSize:         8,
+		writeQueueOfferTimeout: 50 * time.Millisecond,
+		writeQueue:             make(chan *MuxerMsg, 8),
+		streamRecvQueueSize:    16,
+		streamRecvOfferTimeout: 25 * time.Millisecond,
+	}
+
+	channelID := uuid.New()
+	m.channels[channelID] = NewMuxerBidiStream(func([]byte) error { return nil }, func() {})
+	m.tombstones[uuid.New()] = ErrMuxerClosed
+	m.writeQueue <- &MuxerMsg{ControlType: ControlTypePing}
+
+	atomic.StoreInt64(&m.activeStreams, 3)
+	atomic.StoreInt64(&m.streamRecvDepth, 4)
+	atomic.StoreInt64(&m.writeQueueFallbacks, 5)
+	atomic.StoreInt64(&m.writeQueueBlocks, 6)
+	atomic.StoreInt64(&m.streamRecvBlocks, 7)
+	atomic.StoreInt64(&m.streamRecvTimeouts, 8)
+	atomic.StoreInt64(&m.streamRecvOverloads, 9)
+	atomic.StoreInt64(&m.writeQueueSaturationWarnings, 10)
+
+	snapshot := m.DiagnosticsSnapshot()
+
+	assert.Equal(t, int64(3), snapshot.ActiveStreams)
+	assert.Equal(t, 1, snapshot.ChannelsCount)
+	assert.Equal(t, 1, snapshot.TombstonesCount)
+	assert.Equal(t, int64(1), snapshot.WriteQueueDepth)
+	assert.Equal(t, 8, snapshot.WriteQueueCapacity)
+	assert.Equal(t, int64(5), snapshot.WriteQueueFallbacks)
+	assert.Equal(t, int64(6), snapshot.WriteQueueBlocks)
+	assert.Equal(t, int64(4), snapshot.StreamRecvDepth)
+	assert.Equal(t, int64(7), snapshot.StreamRecvBlocks)
+	assert.Equal(t, int64(8), snapshot.StreamRecvTimeouts)
+	assert.Equal(t, int64(9), snapshot.StreamRecvOverloads)
+	assert.Equal(t, int64(10), snapshot.SaturationWarnings)
+	assert.Equal(t, 16, snapshot.StreamRecvQueueSize)
+	assert.Equal(t, 25*time.Millisecond, snapshot.StreamRecvOfferTimeout)
+}
+
 func TestShouldTrackWriteQueueDepthAcrossEnqueueAndDrain(t *testing.T) {
 	m := newQueueTestMuxer(2)
 
