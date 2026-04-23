@@ -140,6 +140,25 @@ func TestShouldClearFailureStateAfterSuccessfulRecovery(t *testing.T) {
 	assert.False(t, exists)
 }
 
+func TestShouldPruneExpiredFailureEntriesOnLookup(t *testing.T) {
+	factory := &scriptedStoreFactory{}
+	manager := NewNodeManager(WithStoreFactory(factory)).(*nodeManager)
+	manager.failureWindow = time.Minute
+
+	expiredStoreID := uuid.New()
+	recentStoreID := uuid.New()
+	manager.failures[expiredStoreID] = &storeFailure{count: 2, lastFailed: time.Now().Add(-manager.failureWindow - time.Second)}
+	manager.failures[recentStoreID] = &storeFailure{count: 1, lastFailed: time.Now()}
+
+	_, err := manager.GetOrCreate(context.Background(), uuid.New())
+	require.NoError(t, err)
+
+	_, expiredExists := manager.failures[expiredStoreID]
+	_, recentExists := manager.failures[recentStoreID]
+	assert.False(t, expiredExists)
+	assert.True(t, recentExists)
+}
+
 func TestShouldCloseManagedNodesOnlyOnce(t *testing.T) {
 	store := &closeCountingStore{}
 	factory := &scriptedStoreFactory{store: store}
@@ -148,9 +167,12 @@ func TestShouldCloseManagedNodesOnlyOnce(t *testing.T) {
 
 	_, err := manager.GetOrCreate(context.Background(), storeID)
 	require.NoError(t, err)
+	manager.failures[uuid.New()] = &storeFailure{count: 1, lastFailed: time.Now()}
 
 	manager.Close()
 	manager.Close()
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(&store.closeCalls))
+	assert.Empty(t, manager.nodes)
+	assert.Empty(t, manager.failures)
 }

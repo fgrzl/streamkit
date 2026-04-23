@@ -96,6 +96,28 @@ func TestShouldDecodeErrorMessageTypes(t *testing.T) {
 	})
 }
 
+func TestShouldDecodeRemoteCloseClosesStreamAndInvokesOnClose(t *testing.T) {
+	called := 0
+	s := NewMuxerBidiStream(func([]byte) error { return nil }, func() { called++ })
+	s.RecvChan() <- []byte(`{"type":"mux::close"}`)
+
+	var value string
+	assert.Equal(t, io.EOF, s.Decode(&value))
+	assert.True(t, s.IsClosed())
+	assert.Equal(t, 1, called)
+}
+
+func TestShouldDecodeRemoteErrorClosesStreamAndInvokesOnClose(t *testing.T) {
+	called := 0
+	s := NewMuxerBidiStream(func([]byte) error { return nil }, func() { called++ })
+	s.RecvChan() <- []byte(`{"type":"mux::error","err":"oops"}`)
+
+	var value string
+	assert.EqualError(t, s.Decode(&value), "remote error: oops")
+	assert.True(t, s.IsClosed())
+	assert.Equal(t, 1, called)
+}
+
 func TestShouldCloseSendEncodesCloseMessage(t *testing.T) {
 	t.Run("CloseSend encodes close message", func(t *testing.T) {
 		s, got := newCapturingStream()

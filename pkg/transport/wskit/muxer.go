@@ -54,6 +54,11 @@ type MuxerMsg struct {
 	TraceContext map[string]string `json:"trace_context,omitempty"`
 }
 
+type muxerTombstone struct {
+	reason   error
+	sequence uint64
+}
+
 // WebSocketMuxer multiplexes multiple logical bidirectional streams over a single WebSocket connection.
 // Each logical stream is identified by a ChannelID.
 // WebSocketMuxer multiplexes logical bidirectional streams over a single
@@ -64,12 +69,15 @@ type WebSocketMuxer struct {
 	name        string
 	conn        *websocket.Conn
 	channels    map[uuid.UUID]*MuxerBidiStream
-	tombstones  map[uuid.UUID]error
+	tombstones  map[uuid.UUID]muxerTombstone
 	channelsMu  sync.RWMutex
 	writeMu     sync.Mutex
 	done        chan struct{}
 	nodeManager server.NodeManager
 	closeOnce   sync.Once
+
+	tombstoneSequence uint64
+	maxTombstones     int
 
 	// outbound write pump
 	writeQueue             chan *MuxerMsg
@@ -161,6 +169,7 @@ const (
 	defaultStreamRecvOfferTimeout              = 100 * time.Millisecond
 	defaultStreamRecvSaturationThreshold       = 3
 	defaultStreamRecvSaturationPolicy          = StreamRecvSaturationPolicyWait
+	defaultMaxTombstones                       = 4096
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -174,12 +183,13 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		name:                          "client",
 		conn:                          conn,
 		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:                    make(map[uuid.UUID]error),
+		tombstones:                    make(map[uuid.UUID]muxerTombstone),
 		done:                          make(chan struct{}),
 		pingInterval:                  30,
 		pongTimeout:                   90,
 		pingJitter:                    5,
 		maxStreams:                    defaultMaxLogicalStreams,
+		maxTombstones:                 defaultMaxTombstones,
 		maxFramePayloadBytes:          defaultMaxFramePayloadBytes,
 		maxMessagePayloadBytes:        defaultMaxMessagePayloadBytes,
 		streamRecvQueueSize:           defaultStreamRecvQueueSize,
@@ -241,12 +251,13 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		conn:                          conn,
 		nodeManager:                   nodeManager,
 		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:                    make(map[uuid.UUID]error),
+		tombstones:                    make(map[uuid.UUID]muxerTombstone),
 		done:                          make(chan struct{}),
 		pingInterval:                  30,
 		pongTimeout:                   90,
 		pingJitter:                    5,
 		maxStreams:                    defaultMaxLogicalStreams,
+		maxTombstones:                 defaultMaxTombstones,
 		maxFramePayloadBytes:          defaultMaxFramePayloadBytes,
 		maxMessagePayloadBytes:        defaultMaxMessagePayloadBytes,
 		streamRecvQueueSize:           defaultStreamRecvQueueSize,
@@ -418,16 +429,41 @@ func (m *WebSocketMuxer) tombstoneStream(channelID uuid.UUID, reason error) {
 
 	m.channelsMu.Lock()
 	if m.tombstones == nil {
-		m.tombstones = make(map[uuid.UUID]error)
+		m.tombstones = make(map[uuid.UUID]muxerTombstone)
 	}
-	if existing, exists := m.tombstones[channelID]; !exists || existing == nil || reason != nil {
-		m.tombstones[channelID] = reason
+	if existing, exists := m.tombstones[channelID]; !exists || existing.reason == nil || reason != nil {
+		m.tombstoneSequence++
+		m.tombstones[channelID] = muxerTombstone{reason: reason, sequence: m.tombstoneSequence}
+		m.pruneTombstonesLocked()
 	}
 	bidi := m.channels[channelID]
 	m.channelsMu.Unlock()
 
 	if bidi != nil {
 		bidi.CloseLocal(reason)
+	}
+}
+
+func (m *WebSocketMuxer) pruneTombstonesLocked() {
+	limit := m.maxTombstones
+	if limit <= 0 {
+		limit = defaultMaxTombstones
+	}
+	for len(m.tombstones) > limit {
+		var oldestID uuid.UUID
+		var oldestSequence uint64
+		found := false
+		for channelID, tombstone := range m.tombstones {
+			if !found || tombstone.sequence < oldestSequence {
+				oldestID = channelID
+				oldestSequence = tombstone.sequence
+				found = true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(m.tombstones, oldestID)
 	}
 }
 

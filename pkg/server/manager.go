@@ -70,6 +70,17 @@ func NewNodeManager(opts ...NodeManagerOption) NodeManager {
 	return n
 }
 
+func (m *nodeManager) pruneExpiredFailuresLocked(now time.Time) {
+	if len(m.failures) == 0 || m.failureWindow <= 0 {
+		return
+	}
+	for storeID, failure := range m.failures {
+		if failure == nil || now.Sub(failure.lastFailed) >= m.failureWindow {
+			delete(m.failures, storeID)
+		}
+	}
+}
+
 func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node, error) {
 	m.mu.RLock()
 	s, ok := m.nodes[storeID]
@@ -80,6 +91,7 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneExpiredFailuresLocked(time.Now())
 
 	// Double-check after acquiring write lock.
 	if s, ok := m.nodes[storeID]; ok {
@@ -153,6 +165,7 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 func (m *nodeManager) Remove(ctx context.Context, storeID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.failures, storeID)
 
 	if node, ok := m.nodes[storeID]; ok {
 		node.Close()
@@ -163,8 +176,15 @@ func (m *nodeManager) Remove(ctx context.Context, storeID uuid.UUID) {
 func (m *nodeManager) Close() {
 	m.closeOnce.Do(func() {
 		m.mu.Lock()
-		defer m.mu.Unlock()
+		nodes := make([]Node, 0, len(m.nodes))
 		for _, node := range m.nodes {
+			nodes = append(nodes, node)
+		}
+		m.nodes = make(map[uuid.UUID]Node)
+		m.failures = make(map[uuid.UUID]*storeFailure)
+		m.mu.Unlock()
+
+		for _, node := range nodes {
 			node.Close()
 		}
 	})

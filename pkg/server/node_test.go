@@ -142,6 +142,8 @@ type mockBidi struct {
 	closed         chan struct{}
 	closeErr       error
 	closeSendErr   error
+	closeLocalErr  error
+	closeLocalCall int
 }
 
 func newMockBidi(env *polymorphic.Envelope) *mockBidi {
@@ -201,6 +203,17 @@ func (m *mockBidi) Close(err error) {
 		close(m.closed)
 	}
 }
+
+func (m *mockBidi) CloseLocal(err error) {
+	m.closeLocalErr = err
+	m.closeLocalCall++
+	select {
+	case <-m.closed:
+	default:
+		close(m.closed)
+	}
+}
+
 func (m *mockBidi) EndOfStreamError() error { return io.EOF }
 func (m *mockBidi) Closed() <-chan struct{} { return m.closed }
 
@@ -218,6 +231,19 @@ func TestShouldGetSpacesStreamsNames(t *testing.T) {
 	// Assert: Expect two encoded names then CloseSend(nil)
 	require.Len(t, bidi.encoded, 2, "expected 2 encoded messages")
 	require.NoError(t, bidi.closeSendErr)
+}
+
+func TestShouldReleaseLocalStreamAfterGetSpacesCompletes(t *testing.T) {
+	store := &mockStore{spaces: []string{"one"}}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.GetSpaces{}})
+
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+
+	require.NoError(t, bidi.closeSendErr)
+	assert.Equal(t, 1, bidi.closeLocalCall, "expected bounded handler to release local stream after CloseSend")
+	assert.NoError(t, bidi.closeLocalErr)
 }
 
 func TestShouldPeekReturnsEntryOrEmpty(t *testing.T) {
