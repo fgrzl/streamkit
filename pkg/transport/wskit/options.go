@@ -62,6 +62,29 @@ func WithStreamRecvSaturationPolicy(policy StreamRecvSaturationPolicy) MuxerOpti
 	}
 }
 
+// WithMuxerTombstoneMax sets the maximum number of tombstone entries per muxer.
+// Values less than or equal to zero disable the size cap (age-based pruning still applies if configured).
+func WithMuxerTombstoneMax(n int) MuxerOption {
+	return func(m *WebSocketMuxer) {
+		m.tombstoneMax = n
+	}
+}
+
+// WithMuxerTombstoneMaxAge sets how long tombstone entries are retained to ignore late frames.
+// Values less than or equal to zero disable age-based eviction (size cap still applies if configured).
+func WithMuxerTombstoneMaxAge(d time.Duration) MuxerOption {
+	return func(m *WebSocketMuxer) {
+		m.tombstoneMaxAge = d
+	}
+}
+
+// WithMuxerNowFunc overrides the clock used for tombstone timestamps and pruning (tests only).
+func WithMuxerNowFunc(fn func() time.Time) MuxerOption {
+	return func(m *WebSocketMuxer) {
+		m.nowFn = fn
+	}
+}
+
 func applyMuxerOptions(m *WebSocketMuxer, opts ...MuxerOption) {
 	for _, opt := range opts {
 		if opt != nil {

@@ -20,12 +20,21 @@ import (
 	"github.com/google/uuid"
 )
 
+// MaxSegLocks is the default upper bound on distinct segment mutex entries.
+// When the map is full, unheld locks are evicted (see getSegmentLock).
+const MaxSegLocks = 8192
+
 // PebbleStore implements the storage interface using PebbleDB as the backend.
 type PebbleStore struct {
 	db        *pebble.DB
 	cache     *cache.ExpiringCache
 	closeOnce sync.Once
-	segLocks  sync.Map // Issue #3: Per-segment write serialization to prevent concurrent produce data corruption
+
+	// Issue #3: Per-segment write serialization to prevent concurrent produce data corruption.
+	// Bounded map with TryLock eviction (mirrors pkg/client produceLocks).
+	segLocksMu  sync.Mutex
+	segLocks    map[string]*sync.Mutex
+	maxSegLocks int // defaults to MaxSegLocks; tests may lower
 }
 
 // NewPebbleStore creates a new PebbleStore instance at the specified path with caching.
@@ -36,9 +45,55 @@ func NewPebbleStore(path string, cache *cache.ExpiringCache) (*PebbleStore, erro
 		return nil, err
 	}
 	return &PebbleStore{
-		db:    db,
-		cache: cache,
+		db:          db,
+		cache:       cache,
+		segLocks:    make(map[string]*sync.Mutex),
+		maxSegLocks: MaxSegLocks,
 	}, nil
+}
+
+// getSegmentLock returns the mutex for (space, segment), evicting unheld
+// entries when maxSegLocks is reached.
+func (s *PebbleStore) getSegmentLock(space, segment string) *sync.Mutex {
+	key := space + ":" + segment
+	s.segLocksMu.Lock()
+	defer s.segLocksMu.Unlock()
+
+	if mu, ok := s.segLocks[key]; ok {
+		return mu
+	}
+
+	max := s.maxSegLocks
+	if max <= 0 {
+		max = MaxSegLocks
+	}
+	if len(s.segLocks) >= max {
+		toRemove := max / 10
+		if toRemove < 1 {
+			toRemove = 1
+		}
+		for k, mu := range s.segLocks {
+			if toRemove <= 0 {
+				break
+			}
+			if mu.TryLock() {
+				delete(s.segLocks, k)
+				mu.Unlock()
+				toRemove--
+			}
+		}
+	}
+
+	mu := &sync.Mutex{}
+	s.segLocks[key] = mu
+	return mu
+}
+
+// SegLocksSize returns the number of cached segment locks (for tests/diagnostics).
+func (s *PebbleStore) SegLocksSize() int {
+	s.segLocksMu.Lock()
+	defer s.segLocksMu.Unlock()
+	return len(s.segLocks)
 }
 
 func (s *PebbleStore) Close() {
@@ -157,9 +212,7 @@ func (s *PebbleStore) Produce(ctx context.Context, args *api.Produce, records en
 	// 1. Both Peek and get the same lastSeq
 	// 2. Both pass validation with sequences N+1, N+2, etc.
 	// 3. Both call batch.Commit, silently overwriting each other's data
-	key := args.Space + ":" + args.Segment
-	lockI, _ := s.segLocks.LoadOrStore(key, &sync.Mutex{})
-	mu := lockI.(*sync.Mutex)
+	mu := s.getSegmentLock(args.Space, args.Segment)
 	mu.Lock()
 	defer mu.Unlock()
 

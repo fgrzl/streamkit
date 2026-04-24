@@ -85,6 +85,9 @@ func (n *defaultNode) Close() {
 	for _, router := range routers {
 		router.close()
 	}
+	if n.leaseStore != nil {
+		n.leaseStore.Close()
+	}
 	n.store.Close()
 }
 

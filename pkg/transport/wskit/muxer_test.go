@@ -112,7 +112,7 @@ func TestShouldGetOrCreateStreamRejectsWhenStreamLimitExceeded(t *testing.T) {
 		name:        "server",
 		done:        make(chan struct{}),
 		channels:    make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:  make(map[uuid.UUID]error),
+		tombstones:  make(map[uuid.UUID]tombstoneEntry),
 		maxStreams:  1,
 		nodeManager: manager,
 		sendJSON: func(_ *websocket.Conn, _ interface{}) error {
@@ -135,7 +135,7 @@ func TestShouldGetOrCreateStreamRejectsWhenStreamLimitExceeded(t *testing.T) {
 	assert.Equal(t, int32(0), manager.getCalls.Load(), "node manager should not be consulted once the stream cap is hit")
 	m.channelsMu.RLock()
 	defer m.channelsMu.RUnlock()
-	assert.ErrorIs(t, m.tombstones[msg.ChannelID], ErrTooManyStreams)
+	assert.ErrorIs(t, m.tombstones[msg.ChannelID].err, ErrTooManyStreams)
 }
 
 func TestShouldOverwriteExistingRegistration(t *testing.T) {
@@ -340,7 +340,7 @@ func TestShouldReturnMuxerDiagnosticsSnapshot(t *testing.T) {
 		name:                   "test",
 		done:                   make(chan struct{}),
 		channels:               make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:             make(map[uuid.UUID]error),
+		tombstones:             make(map[uuid.UUID]tombstoneEntry),
 		writeQueueSize:         8,
 		writeQueueOfferTimeout: 50 * time.Millisecond,
 		writeQueue:             make(chan *MuxerMsg, 8),
@@ -350,7 +350,7 @@ func TestShouldReturnMuxerDiagnosticsSnapshot(t *testing.T) {
 
 	channelID := uuid.New()
 	m.channels[channelID] = NewMuxerBidiStream(func([]byte) error { return nil }, func() {})
-	m.tombstones[uuid.New()] = ErrMuxerClosed
+	m.tombstones[uuid.New()] = tombstoneEntry{err: ErrMuxerClosed, at: time.Now()}
 	m.writeQueue <- &MuxerMsg{ControlType: ControlTypePing}
 
 	atomic.StoreInt64(&m.activeStreams, 3)
@@ -504,7 +504,7 @@ func TestShouldSendAccessDeniedError(t *testing.T) {
 	m := &WebSocketMuxer{
 		Context:    context.Background(),
 		channels:   make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones: make(map[uuid.UUID]error),
+		tombstones: make(map[uuid.UUID]tombstoneEntry),
 		done:       make(chan struct{}),
 		// session that denies access
 		session: &muxerSession{allowAll: false, allowedStores: map[uuid.UUID]struct{}{}},
@@ -543,7 +543,7 @@ func TestShouldRouteErrorControlMessagesToExistingStream(t *testing.T) {
 		Context:    context.Background(),
 		name:       "client",
 		channels:   make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones: make(map[uuid.UUID]error),
+		tombstones: make(map[uuid.UUID]tombstoneEntry),
 		done:       make(chan struct{}),
 	}
 
@@ -572,7 +572,7 @@ func TestShouldReleaseStreamOnPeerCloseWithoutDroppingBufferedMessages(t *testin
 		Context:    context.Background(),
 		name:       "client",
 		channels:   make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones: make(map[uuid.UUID]error),
+		tombstones: make(map[uuid.UUID]tombstoneEntry),
 		done:       make(chan struct{}),
 		session:    &muxerSession{allowAll: true},
 	}
@@ -613,7 +613,7 @@ func TestShouldDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
 		Context:                       context.Background(),
 		name:                          "client",
 		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:                    make(map[uuid.UUID]error),
+		tombstones:                    make(map[uuid.UUID]tombstoneEntry),
 		done:                          make(chan struct{}),
 		streamRecvOfferTimeout:        5 * time.Millisecond,
 		streamRecvSaturationThreshold: 2,
@@ -683,7 +683,7 @@ func TestShouldDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 		Context:                       context.Background(),
 		name:                          "client",
 		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:                    make(map[uuid.UUID]error),
+		tombstones:                    make(map[uuid.UUID]tombstoneEntry),
 		done:                          make(chan struct{}),
 		streamRecvOfferTimeout:        5 * time.Millisecond,
 		streamRecvSaturationThreshold: 2,
@@ -747,7 +747,7 @@ func TestShouldDeliverToStreamWaitModeDoesNotCloseOnSustainedBackpressure(t *tes
 		Context:                       context.Background(),
 		name:                          "client",
 		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:                    make(map[uuid.UUID]error),
+		tombstones:                    make(map[uuid.UUID]tombstoneEntry),
 		done:                          make(chan struct{}),
 		streamRecvOfferTimeout:        5 * time.Millisecond,
 		streamRecvSaturationThreshold: 1,
@@ -806,7 +806,7 @@ func TestShouldGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {
 		Context:     context.Background(),
 		name:        "server",
 		channels:    make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:  map[uuid.UUID]error{channelID: ErrStreamOverloaded},
+		tombstones:  map[uuid.UUID]tombstoneEntry{channelID: {err: ErrStreamOverloaded, at: time.Now()}},
 		done:        make(chan struct{}),
 		nodeManager: manager,
 		session:     &muxerSession{allowAll: true},

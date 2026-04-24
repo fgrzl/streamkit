@@ -28,6 +28,13 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+// tombstoneEntry records why a logical channel was closed locally and when,
+// so late frames can be ignored until the entry ages out or is evicted by cap.
+type tombstoneEntry struct {
+	err error
+	at  time.Time
+}
+
 type ControlType string
 
 const (
@@ -64,7 +71,7 @@ type WebSocketMuxer struct {
 	name        string
 	conn        *websocket.Conn
 	channels    map[uuid.UUID]*MuxerBidiStream
-	tombstones  map[uuid.UUID]error
+	tombstones  map[uuid.UUID]tombstoneEntry
 	channelsMu  sync.RWMutex
 	writeMu     sync.Mutex
 	done        chan struct{}
@@ -119,6 +126,10 @@ type WebSocketMuxer struct {
 	// Tests may override these to simulate network behavior.
 	sendJSON func(conn *websocket.Conn, v interface{}) error
 	recvJSON func(conn *websocket.Conn, v interface{}) error
+
+	tombstoneMax    int
+	tombstoneMaxAge time.Duration
+	nowFn           func() time.Time // tests override; nil means time.Now
 }
 
 // MuxerDiagnostics provides a point-in-time snapshot of resource/cardinality
@@ -161,6 +172,8 @@ const (
 	defaultStreamRecvOfferTimeout              = 100 * time.Millisecond
 	defaultStreamRecvSaturationThreshold       = 3
 	defaultStreamRecvSaturationPolicy          = StreamRecvSaturationPolicyWait
+	defaultTombstoneMax                        = 1024
+	defaultTombstoneMaxAge                     = 60 * time.Second
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -174,7 +187,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		name:                          "client",
 		conn:                          conn,
 		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:                    make(map[uuid.UUID]error),
+		tombstones:                    make(map[uuid.UUID]tombstoneEntry),
 		done:                          make(chan struct{}),
 		pingInterval:                  30,
 		pongTimeout:                   90,
@@ -191,6 +204,8 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		cancelFunc:                    cancel,
 		writeQueueOfferTimeout:        defaultWriteQueueOfferTimeout,
 		queueMetrics:                  telemetry.NewWSKitQueueMetrics(),
+		tombstoneMax:                  defaultTombstoneMax,
+		tombstoneMaxAge:               defaultTombstoneMaxAge,
 	}
 	applyMuxerOptions(m, opts...)
 	if m.streamRecvQueueSize <= 0 {
@@ -241,7 +256,7 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		conn:                          conn,
 		nodeManager:                   nodeManager,
 		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
-		tombstones:                    make(map[uuid.UUID]error),
+		tombstones:                    make(map[uuid.UUID]tombstoneEntry),
 		done:                          make(chan struct{}),
 		pingInterval:                  30,
 		pongTimeout:                   90,
@@ -258,6 +273,8 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		cancelFunc:                    cancel,
 		writeQueueOfferTimeout:        defaultWriteQueueOfferTimeout,
 		queueMetrics:                  telemetry.NewWSKitQueueMetrics(),
+		tombstoneMax:                  defaultTombstoneMax,
+		tombstoneMaxAge:               defaultTombstoneMaxAge,
 	}
 	applyMuxerOptions(m, opts...)
 	if m.streamRecvQueueSize <= 0 {
@@ -411,18 +428,69 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 	return bidi
 }
 
+func (m *WebSocketMuxer) tombstoneNow() time.Time {
+	if m == nil {
+		return time.Now()
+	}
+	if m.nowFn != nil {
+		return m.nowFn()
+	}
+	return time.Now()
+}
+
+// pruneTombstonesLocked drops expired and excess tombstones. m.channelsMu must be locked.
+func (m *WebSocketMuxer) pruneTombstonesLocked(now time.Time) {
+	if m.tombstones == nil {
+		return
+	}
+	if m.tombstoneMaxAge > 0 {
+		for id, e := range m.tombstones {
+			if now.Sub(e.at) > m.tombstoneMaxAge {
+				delete(m.tombstones, id)
+			}
+		}
+	}
+	if m.tombstoneMax > 0 {
+		for len(m.tombstones) > m.tombstoneMax {
+			var victim uuid.UUID
+			var oldest time.Time
+			first := true
+			for id, e := range m.tombstones {
+				if first || e.at.Before(oldest) {
+					first = false
+					oldest = e.at
+					victim = id
+				}
+			}
+			if first {
+				break
+			}
+			delete(m.tombstones, victim)
+		}
+	}
+}
+
 func (m *WebSocketMuxer) tombstoneStream(channelID uuid.UUID, reason error) {
 	if channelID == uuid.Nil {
 		return
 	}
 
+	now := m.tombstoneNow()
 	m.channelsMu.Lock()
 	if m.tombstones == nil {
-		m.tombstones = make(map[uuid.UUID]error)
+		m.tombstones = make(map[uuid.UUID]tombstoneEntry)
 	}
-	if existing, exists := m.tombstones[channelID]; !exists || existing == nil || reason != nil {
-		m.tombstones[channelID] = reason
+	m.pruneTombstonesLocked(now)
+
+	var ent tombstoneEntry
+	if existing, exists := m.tombstones[channelID]; exists && reason == nil && existing.err != nil {
+		ent = existing
+	} else {
+		ent = tombstoneEntry{err: reason, at: now}
 	}
+	m.tombstones[channelID] = ent
+	m.pruneTombstonesLocked(now)
+
 	bidi := m.channels[channelID]
 	m.channelsMu.Unlock()
 
@@ -839,10 +907,11 @@ func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) 
 		if m.handlePeerStreamControl(ctx, msg) {
 			return
 		}
-		m.channelsMu.RLock()
+		m.channelsMu.Lock()
+		m.pruneTombstonesLocked(m.tombstoneNow())
 		bidi, exists := m.channels[msg.ChannelID]
 		_, tombstoned := m.tombstones[msg.ChannelID]
-		m.channelsMu.RUnlock()
+		m.channelsMu.Unlock()
 		if exists {
 			m.deliverToStream(bidi, ctx, msg)
 			return
@@ -882,10 +951,11 @@ func (m *WebSocketMuxer) handlePeerStreamControl(ctx context.Context, msg *Muxer
 		return false
 	}
 
-	m.channelsMu.RLock()
+	m.channelsMu.Lock()
+	m.pruneTombstonesLocked(m.tombstoneNow())
 	bidi, exists := m.channels[msg.ChannelID]
 	_, tombstoned := m.tombstones[msg.ChannelID]
-	m.channelsMu.RUnlock()
+	m.channelsMu.Unlock()
 
 	if !exists {
 		if tombstoned {
@@ -962,10 +1032,11 @@ func (m *WebSocketMuxer) canAccessOrSendError(ctx context.Context, storeID, chan
 // If the stream doesn't exist, it attempts to use nodeManager to create the
 // node and register a new stream. On failure it logs and sends an error control.
 func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (*MuxerBidiStream, error) {
-	m.channelsMu.RLock()
+	m.channelsMu.Lock()
+	m.pruneTombstonesLocked(m.tombstoneNow())
 	bidi, exists := m.channels[msg.ChannelID]
 	_, tombstoned := m.tombstones[msg.ChannelID]
-	m.channelsMu.RUnlock()
+	m.channelsMu.Unlock()
 
 	if exists {
 		return bidi, nil

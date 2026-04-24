@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestShouldAcquireOnce(t *testing.T) {
@@ -70,4 +71,39 @@ func TestShouldExpiredLeaseCanBeReacquired(t *testing.T) {
 	time.Sleep(15 * time.Millisecond)
 	ok := s.Acquire("k", "holder2", 30*time.Second)
 	assert.True(t, ok)
+}
+
+func TestShouldSweepExpiredLeases(t *testing.T) {
+	s := NewStore(WithCleanupInterval(10 * time.Millisecond))
+	defer s.Close()
+
+	assert.True(t, s.Acquire("k", "h", 20*time.Millisecond))
+	require.Eventually(t, func() bool { return s.Size() == 0 }, time.Second, 15*time.Millisecond)
+}
+
+func TestShouldNotSweepActiveLeases(t *testing.T) {
+	s := NewStore(WithCleanupInterval(15 * time.Millisecond))
+	defer s.Close()
+
+	assert.True(t, s.Acquire("k", "h", 5*time.Second))
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, 1, s.Size())
+}
+
+func TestShouldStopSweeperOnClose(t *testing.T) {
+	s := NewStore(WithCleanupInterval(time.Millisecond))
+	s.Close()
+	s.Close() // idempotent
+}
+
+func TestShouldOpportunisticallyEvictOnAcquire(t *testing.T) {
+	s := NewStore(WithCleanupInterval(0))
+	defer s.Close()
+
+	assert.True(t, s.Acquire("k1", "h1", 5*time.Millisecond))
+	time.Sleep(15 * time.Millisecond)
+	assert.True(t, s.Acquire("k2", "h2", 30*time.Second))
+	assert.Equal(t, 1, s.Size())
+	ok := s.Acquire("k1", "h3", time.Second)
+	assert.True(t, ok, "k1 should be free after opportunistic eviction")
 }

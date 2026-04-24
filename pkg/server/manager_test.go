@@ -63,7 +63,9 @@ func TestShouldGetOrCreateAndRemoveNode(t *testing.T) {
 
 	n2, err := m.GetOrCreate(context.Background(), id)
 	require.NoError(t, err)
-	require.Equal(t, n1, n2, "expected same node instance for repeated GetOrCreate")
+	r1 := n1.(*refCountedNode)
+	r2 := n2.(*refCountedNode)
+	require.Equal(t, r1.entry, r2.entry, "expected same backing node entry for repeated GetOrCreate")
 
 	// Act: remove and create again
 	// Act: remove and create again
@@ -73,7 +75,8 @@ func TestShouldGetOrCreateAndRemoveNode(t *testing.T) {
 
 	// Assert: store factory should have been used to create a new store instance
 	require.Equal(t, 2, sf.created, "expected store factory to be invoked twice")
-	_ = n3
+	r3 := n3.(*refCountedNode)
+	require.NotEqual(t, r1.entry, r3.entry)
 }
 
 func TestShouldOpenCircuitAfterConsecutiveFailures(t *testing.T) {
@@ -153,4 +156,135 @@ func TestShouldCloseManagedNodesOnlyOnce(t *testing.T) {
 	manager.Close()
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(&store.closeCalls))
+}
+
+func TestShouldCapFailuresMapSize(t *testing.T) {
+	expectedErr := errors.New("store create failed")
+	factory := &scriptedStoreFactory{failuresRemaining: 1_000_000, err: expectedErr}
+	manager := NewNodeManager(WithStoreFactory(factory)).(*nodeManager)
+	manager.maxFailureEntries = 32
+
+	for range 200 {
+		_, err := manager.GetOrCreate(context.Background(), uuid.New())
+		require.ErrorIs(t, err, expectedErr)
+	}
+
+	manager.mu.Lock()
+	n := len(manager.failures)
+	manager.mu.Unlock()
+	assert.LessOrEqual(t, n, 32)
+}
+
+func TestShouldEvictOldestFailureEntryWhenCapped(t *testing.T) {
+	expectedErr := errors.New("store create failed")
+	factory := &scriptedStoreFactory{failuresRemaining: 1_000_000, err: expectedErr}
+	manager := NewNodeManager(WithStoreFactory(factory)).(*nodeManager)
+	manager.maxFailureEntries = 32
+	ctx := context.Background()
+
+	idA := uuid.New()
+	_, err := manager.GetOrCreate(ctx, idA)
+	require.ErrorIs(t, err, expectedErr)
+
+	time.Sleep(5 * time.Millisecond)
+
+	for range 31 {
+		_, err := manager.GetOrCreate(ctx, uuid.New())
+		require.ErrorIs(t, err, expectedErr)
+	}
+
+	manager.mu.Lock()
+	_, hasA := manager.failures[idA]
+	nBefore := len(manager.failures)
+	manager.mu.Unlock()
+	require.True(t, hasA)
+	require.Equal(t, 32, nBefore)
+
+	_, err = manager.GetOrCreate(ctx, uuid.New())
+	require.ErrorIs(t, err, expectedErr)
+
+	manager.mu.Lock()
+	_, hasAAfter := manager.failures[idA]
+	manager.mu.Unlock()
+	assert.False(t, hasAAfter, "oldest failure idA should have been evicted when map was at cap")
+}
+
+func TestShouldEvictIdleNodesAfterTTL(t *testing.T) {
+	store := &closeCountingStore{}
+	factory := &scriptedStoreFactory{store: store}
+	m := NewNodeManager(
+		WithStoreFactory(factory),
+		WithIdleEviction(20*time.Millisecond, 5*time.Millisecond),
+	).(*nodeManager)
+	id := uuid.New()
+	_, err := m.GetOrCreate(context.Background(), id)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		m.mu.Lock()
+		_, ok := m.nodes[id]
+		m.mu.Unlock()
+		return !ok && atomic.LoadInt32(&store.closeCalls) >= 1
+	}, time.Second, 5*time.Millisecond)
+	m.Close()
+}
+
+func TestShouldNotEvictNodeWithInFlightHandle(t *testing.T) {
+	store := &closeCountingStore{}
+	factory := &scriptedStoreFactory{store: store}
+	m := NewNodeManager(
+		WithStoreFactory(factory),
+		WithIdleEviction(25*time.Millisecond, 5*time.Millisecond),
+	).(*nodeManager)
+	id := uuid.New()
+	node, err := m.GetOrCreate(context.Background(), id)
+	require.NoError(t, err)
+	ent := m.nodes[id]
+	ent.inflight.Store(1)
+	time.Sleep(80 * time.Millisecond)
+	m.mu.Lock()
+	_, still := m.nodes[id]
+	m.mu.Unlock()
+	require.True(t, still)
+	ent.inflight.Store(0)
+	// reapIdleNodes deletes under m.mu then closes without holding the lock; wait
+	// until both eviction and store Close are visible to avoid a scheduler race.
+	require.Eventually(t, func() bool {
+		m.mu.Lock()
+		_, ok := m.nodes[id]
+		m.mu.Unlock()
+		return !ok && atomic.LoadInt32(&store.closeCalls) >= 1
+	}, time.Second, 5*time.Millisecond)
+	_ = node
+	m.Close()
+}
+
+func TestShouldRefreshLastAccessedOnGetOrCreate(t *testing.T) {
+	store := &closeCountingStore{}
+	factory := &scriptedStoreFactory{store: store}
+	m := NewNodeManager(
+		WithStoreFactory(factory),
+		WithIdleEviction(50*time.Millisecond, 10*time.Millisecond),
+	).(*nodeManager)
+	id := uuid.New()
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, err := m.GetOrCreate(context.Background(), id)
+		require.NoError(t, err)
+		time.Sleep(15 * time.Millisecond)
+	}
+	m.mu.Lock()
+	_, still := m.nodes[id]
+	m.mu.Unlock()
+	require.True(t, still, "node should remain while repeatedly refreshed")
+	m.Close()
+}
+
+func TestShouldNotBreakWhenIdleEvictionDisabled(t *testing.T) {
+	sf := &testStoreFactory{}
+	m := NewNodeManager(WithStoreFactory(sf))
+	id := uuid.New()
+	_, err := m.GetOrCreate(context.Background(), id)
+	require.NoError(t, err)
+	m.Close()
+	m.Close()
 }

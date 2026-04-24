@@ -4,14 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fgrzl/streamkit/internal/lease"
+	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/bus"
 	"github.com/fgrzl/streamkit/pkg/storage"
 	"github.com/google/uuid"
 )
+
+const defaultMaxFailureEntries = 1024
 
 // NodeManager manages per-store storage instances and their lifecycle.
 type NodeManager interface {
@@ -40,50 +45,93 @@ func WithStoreFactory(storeFactory storage.StoreFactory) NodeManagerOption {
 	}
 }
 
+// WithIdleEviction enables a background reaper that closes and removes nodes that have
+// had no GetOrCreate traffic and no in-flight Handle calls for idleTTL.
+// Both idleTTL and checkInterval must be positive; otherwise eviction stays disabled.
+func WithIdleEviction(idleTTL, checkInterval time.Duration) NodeManagerOption {
+	return func(n *nodeManager) {
+		if idleTTL > 0 && checkInterval > 0 {
+			n.idleTTL = idleTTL
+			n.idleCheckEvery = checkInterval
+		}
+	}
+}
+
 type storeFailure struct {
 	count      int
 	lastFailed time.Time
 }
 
+type nodeEntry struct {
+	inner        Node
+	lastAccessed atomic.Int64
+	inflight     atomic.Int32
+}
+
+type refCountedNode struct {
+	m       *nodeManager
+	storeID uuid.UUID
+	entry   *nodeEntry
+}
+
+func (w *refCountedNode) Handle(ctx context.Context, bidi api.BidiStream) {
+	w.entry.inflight.Add(1)
+	defer w.entry.inflight.Add(-1)
+	w.entry.lastAccessed.Store(time.Now().UnixNano())
+	w.entry.inner.Handle(ctx, bidi)
+}
+
+func (w *refCountedNode) Close() {
+	w.entry.inner.Close()
+}
+
 type nodeManager struct {
-	mu            sync.RWMutex
-	busFactory    bus.MessageBusFactory
-	storeFactory  storage.StoreFactory
-	nodes         map[uuid.UUID]Node
-	failures      map[uuid.UUID]*storeFailure
-	closeOnce     sync.Once
-	failureWindow time.Duration // How long to wait before retrying after failures
-	maxFailures   int           // Circuit opens after this many consecutive failures
+	mu                sync.RWMutex
+	busFactory        bus.MessageBusFactory
+	storeFactory      storage.StoreFactory
+	nodes             map[uuid.UUID]*nodeEntry
+	failures          map[uuid.UUID]*storeFailure
+	closeOnce         sync.Once
+	failureWindow     time.Duration // How long to wait before retrying after failures
+	maxFailures       int           // Circuit opens after this many consecutive failures
+	maxFailureEntries int           // cap on distinct store IDs tracked in failures
+
+	idleTTL        time.Duration
+	idleCheckEvery time.Duration
+	reaperStop     chan struct{}
+	reaperWG       sync.WaitGroup
 }
 
 // NewNodeManager creates a new NodeManager with the specified options.
 func NewNodeManager(opts ...NodeManagerOption) NodeManager {
 	n := &nodeManager{
-		nodes:         make(map[uuid.UUID]Node),
-		failures:      make(map[uuid.UUID]*storeFailure),
-		failureWindow: 30 * time.Second, // Default: wait 30s after 3 consecutive failures
-		maxFailures:   3,                // Default: circuit opens after 3 failures
+		nodes:             make(map[uuid.UUID]*nodeEntry),
+		failures:          make(map[uuid.UUID]*storeFailure),
+		failureWindow:     30 * time.Second, // Default: wait 30s after 3 consecutive failures
+		maxFailures:       3,                // Default: circuit opens after 3 failures
+		maxFailureEntries: defaultMaxFailureEntries,
 	}
 	for _, opt := range opts {
 		opt(n)
+	}
+	if n.idleTTL > 0 && n.idleCheckEvery > 0 {
+		n.reaperStop = make(chan struct{})
+		n.reaperWG.Add(1)
+		go func() {
+			defer n.reaperWG.Done()
+			n.idleReaper()
+		}()
 	}
 	return n
 }
 
 func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node, error) {
-	m.mu.RLock()
-	s, ok := m.nodes[storeID]
-	m.mu.RUnlock()
-	if ok {
-		return s, nil
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Double-check after acquiring write lock.
-	if s, ok := m.nodes[storeID]; ok {
-		return s, nil
+	if ent, ok := m.nodes[storeID]; ok {
+		ent.lastAccessed.Store(time.Now().UnixNano())
+		return &refCountedNode{m: m, storeID: storeID, entry: ent}, nil
 	}
 
 	// Check circuit breaker: if store has failed too many times recently, fail fast
@@ -121,6 +169,9 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 			failure.lastFailed = time.Now()
 			failureCount = failure.count
 		} else {
+			if len(m.failures) >= m.maxFailureEntries {
+				m.evictOldestFailureLocked()
+			}
 			m.failures[storeID] = &storeFailure{count: 1, lastFailed: time.Now()}
 		}
 		slog.ErrorContext(ctx, "node manager: store creation failed",
@@ -145,27 +196,101 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 	}
 
 	leaseStore := lease.NewStore()
-	node := NewNode(storeID, store, m.busFactory, leaseStore)
-	m.nodes[storeID] = node
-	return node, nil
+	inner := NewNode(storeID, store, m.busFactory, leaseStore)
+	newEnt := &nodeEntry{inner: inner}
+	newEnt.lastAccessed.Store(time.Now().UnixNano())
+	m.nodes[storeID] = newEnt
+	return &refCountedNode{m: m, storeID: storeID, entry: newEnt}, nil
 }
 
 func (m *nodeManager) Remove(ctx context.Context, storeID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if node, ok := m.nodes[storeID]; ok {
-		node.Close()
+	if ent, ok := m.nodes[storeID]; ok {
+		ent.inner.Close()
 		delete(m.nodes, storeID)
 	}
 }
 
 func (m *nodeManager) Close() {
 	m.closeOnce.Do(func() {
+		if m.reaperStop != nil {
+			close(m.reaperStop)
+			m.reaperWG.Wait()
+		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		for _, node := range m.nodes {
-			node.Close()
+		for _, ent := range m.nodes {
+			ent.inner.Close()
 		}
+		m.nodes = make(map[uuid.UUID]*nodeEntry)
 	})
 }
+
+func (m *nodeManager) idleReaper() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("node manager: idle reaper panic recovered",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())))
+		}
+	}()
+	ticker := time.NewTicker(m.idleCheckEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.reaperStop:
+			return
+		case <-ticker.C:
+			m.reapIdleNodes()
+		}
+	}
+}
+
+func (m *nodeManager) reapIdleNodes() {
+	if m.idleTTL <= 0 {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	var toClose []Node
+	for sid, ent := range m.nodes {
+		if ent.inflight.Load() != 0 {
+			continue
+		}
+		if now.Sub(time.Unix(0, ent.lastAccessed.Load())) < m.idleTTL {
+			continue
+		}
+		toClose = append(toClose, ent.inner)
+		delete(m.nodes, sid)
+	}
+	m.mu.Unlock()
+	for _, inner := range toClose {
+		inner.Close()
+	}
+}
+
+// evictOldestFailureLocked removes one failure entry with the smallest lastFailed.
+// Caller must hold m.mu (write lock).
+func (m *nodeManager) evictOldestFailureLocked() {
+	if len(m.failures) == 0 {
+		return
+	}
+	var victim uuid.UUID
+	var oldest time.Time
+	first := true
+	for id, f := range m.failures {
+		if first || f.lastFailed.Before(oldest) {
+			first = false
+			oldest = f.lastFailed
+			victim = id
+		}
+	}
+	if !first {
+		delete(m.failures, victim)
+	}
+}
+
+// Compile-time check that refCountedNode implements Node.
+var _ Node = (*refCountedNode)(nil)
