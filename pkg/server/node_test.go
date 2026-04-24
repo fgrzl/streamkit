@@ -142,6 +142,7 @@ type mockBidi struct {
 	closed         chan struct{}
 	closeErr       error
 	closeSendErr   error
+	closeLocalMu   sync.Mutex
 	closeLocalErr  error
 	closeLocalCall int
 }
@@ -205,13 +206,21 @@ func (m *mockBidi) Close(err error) {
 }
 
 func (m *mockBidi) CloseLocal(err error) {
+	m.closeLocalMu.Lock()
 	m.closeLocalErr = err
 	m.closeLocalCall++
+	m.closeLocalMu.Unlock()
 	select {
 	case <-m.closed:
 	default:
 		close(m.closed)
 	}
+}
+
+func (m *mockBidi) closeLocalState() (calls int, err error) {
+	m.closeLocalMu.Lock()
+	defer m.closeLocalMu.Unlock()
+	return m.closeLocalCall, m.closeLocalErr
 }
 
 func (m *mockBidi) EndOfStreamError() error { return io.EOF }
@@ -242,8 +251,13 @@ func TestShouldReleaseLocalStreamAfterGetSpacesCompletes(t *testing.T) {
 	waitForClosed(t, bidi)
 
 	require.NoError(t, bidi.closeSendErr)
-	assert.Equal(t, 1, bidi.closeLocalCall, "expected bounded handler to release local stream after CloseSend")
-	assert.NoError(t, bidi.closeLocalErr)
+	require.Eventually(t, func() bool {
+		n, _ := bidi.closeLocalState()
+		return n >= 1
+	}, time.Second, time.Millisecond, "async stream should call CloseLocal after CloseSend")
+	calls, localErr := bidi.closeLocalState()
+	assert.Equal(t, 1, calls, "expected bounded handler to release local stream after CloseSend")
+	assert.NoError(t, localErr)
 }
 
 func TestShouldPeekReturnsEntryOrEmpty(t *testing.T) {
