@@ -823,6 +823,38 @@ func TestShouldGetOrCreateStreamIgnoresTombstonedChannel(t *testing.T) {
 	assert.Equal(t, int32(0), manager.getCalls.Load())
 }
 
+func TestShouldBoundMuxerTombstones(t *testing.T) {
+	start := time.Unix(100, 0)
+	step := 0
+	m := &WebSocketMuxer{
+		Context:         context.Background(),
+		name:            "server",
+		channels:        make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:      make(map[uuid.UUID]tombstoneEntry),
+		tombstoneMax:    3,
+		tombstoneMaxAge: 0,
+		nowFn: func() time.Time {
+			step++
+			return start.Add(time.Duration(step) * time.Millisecond)
+		},
+		done: make(chan struct{}),
+	}
+
+	channelIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
+	for _, channelID := range channelIDs {
+		m.tombstoneStream(channelID, ErrMuxerClosed)
+	}
+
+	m.channelsMu.RLock()
+	defer m.channelsMu.RUnlock()
+	assert.Len(t, m.tombstones, 3)
+	_, oldestGone := m.tombstones[channelIDs[0]]
+	assert.False(t, oldestGone, "oldest tombstone should be evicted under cap")
+	_, newestRetained := m.tombstones[channelIDs[len(channelIDs)-1]]
+	assert.True(t, newestRetained)
+	assert.ErrorIs(t, m.tombstones[channelIDs[len(channelIDs)-1]].err, ErrMuxerClosed)
+}
+
 func TestShouldSuccessfulWritesDoNotRefreshHeartbeatTimeout(t *testing.T) {
 	m := &WebSocketMuxer{
 		Context:     context.Background(),

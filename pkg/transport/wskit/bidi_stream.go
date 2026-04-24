@@ -2,7 +2,6 @@ package wskit
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -177,7 +176,8 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 	switch errMsg.Type {
 	case controlMsgSentinel + "close":
 		if errMsg.Err != "" {
-			remoteErr := errors.New(errMsg.Err)
+			remoteErr := fmt.Errorf("remote closed stream: %s", errMsg.Err)
+			c.CloseRemote(remoteErr)
 			if benignDisconnect(remoteErr) {
 				slog.Debug("bidi: remote closed stream",
 					slog.String("channel_id", c.channelID.String()),
@@ -189,23 +189,27 @@ func (c *MuxerBidiStream) handleErrorMessage(payload []byte) (bool, error) {
 					slog.String("error_type", classifyTransportError(remoteErr)),
 					slog.String("err", errMsg.Err))
 			}
-			return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
+			return true, remoteErr
 		}
+		c.CloseRemote(nil)
 		return true, io.EOF
 	case controlMsgSentinel + "error":
-		remoteErr := errors.New(errMsg.Err)
+		remoteErr := fmt.Errorf("remote error: %s", errMsg.Err)
+		c.CloseRemote(remoteErr)
 		slog.Warn("bidi: remote error",
 			slog.String("channel_id", c.channelID.String()),
 			slog.String("error_type", classifyTransportError(remoteErr)),
 			slog.String("err", errMsg.Err))
-		return true, fmt.Errorf("remote error: %s", errMsg.Err)
+		return true, remoteErr
 	default:
+		protocolErr := fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err)
+		c.CloseRemote(protocolErr)
 		slog.Warn("bidi: unknown error type",
 			slog.String("channel_id", c.channelID.String()),
 			slog.String("error_type", "protocol"),
 			slog.String("type", errMsg.Type),
 			slog.String("err", errMsg.Err))
-		return true, fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err)
+		return true, protocolErr
 	}
 }
 

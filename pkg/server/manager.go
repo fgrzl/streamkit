@@ -125,9 +125,21 @@ func NewNodeManager(opts ...NodeManagerOption) NodeManager {
 	return n
 }
 
+func (m *nodeManager) pruneExpiredFailuresLocked(now time.Time) {
+	if len(m.failures) == 0 || m.failureWindow <= 0 {
+		return
+	}
+	for storeID, failure := range m.failures {
+		if failure == nil || now.Sub(failure.lastFailed) >= m.failureWindow {
+			delete(m.failures, storeID)
+		}
+	}
+}
+
 func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneExpiredFailuresLocked(time.Now())
 
 	if ent, ok := m.nodes[storeID]; ok {
 		ent.lastAccessed.Store(time.Now().UnixNano())
@@ -206,6 +218,7 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 func (m *nodeManager) Remove(ctx context.Context, storeID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.failures, storeID)
 
 	if ent, ok := m.nodes[storeID]; ok {
 		ent.inner.Close()
@@ -220,11 +233,17 @@ func (m *nodeManager) Close() {
 			m.reaperWG.Wait()
 		}
 		m.mu.Lock()
-		defer m.mu.Unlock()
+		toClose := make([]Node, 0, len(m.nodes))
 		for _, ent := range m.nodes {
-			ent.inner.Close()
+			toClose = append(toClose, ent.inner)
 		}
 		m.nodes = make(map[uuid.UUID]*nodeEntry)
+		m.failures = make(map[uuid.UUID]*storeFailure)
+		m.mu.Unlock()
+
+		for _, node := range toClose {
+			node.Close()
+		}
 	})
 }
 

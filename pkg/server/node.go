@@ -211,7 +211,7 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 				slog.String("space", args.Space),
 				slog.String("segment", args.Segment),
 				"err", err)...)
-		bidi.CloseSend(err)
+		closeSendAndRelease(bidi, err)
 		return
 	}
 
@@ -229,107 +229,107 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 				slog.String("space", args.Space),
 				slog.String("segment", args.Segment),
 				"err", err)...)
-		bidi.CloseSend(err)
+		closeSendAndRelease(bidi, err)
 		return
 	}
-	bidi.CloseSend(nil)
+	closeSendAndRelease(bidi, nil)
 }
 
 func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcquire, bidi api.BidiStream) {
 	if n.leaseStore == nil {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if args.Key == "" {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if args.Holder == "" {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	ttl := time.Duration(args.TTLSeconds) * time.Second
 	if ttl <= 0 {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if ttl > maxLeaseTTL {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	ok := n.leaseStore.Acquire(args.Key, args.Holder, ttl)
 	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
 		telemetry.RecordError(trace.SpanFromContext(ctx), err)
-		bidi.CloseSend(err)
+		closeSendAndRelease(bidi, err)
 		return
 	}
-	bidi.CloseSend(nil)
+	closeSendAndRelease(bidi, nil)
 }
 
 func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew, bidi api.BidiStream) {
 	if n.leaseStore == nil {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if args.Key == "" {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if args.Holder == "" {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	ttl := time.Duration(args.TTLSeconds) * time.Second
 	if ttl <= 0 {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if ttl > maxLeaseTTL {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	ok := n.leaseStore.Renew(args.Key, args.Holder, ttl)
 	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
 		telemetry.RecordError(trace.SpanFromContext(ctx), err)
-		bidi.CloseSend(err)
+		closeSendAndRelease(bidi, err)
 		return
 	}
-	bidi.CloseSend(nil)
+	closeSendAndRelease(bidi, nil)
 }
 
 func (n *defaultNode) handleLeaseRelease(ctx context.Context, args *api.LeaseRelease, bidi api.BidiStream) {
 	if n.leaseStore == nil {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if args.Key == "" {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	if args.Holder == "" {
 		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 		return
 	}
 	ok := n.leaseStore.Release(args.Key, args.Holder)
 	if err := bidi.Encode(&api.LeaseResult{Ok: ok}); err != nil {
 		telemetry.RecordError(trace.SpanFromContext(ctx), err)
-		bidi.CloseSend(err)
+		closeSendAndRelease(bidi, err)
 		return
 	}
-	bidi.CloseSend(nil)
+	closeSendAndRelease(bidi, nil)
 }
 
 func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi api.BidiStream) {
@@ -364,11 +364,11 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 				appendLogFields(fields,
 					slog.Int("status_count", count),
 					"err", err)...)
-			bidi.CloseSend(err)
+			closeSendAndRelease(bidi, err)
 			return
 		}
 
-		bidi.CloseSend(nil)
+		closeSendAndRelease(bidi, nil)
 	})
 }
 
@@ -486,7 +486,7 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 			logContextFields(ctx, n.storeID,
 				slog.String("space", args.Space),
 				slog.String("segment", args.Segment))...)
-		bidi.CloseSend(err)
+		closeSendAndRelease(bidi, err)
 		return
 	}
 
@@ -498,7 +498,7 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 				slog.String("space", args.Space),
 				slog.String("segment", args.Segment),
 				"err", err)...)
-		bidi.CloseSend(fmt.Errorf("failed to connect to the message bus"))
+		closeSendAndRelease(bidi, fmt.Errorf("failed to connect to the message bus"))
 		return
 	}
 
@@ -748,6 +748,16 @@ func runAsyncStream(ctx context.Context, bidi api.BidiStream, fields []any, fn f
 	}()
 }
 
+func closeSendAndRelease(bidi api.BidiStream, err error) {
+	if bidi == nil {
+		return
+	}
+	_ = bidi.CloseSend(err)
+	if closer, ok := bidi.(interface{ CloseLocal(error) }); ok {
+		closer.CloseLocal(err)
+	}
+}
+
 func streamNames(ctx context.Context, operation string, enumerator enumerators.Enumerator[string], bidi api.BidiStream, fields ...any) {
 	defer enumerator.Dispose()
 	for enumerator.MoveNext() {
@@ -758,17 +768,17 @@ func streamNames(ctx context.Context, operation string, enumerator enumerators.E
 		if err != nil {
 			slog.WarnContext(ctx, "server: "+operation+" enumerator failed",
 				appendLogFields(fields, "err", err)...)
-			bidi.CloseSend(err)
+			closeSendAndRelease(bidi, err)
 			return
 		}
 		if err := bidi.Encode(name); err != nil {
 			slog.WarnContext(ctx, "server: "+operation+" response encode failed",
 				appendLogFields(fields, "err", err)...)
-			bidi.CloseSend(err)
+			closeSendAndRelease(bidi, err)
 			return
 		}
 	}
-	bidi.CloseSend(nil)
+	closeSendAndRelease(bidi, nil)
 }
 
 func streamEntries(ctx context.Context, operation string, enumerator enumerators.Enumerator[*api.Entry], bidi api.BidiStream, fields ...any) {
@@ -781,17 +791,17 @@ func streamEntries(ctx context.Context, operation string, enumerator enumerators
 		if err != nil {
 			slog.WarnContext(ctx, "server: "+operation+" enumerator failed",
 				appendLogFields(fields, "err", err)...)
-			bidi.CloseSend(err)
+			closeSendAndRelease(bidi, err)
 			return
 		}
 		if err := bidi.Encode(entry); err != nil {
 			slog.WarnContext(ctx, "server: "+operation+" response encode failed",
 				appendLogFields(fields, "err", err)...)
-			bidi.CloseSend(err)
+			closeSendAndRelease(bidi, err)
 			return
 		}
 	}
-	bidi.CloseSend(nil)
+	closeSendAndRelease(bidi, nil)
 }
 
 func logContextFields(ctx context.Context, storeID uuid.UUID, extras ...any) []any {
@@ -811,7 +821,7 @@ func appendLogFields(fields []any, extras ...any) []any {
 
 func checkContext(ctx context.Context, bidi api.BidiStream) bool {
 	if err := ctx.Err(); err != nil {
-		bidi.CloseSend(err)
+		closeSendAndRelease(bidi, err)
 		return false
 	}
 	return true
