@@ -35,6 +35,46 @@ type tombstoneEntry struct {
 	at  time.Time
 }
 
+// ingressMsg is a copy of an inbound frame for one logical stream. The shared
+// WebSocket read loop enqueues these so it never blocks on deliverToStream for
+// a different channel.
+type ingressMsg struct {
+	ctx       context.Context
+	control   ControlType
+	storeID   uuid.UUID
+	channelID uuid.UUID
+	payload   []byte
+}
+
+// streamIngress is a per-channel FIFO queue drained by a single goroutine that
+// calls deliverToStream. This isolates slow consumers so readLoop can keep
+// decoding frames for other channels.
+type streamIngress struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queue  []*ingressMsg
+	closed bool
+	wg     sync.WaitGroup
+}
+
+func newStreamIngress() *streamIngress {
+	s := &streamIngress{}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+// shutdownMarkClosed wakes the worker and sets closed; the worker discards any
+// undelivered queue entries and exits. Does not wait.
+func (ing *streamIngress) shutdownMarkClosed() {
+	if ing == nil {
+		return
+	}
+	ing.mu.Lock()
+	ing.closed = true
+	ing.cond.Broadcast()
+	ing.mu.Unlock()
+}
+
 type ControlType string
 
 const (
@@ -71,6 +111,7 @@ type WebSocketMuxer struct {
 	name        string
 	conn        *websocket.Conn
 	channels    map[uuid.UUID]*MuxerBidiStream
+	ingresses   map[uuid.UUID]*streamIngress
 	tombstones  map[uuid.UUID]tombstoneEntry
 	channelsMu  sync.RWMutex
 	writeMu     sync.Mutex
@@ -388,7 +429,10 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 		return bidi
 	default:
 	}
-	if m.maxStreams > 0 && atomic.LoadInt64(&m.activeStreams) >= m.maxStreams {
+	m.channelsMu.RLock()
+	_, replacing := m.channels[channelID]
+	m.channelsMu.RUnlock()
+	if !replacing && m.maxStreams > 0 && atomic.LoadInt64(&m.activeStreams) >= m.maxStreams {
 		bidi := NewMuxerBidiStream(
 			func([]byte) error { return ErrTooManyStreams },
 			func() {},
@@ -408,22 +452,65 @@ func (m *WebSocketMuxer) register(ctx context.Context, storeID, channelID uuid.U
 		return m.sendData(storeID, channelID, payload, nil)
 	}
 
+	var (
+		bidi       *MuxerBidiStream
+		newIngress *streamIngress
+	)
 	cleanup := func() {
 		atomic.AddInt64(&m.activeStreams, -1)
+		var ing *streamIngress
 		m.channelsMu.Lock()
-		defer m.channelsMu.Unlock()
-		delete(m.channels, channelID)
+		if current := m.channels[channelID]; current == bidi {
+			delete(m.channels, channelID)
+		}
+		if m.ingresses != nil {
+			if v, ok := m.ingresses[channelID]; ok && v == newIngress {
+				delete(m.ingresses, channelID)
+				ing = v
+			}
+		}
+		m.channelsMu.Unlock()
+		if ing != nil {
+			// Never ing.wg.Wait() here: cleanup can run from the ingress worker
+			// (e.g. handlePeerStreamControl -> CloseRemote), which would deadlock.
+			ing.shutdownMarkClosed()
+		}
 	}
 
-	bidi := NewMuxerBidiStream(sendFn, cleanup, m.streamRecvQueueCapacity())
+	bidi = NewMuxerBidiStream(sendFn, cleanup, m.streamRecvQueueCapacity())
 	bidi.SetChannelID(channelID)
 
 	m.channelsMu.Lock()
+	oldBidi := m.channels[channelID]
+	var oldIngress *streamIngress
+	if m.ingresses != nil {
+		if v, ok := m.ingresses[channelID]; ok {
+			oldIngress = v
+		}
+	}
+	if m.ingresses == nil {
+		m.ingresses = make(map[uuid.UUID]*streamIngress)
+	}
+	newIngress = newStreamIngress()
+	m.ingresses[channelID] = newIngress
 	delete(m.tombstones, channelID)
 	m.channels[channelID] = bidi
 	m.channelsMu.Unlock()
 
+	if oldIngress != nil {
+		oldIngress.shutdownMarkClosed()
+	}
+
+	newIngress.wg.Add(1)
+	go func(b *MuxerBidiStream, ing *streamIngress) {
+		defer ing.wg.Done()
+		m.runStreamIngressWorker(b, ing)
+	}(bidi, newIngress)
+
 	atomic.AddInt64(&m.activeStreams, 1)
+	if oldBidi != nil && oldBidi != bidi {
+		oldBidi.CloseLocal(nil)
+	}
 
 	return bidi
 }
@@ -904,16 +991,13 @@ func (m *WebSocketMuxer) handleClose(ctx context.Context) {
 
 func (m *WebSocketMuxer) handleErrorMessage(ctx context.Context, msg *MuxerMsg) {
 	if msg != nil && msg.ChannelID != uuid.Nil {
-		if m.handlePeerStreamControl(ctx, msg) {
-			return
-		}
 		m.channelsMu.Lock()
 		m.pruneTombstonesLocked(m.tombstoneNow())
-		bidi, exists := m.channels[msg.ChannelID]
+		_, exists := m.channels[msg.ChannelID]
 		_, tombstoned := m.tombstones[msg.ChannelID]
 		m.channelsMu.Unlock()
 		if exists {
-			m.deliverToStream(bidi, ctx, msg)
+			m.enqueueIngress(ctx, msg)
 			return
 		}
 		if tombstoned {
@@ -932,17 +1016,14 @@ func (m *WebSocketMuxer) handleDataMessage(ctx context.Context, msg *MuxerMsg) {
 	if !m.canAccessOrSendError(ctx, msg.StoreID, msg.ChannelID) {
 		return
 	}
-	if m.handlePeerStreamControl(ctx, msg) {
-		return
-	}
 
-	bidi, err := m.getOrCreateStream(ctx, msg)
+	_, err := m.getOrCreateStream(ctx, msg)
 	if err != nil {
 		// getOrCreateStream already logged and sent an error control if appropriate
 		return
 	}
 
-	m.deliverToStream(bidi, ctx, msg)
+	m.enqueueIngress(ctx, msg)
 }
 
 func (m *WebSocketMuxer) handlePeerStreamControl(ctx context.Context, msg *MuxerMsg) bool {
@@ -1120,6 +1201,94 @@ func (m *WebSocketMuxer) getOrCreateStream(ctx context.Context, msg *MuxerMsg) (
 	return nil, errors.New("registration returned nil")
 }
 
+// runStreamIngressWorker drains ingressMsg items for one logical stream in FIFO
+// order and applies deliverToStream. It exits when the ingress is shut down.
+func (m *WebSocketMuxer) runStreamIngressWorker(bidi *MuxerBidiStream, ing *streamIngress) {
+	if bidi == nil || ing == nil {
+		return
+	}
+	ing.mu.Lock()
+	for {
+		if ing.closed {
+			ing.queue = nil
+			ing.mu.Unlock()
+			return
+		}
+		for len(ing.queue) > 0 {
+			item := ing.queue[0]
+			ing.queue = ing.queue[1:]
+			ing.mu.Unlock()
+
+			msg := &MuxerMsg{
+				ControlType: item.control,
+				StoreID:     item.storeID,
+				ChannelID:   item.channelID,
+				Payload:     item.payload,
+			}
+			// Peer stream control (mux::close / mux::error) must run in ingress
+			// order after prior frames for this channel, not synchronously in readLoop.
+			if msg.ControlType == ControlTypeData || msg.ControlType == ControlTypeError {
+				if m.handlePeerStreamControl(item.ctx, msg) {
+					// Stream is closed; drop undelivered ingress and stop this worker.
+					ing.mu.Lock()
+					ing.queue = nil
+					ing.mu.Unlock()
+					return
+				}
+			}
+			m.deliverToStream(bidi, item.ctx, msg)
+
+			ing.mu.Lock()
+			if ing.closed {
+				ing.queue = nil
+				ing.mu.Unlock()
+				return
+			}
+		}
+		if ing.closed {
+			ing.mu.Unlock()
+			return
+		}
+		ing.cond.Wait()
+	}
+}
+
+// enqueueIngress copies msg and pushes it to the per-channel ingress queue.
+// The WebSocket read loop must use this instead of deliverToStream so one slow
+// stream does not head-of-line block other channels.
+func (m *WebSocketMuxer) enqueueIngress(ctx context.Context, msg *MuxerMsg) {
+	if msg == nil {
+		return
+	}
+	chID := msg.ChannelID
+	var payload []byte
+	if len(msg.Payload) > 0 {
+		payload = append([]byte(nil), msg.Payload...)
+	}
+	item := &ingressMsg{
+		ctx:       ctx,
+		control:   msg.ControlType,
+		storeID:   msg.StoreID,
+		channelID: chID,
+		payload:   payload,
+	}
+
+	m.channelsMu.RLock()
+	ing := m.ingresses[chID]
+	m.channelsMu.RUnlock()
+	if ing == nil {
+		return
+	}
+	ing.mu.Lock()
+	if ing.closed {
+		ing.mu.Unlock()
+		return
+	}
+	ing.queue = append(ing.queue, item)
+	ing.cond.Signal()
+	ing.mu.Unlock()
+}
+
 // deliverToStream offers the payload to the bidi stream and logs delivery or drop.
 func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Context, msg *MuxerMsg) {
 	if bidi == nil {
@@ -1136,7 +1305,7 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		offerTimeout = defaultStreamRecvOfferTimeout
 	}
 
-	for consecutiveTimeouts := int64(0); ; consecutiveTimeouts++ {
+	for consecutiveTimeouts := int64(0); ; {
 		select {
 		case <-ctx.Done():
 			return

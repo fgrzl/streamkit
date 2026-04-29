@@ -158,6 +158,78 @@ func TestShouldOverwriteExistingRegistration(t *testing.T) {
 	got := m.channels[channelID]
 	m.channelsMu.RUnlock()
 	assert.Equal(t, second, got)
+	assert.True(t, first.IsClosed(), "expected overwritten stream to close")
+	assert.False(t, second.IsClosed(), "expected replacement stream to remain open")
+	assert.Equal(t, int64(1), atomic.LoadInt64(&m.activeStreams))
+}
+
+func TestShouldReplaceExistingRegistrationUnderStreamLimit(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]tombstoneEntry),
+		done:       make(chan struct{}),
+		maxStreams: 1,
+		sendJSON:   func(_ *websocket.Conn, _ interface{}) error { return nil },
+	}
+
+	storeID := uuid.New()
+	channelID := uuid.New()
+	first := m.register(context.Background(), storeID, channelID)
+	second := m.register(context.Background(), storeID, channelID)
+
+	require.NotNil(t, second)
+	assert.NotEqual(t, first, second)
+	assert.True(t, first.IsClosed(), "replacement should close the superseded stream")
+	assert.NoError(t, second.Encode("ok"), "replacement stream should be usable under the existing stream slot")
+	assert.Equal(t, int64(1), atomic.LoadInt64(&m.activeStreams))
+}
+
+func TestShouldReplaceBackpressuredRegistrationWithoutBlocking(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:                       context.Background(),
+		name:                          "client",
+		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:                    make(map[uuid.UUID]tombstoneEntry),
+		done:                          make(chan struct{}),
+		streamRecvOfferTimeout:        5 * time.Millisecond,
+		streamRecvSaturationThreshold: 1,
+		streamRecvSaturationPolicy:    StreamRecvSaturationPolicyWait,
+	}
+
+	storeID := uuid.New()
+	channelID := uuid.New()
+	first := m.register(context.Background(), storeID, channelID)
+	first.recvChan = make(chan any, 1)
+	require.True(t, first.Offer([]byte(`"blocked"`)))
+
+	m.enqueueIngress(context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   channelID,
+		Payload:     []byte(`"waiting"`),
+	})
+	require.Eventually(t, func() bool {
+		return m.StreamRecvTimeouts() > 0
+	}, time.Second, 5*time.Millisecond)
+
+	done := make(chan *MuxerBidiStream, 1)
+	go func() {
+		done <- m.register(context.Background(), storeID, channelID)
+	}()
+
+	var second *MuxerBidiStream
+	select {
+	case second = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("replacement register blocked behind old ingress worker")
+	}
+
+	require.NotNil(t, second)
+	assert.True(t, first.IsClosed(), "old stream should close and unblock its ingress worker")
+	assert.False(t, second.IsClosed())
+	assert.Equal(t, int64(1), atomic.LoadInt64(&m.activeStreams))
 }
 
 func TestShouldRejectOfferAfterClose(t *testing.T) {
@@ -595,16 +667,66 @@ func TestShouldReleaseStreamOnPeerCloseWithoutDroppingBufferedMessages(t *testin
 		Payload:     []byte(`{"type":"mux::close"}`),
 	})
 
-	m.channelsMu.RLock()
-	_, exists := m.channels[channelID]
-	m.channelsMu.RUnlock()
-	assert.False(t, exists, "expected channel to be removed after peer close")
-	assert.Equal(t, int64(0), atomic.LoadInt64(&m.activeStreams))
+	require.Eventually(t, func() bool {
+		m.channelsMu.RLock()
+		_, exists := m.channels[channelID]
+		m.channelsMu.RUnlock()
+		return !exists
+	}, 2*time.Second, 5*time.Millisecond, "expected channel to be removed after peer close")
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt64(&m.activeStreams) == 0
+	}, 2*time.Second, 5*time.Millisecond, "expected activeStreams 0 after peer close")
 
 	var value string
 	require.NoError(t, bidi.Decode(&value))
 	assert.Equal(t, "ok", value)
 	assert.Equal(t, io.EOF, bidi.Decode(&value))
+}
+
+func TestShouldReleaseStreamOnPeerErrorAfterPriorIngressData(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]tombstoneEntry),
+		done:       make(chan struct{}),
+		session:    &muxerSession{allowAll: true},
+	}
+
+	storeID := uuid.New()
+	channelID := uuid.New()
+	bidi := m.register(context.Background(), storeID, channelID)
+
+	m.processMessage(&MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   channelID,
+		Payload:     []byte(`"before"`),
+	})
+	m.processMessage(&MuxerMsg{
+		ControlType: ControlTypeError,
+		StoreID:     storeID,
+		ChannelID:   channelID,
+		Payload:     []byte(`{"type":"mux::error","err":"boom"}`),
+	})
+	m.processMessage(&MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   channelID,
+		Payload:     []byte(`"after"`),
+	})
+
+	var value string
+	require.NoError(t, bidi.Decode(&value))
+	assert.Equal(t, "before", value)
+	assert.EqualError(t, bidi.Decode(&value), "remote error: boom")
+	require.Eventually(t, func() bool {
+		m.channelsMu.RLock()
+		_, exists := m.channels[channelID]
+		m.channelsMu.RUnlock()
+		return !exists
+	}, 2*time.Second, 5*time.Millisecond, "expected channel to be removed after peer error")
+	assert.Equal(t, int64(0), atomic.LoadInt64(&m.activeStreams))
 }
 
 func TestShouldDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
@@ -1005,4 +1127,96 @@ func TestShouldShutdownWithOpenStreamDoesNotDeadlock(t *testing.T) {
 	_, exists := m.channels[channelID]
 	m.channelsMu.RUnlock()
 	assert.False(t, exists, "expected channel to be removed after shutdown")
+}
+
+// TestShouldIsolateIngressSlowStreamFromBlockingOtherChannels verifies that when
+// one logical stream's ingress worker is blocked in deliverToStream (recv buffer
+// full), another channel on the same muxer can still receive data.
+func TestShouldIsolateIngressSlowStreamFromBlockingOtherChannels(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]tombstoneEntry),
+		done:       make(chan struct{}),
+		session:    &muxerSession{allowAll: true},
+	}
+
+	storeID := uuid.New()
+	slowID := uuid.New()
+	fastID := uuid.New()
+	slow := m.register(context.Background(), storeID, slowID)
+	fast := m.register(context.Background(), storeID, fastID)
+
+	for i := 0; i < cap(slow.recvChan); i++ {
+		require.True(t, slow.Offer([]byte(`"fill"`)))
+	}
+
+	go func() {
+		m.enqueueIngress(context.Background(), &MuxerMsg{
+			ControlType: ControlTypeData,
+			StoreID:     storeID,
+			ChannelID:   slowID,
+			Payload:     []byte(`"blocking-deliver"`),
+		})
+	}()
+
+	time.Sleep(15 * time.Millisecond)
+
+	m.enqueueIngress(context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   fastID,
+		Payload:     []byte(`"fast"`),
+	})
+
+	done := make(chan string, 1)
+	go func() {
+		var v string
+		if err := fast.Decode(&v); err != nil {
+			done <- ""
+			return
+		}
+		done <- v
+	}()
+
+	select {
+	case v := <-done:
+		assert.Equal(t, "fast", v)
+	case <-time.After(2 * time.Second):
+		t.Fatal("fast stream decode blocked while slow stream ingress worker was backpressured")
+	}
+}
+
+// TestShouldIngressPreservePerChannelFIFO enqueues multiple data frames on one
+// channel and asserts Decode observes wire order.
+func TestShouldIngressPreservePerChannelFIFO(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:    context.Background(),
+		name:       "client",
+		channels:   make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones: make(map[uuid.UUID]tombstoneEntry),
+		done:       make(chan struct{}),
+		session:    &muxerSession{allowAll: true},
+	}
+	storeID := uuid.New()
+	channelID := uuid.New()
+	bidi := m.register(context.Background(), storeID, channelID)
+
+	for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
+		m.enqueueIngress(context.Background(), &MuxerMsg{
+			ControlType: ControlTypeData,
+			StoreID:     storeID,
+			ChannelID:   channelID,
+			Payload:     p,
+		})
+	}
+
+	var x, y, z string
+	require.NoError(t, bidi.Decode(&x))
+	require.NoError(t, bidi.Decode(&y))
+	require.NoError(t, bidi.Decode(&z))
+	assert.Equal(t, "a", x)
+	assert.Equal(t, "b", y)
+	assert.Equal(t, "c", z)
 }
