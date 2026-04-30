@@ -262,12 +262,14 @@ func TestShouldMuxerReceivePressureOptionsOverrideDefaults(t *testing.T) {
 	m := &WebSocketMuxer{}
 	applyMuxerOptions(m,
 		WithStreamRecvQueueSize(9),
+		WithStreamIngressQueueSize(7),
 		WithStreamRecvOfferTimeout(5*time.Millisecond),
 		WithStreamRecvSaturationThreshold(4),
 		WithStreamRecvSaturationPolicy(StreamRecvSaturationPolicyClose),
 	)
 
 	assert.Equal(t, 9, m.streamRecvQueueSize)
+	assert.Equal(t, 7, m.streamIngressQueueSize)
 	assert.Equal(t, 5*time.Millisecond, m.streamRecvOfferTimeout)
 	assert.Equal(t, int64(4), m.streamRecvSaturationThreshold)
 	assert.Equal(t, StreamRecvSaturationPolicyClose, m.streamRecvSaturationPolicy)
@@ -449,6 +451,7 @@ func TestShouldReturnMuxerDiagnosticsSnapshot(t *testing.T) {
 	assert.Equal(t, int64(9), snapshot.StreamRecvOverloads)
 	assert.Equal(t, int64(10), snapshot.SaturationWarnings)
 	assert.Equal(t, 16, snapshot.StreamRecvQueueSize)
+	assert.Equal(t, defaultStreamIngressQueueSize, snapshot.StreamIngressQueueSize)
 	assert.Equal(t, 25*time.Millisecond, snapshot.StreamRecvOfferTimeout)
 }
 
@@ -1186,6 +1189,70 @@ func TestShouldIsolateIngressSlowStreamFromBlockingOtherChannels(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("fast stream decode blocked while slow stream ingress worker was backpressured")
 	}
+}
+
+func TestShouldCloseOnlySlowStreamWhenIngressBacklogOverflows(t *testing.T) {
+	m := &WebSocketMuxer{
+		Context:                       context.Background(),
+		name:                          "client",
+		channels:                      make(map[uuid.UUID]*MuxerBidiStream),
+		tombstones:                    make(map[uuid.UUID]tombstoneEntry),
+		done:                          make(chan struct{}),
+		session:                       &muxerSession{allowAll: true},
+		streamIngressQueueSize:        1,
+		streamRecvOfferTimeout:        5 * time.Millisecond,
+		streamRecvSaturationThreshold: 1,
+		streamRecvSaturationPolicy:    StreamRecvSaturationPolicyWait,
+		sendJSON:                      func(_ *websocket.Conn, _ interface{}) error { return nil },
+	}
+
+	storeID := uuid.New()
+	slowID := uuid.New()
+	fastID := uuid.New()
+	slow := m.register(context.Background(), storeID, slowID)
+	fast := m.register(context.Background(), storeID, fastID)
+	slow.recvChan = make(chan any, 1)
+	require.True(t, slow.Offer([]byte(`"fill"`)))
+
+	m.enqueueIngress(context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   slowID,
+		Payload:     []byte(`"blocked"`),
+	})
+	require.Eventually(t, func() bool {
+		return m.StreamRecvTimeouts() > 0
+	}, time.Second, 5*time.Millisecond)
+
+	m.enqueueIngress(context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   slowID,
+		Payload:     []byte(`"queued"`),
+	})
+	m.enqueueIngress(context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   slowID,
+		Payload:     []byte(`"overflow"`),
+	})
+
+	require.Eventually(t, slow.IsClosed, time.Second, 5*time.Millisecond)
+	assert.Equal(t, int64(1), m.StreamRecvOverloads())
+	m.channelsMu.RLock()
+	_, tombstoned := m.tombstones[slowID]
+	m.channelsMu.RUnlock()
+	assert.True(t, tombstoned, "expected overloaded stream to be tombstoned")
+
+	m.enqueueIngress(context.Background(), &MuxerMsg{
+		ControlType: ControlTypeData,
+		StoreID:     storeID,
+		ChannelID:   fastID,
+		Payload:     []byte(`"fast"`),
+	})
+	var value string
+	require.NoError(t, fast.Decode(&value))
+	assert.Equal(t, "fast", value)
 }
 
 // TestShouldIngressPreservePerChannelFIFO enqueues multiple data frames on one

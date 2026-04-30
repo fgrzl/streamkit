@@ -30,6 +30,17 @@ func WithStreamRecvQueueSize(size int) MuxerOption {
 	}
 }
 
+// WithStreamIngressQueueSize sets the per-logical-stream ingress backlog used
+// between the shared websocket read loop and the stream's receive queue.
+// Values less than or equal to zero are ignored.
+func WithStreamIngressQueueSize(size int) MuxerOption {
+	return func(m *WebSocketMuxer) {
+		if size > 0 {
+			m.streamIngressQueueSize = size
+		}
+	}
+}
+
 // WithStreamRecvOfferTimeout sets how long the muxer waits for a logical stream
 // to free receive-buffer headroom before retrying or closing the channel.
 // Values less than or equal to zero are ignored.

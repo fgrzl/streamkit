@@ -158,6 +158,7 @@ type WebSocketMuxer struct {
 	streamRecvTimeouts            int64
 	streamRecvOverloads           int64
 	streamRecvQueueSize           int
+	streamIngressQueueSize        int
 	streamRecvOfferTimeout        time.Duration
 	streamRecvSaturationThreshold int64
 	streamRecvSaturationPolicy    StreamRecvSaturationPolicy
@@ -189,6 +190,7 @@ type MuxerDiagnostics struct {
 	StreamRecvOverloads    int64
 	SaturationWarnings     int64
 	StreamRecvQueueSize    int
+	StreamIngressQueueSize int
 	StreamRecvOfferTimeout time.Duration
 }
 
@@ -210,6 +212,7 @@ const (
 	defaultMaxFramePayloadBytes                = 8 << 20
 	defaultMaxMessagePayloadBytes              = 6 << 20
 	defaultStreamRecvQueueSize                 = 1024
+	defaultStreamIngressQueueSize              = defaultStreamRecvQueueSize
 	defaultStreamRecvOfferTimeout              = 100 * time.Millisecond
 	defaultStreamRecvSaturationThreshold       = 3
 	defaultStreamRecvSaturationPolicy          = StreamRecvSaturationPolicyWait
@@ -237,6 +240,7 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 		maxFramePayloadBytes:          defaultMaxFramePayloadBytes,
 		maxMessagePayloadBytes:        defaultMaxMessagePayloadBytes,
 		streamRecvQueueSize:           defaultStreamRecvQueueSize,
+		streamIngressQueueSize:        defaultStreamIngressQueueSize,
 		streamRecvOfferTimeout:        defaultStreamRecvOfferTimeout,
 		streamRecvSaturationThreshold: defaultStreamRecvSaturationThreshold,
 		streamRecvSaturationPolicy:    defaultStreamRecvSaturationPolicy,
@@ -251,6 +255,9 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	applyMuxerOptions(m, opts...)
 	if m.streamRecvQueueSize <= 0 {
 		m.streamRecvQueueSize = defaultStreamRecvQueueSize
+	}
+	if m.streamIngressQueueSize <= 0 {
+		m.streamIngressQueueSize = defaultStreamIngressQueueSize
 	}
 	if m.streamRecvOfferTimeout <= 0 {
 		m.streamRecvOfferTimeout = defaultStreamRecvOfferTimeout
@@ -306,6 +313,7 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 		maxFramePayloadBytes:          defaultMaxFramePayloadBytes,
 		maxMessagePayloadBytes:        defaultMaxMessagePayloadBytes,
 		streamRecvQueueSize:           defaultStreamRecvQueueSize,
+		streamIngressQueueSize:        defaultStreamIngressQueueSize,
 		streamRecvOfferTimeout:        defaultStreamRecvOfferTimeout,
 		streamRecvSaturationThreshold: defaultStreamRecvSaturationThreshold,
 		streamRecvSaturationPolicy:    defaultStreamRecvSaturationPolicy,
@@ -320,6 +328,9 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	applyMuxerOptions(m, opts...)
 	if m.streamRecvQueueSize <= 0 {
 		m.streamRecvQueueSize = defaultStreamRecvQueueSize
+	}
+	if m.streamIngressQueueSize <= 0 {
+		m.streamIngressQueueSize = defaultStreamIngressQueueSize
 	}
 	if m.streamRecvOfferTimeout <= 0 {
 		m.streamRecvOfferTimeout = defaultStreamRecvOfferTimeout
@@ -591,6 +602,13 @@ func (m *WebSocketMuxer) streamRecvQueueCapacity() int {
 		return m.streamRecvQueueSize
 	}
 	return defaultStreamRecvQueueSize
+}
+
+func (m *WebSocketMuxer) streamIngressQueueCapacity() int {
+	if m.streamIngressQueueSize > 0 {
+		return m.streamIngressQueueSize
+	}
+	return defaultStreamIngressQueueSize
 }
 
 func (m *WebSocketMuxer) streamRecvWaitTimeout() time.Duration {
@@ -1279,14 +1297,39 @@ func (m *WebSocketMuxer) enqueueIngress(ctx context.Context, msg *MuxerMsg) {
 	if ing == nil {
 		return
 	}
+
+	capacity := m.streamIngressQueueCapacity()
+	overloaded := false
+	queueDepth := int64(0)
 	ing.mu.Lock()
 	if ing.closed {
 		ing.mu.Unlock()
 		return
 	}
-	ing.queue = append(ing.queue, item)
-	ing.cond.Signal()
+	if capacity > 0 && len(ing.queue) >= capacity {
+		queueDepth = int64(len(ing.queue))
+		ing.closed = true
+		ing.queue = nil
+		ing.cond.Broadcast()
+		overloaded = true
+	} else {
+		ing.queue = append(ing.queue, item)
+		ing.cond.Signal()
+	}
 	ing.mu.Unlock()
+
+	if !overloaded {
+		return
+	}
+
+	slog.WarnContext(ctx, "muxer: stream ingress backlog overloaded; closing channel",
+		m.msgLogFields(msg,
+			slog.String("error_type", classifyTransportError(ErrStreamOverloaded)),
+			slog.Int64("queue_depth", queueDepth),
+			slog.Int("queue_capacity", capacity))...)
+	m.recordStreamRecvOverload()
+	m.tombstoneStream(chID, ErrStreamOverloaded)
+	m.sendStreamOverloadErrorAsync(msg.StoreID, chID)
 }
 
 // deliverToStream offers the payload to the bidi stream and logs delivery or drop.
@@ -1374,33 +1417,37 @@ func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Cont
 		m.recordStreamRecvOverload()
 		m.tombstoneStream(msg.ChannelID, ErrStreamOverloaded)
 
-		if msg == nil || msg.ChannelID == uuid.Nil {
-			return
-		}
-
-		go func(storeID, channelID uuid.UUID) {
-			payload, err := json.Marshal(&ErrorMessage{
-				Type: controlMsgSentinel + "error",
-				Err:  ErrStreamOverloaded.Error(),
-			})
-			if err != nil {
-				slog.WarnContext(m.Context, "muxer: marshal overload error failed",
-					m.logFields(m.Context,
-						slog.String("channel_id", channelID.String()),
-						"err", err)...)
-				return
-			}
-			if err := m.sendControl(ControlTypeError, storeID, channelID, payload); err != nil {
-				slog.WarnContext(m.Context, "muxer: send overload error failed",
-					m.logFields(m.Context,
-						slog.String("store_id", storeID.String()),
-						slog.String("channel_id", channelID.String()),
-						slog.String("error_type", classifyTransportError(err)),
-						"err", err)...)
-			}
-		}(msg.StoreID, msg.ChannelID)
+		m.sendStreamOverloadErrorAsync(msg.StoreID, msg.ChannelID)
 		return
 	}
+}
+
+func (m *WebSocketMuxer) sendStreamOverloadErrorAsync(storeID, channelID uuid.UUID) {
+	if channelID == uuid.Nil {
+		return
+	}
+
+	go func() {
+		payload, err := json.Marshal(&ErrorMessage{
+			Type: controlMsgSentinel + "error",
+			Err:  ErrStreamOverloaded.Error(),
+		})
+		if err != nil {
+			slog.WarnContext(m.Context, "muxer: marshal overload error failed",
+				m.logFields(m.Context,
+					slog.String("channel_id", channelID.String()),
+					"err", err)...)
+			return
+		}
+		if err := m.sendControl(ControlTypeError, storeID, channelID, payload); err != nil {
+			slog.WarnContext(m.Context, "muxer: send overload error failed",
+				m.logFields(m.Context,
+					slog.String("store_id", storeID.String()),
+					slog.String("channel_id", channelID.String()),
+					slog.String("error_type", classifyTransportError(err)),
+					"err", err)...)
+		}
+	}()
 }
 
 // heartbeat periodically sends ping control frames and verifies a timely pong or activity.
@@ -1836,6 +1883,7 @@ func (m *WebSocketMuxer) DiagnosticsSnapshot() MuxerDiagnostics {
 		StreamRecvOverloads:    atomic.LoadInt64(&m.streamRecvOverloads),
 		SaturationWarnings:     atomic.LoadInt64(&m.writeQueueSaturationWarnings),
 		StreamRecvQueueSize:    m.streamRecvQueueCapacity(),
+		StreamIngressQueueSize: m.streamIngressQueueCapacity(),
 		StreamRecvOfferTimeout: m.streamRecvWaitTimeout(),
 	}
 }

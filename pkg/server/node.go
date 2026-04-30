@@ -9,7 +9,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"sync"
@@ -30,6 +32,25 @@ const (
 	minSubscriptionHeartbeatIntervalSeconds = 1
 	maxSubscriptionHeartbeatIntervalSeconds = 300
 )
+
+// isBenignInitialEnvelopeDecodeErr reports teardown before the first request
+// envelope (e.g. client closed the logical stream, overload tombstone, ctx cancel).
+// These should not spam WARN like malformed JSON would.
+func isBenignInitialEnvelopeDecodeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return false
+}
 
 // Node represents a request handler that processes streaming operations
 // and coordinates with storage backends.
@@ -103,8 +124,13 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 
 	envelope := &polymorphic.Envelope{}
 	if err := bidi.Decode(envelope); err != nil {
-		slog.WarnContext(ctx, "server: failed to decode request envelope",
-			logContextFields(ctx, n.storeID, "err", err)...)
+		if isBenignInitialEnvelopeDecodeErr(err) {
+			slog.DebugContext(ctx, "server: logical stream closed before request envelope",
+				logContextFields(ctx, n.storeID, "err", err)...)
+		} else {
+			slog.WarnContext(ctx, "server: failed to decode request envelope",
+				logContextFields(ctx, n.storeID, "err", err)...)
+		}
 		bidi.Close(err)
 		return
 	}
@@ -509,7 +535,9 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 			subscriber.router.unregisterSubscriber(subscriber)
 			cancelSub()
 			if closeBidi {
-				bidi.Close(closeErr)
+				subscriber.close(closeErr, true)
+			} else {
+				subscriber.close(closeErr, false)
 			}
 		})
 	}

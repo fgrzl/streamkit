@@ -226,6 +226,32 @@ func (m *mockBidi) closeLocalState() (calls int, err error) {
 func (m *mockBidi) EndOfStreamError() error { return io.EOF }
 func (m *mockBidi) Closed() <-chan struct{} { return m.closed }
 
+type blockingEncodeBidi struct {
+	*mockBidi
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingEncodeBidi) Encode(msg any) error {
+	b.once.Do(func() {
+		close(b.started)
+		<-b.release
+	})
+	return b.mockBidi.Encode(msg)
+}
+
+func TestShouldHandleEOFBeforeRequestEnvelope(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	bidi := newMockBidi(nil)
+
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+
+	require.ErrorIs(t, bidi.closeErr, io.EOF)
+}
+
 func TestShouldGetSpacesStreamsNames(t *testing.T) {
 	// Arrange
 	store := &mockStore{spaces: []string{"one", "two"}}
@@ -742,6 +768,92 @@ func TestShouldSubscribeBuffersNotificationsUntilSnapshotCompletes(t *testing.T)
 
 	cancel()
 	waitForClosed(t, bidi)
+}
+
+func TestShouldSubscriptionRouterCoalesceSlowSubscriberWithoutBlocking(t *testing.T) {
+	storeID := uuid.New()
+	router := &spaceSubscriptionRouter{
+		node: &defaultNode{
+			storeID: storeID,
+		},
+		space:               "s",
+		wildcardSubscribers: make(map[string]*spaceSubscriptionTarget),
+		segmentSubscribers:  make(map[string]map[string]*spaceSubscriptionTarget),
+	}
+	bidi := &blockingEncodeBidi{
+		mockBidi: newMockBidi(nil),
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	bidi.encodedCh = make(chan any, 4)
+	target := newSpaceSubscriptionTarget(router, "seg", bidi)
+	target.snapshotPending = false
+	target.sendQueueLimit = 1
+	router.segmentSubscribers["seg"] = map[string]*spaceSubscriptionTarget{target.id: target}
+	router.subscriberCount = 1
+	target.start()
+
+	require.NoError(t, router.handleNotification(context.Background(), &api.SegmentNotification{
+		StoreID: storeID,
+		SegmentStatus: &api.SegmentStatus{
+			Space:        "s",
+			Segment:      "seg",
+			LastSequence: 1,
+		},
+	}))
+	select {
+	case <-bidi.started:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber writer to block")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		for seq := uint64(2); seq <= 100; seq++ {
+			if err := router.handleNotification(context.Background(), &api.SegmentNotification{
+				StoreID: storeID,
+				SegmentStatus: &api.SegmentStatus{
+					Space:        "s",
+					Segment:      "seg",
+					LastSequence: seq,
+				},
+			}); err != nil {
+				errCh <- err
+				return
+			}
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("router blocked behind a slow subscriber")
+	}
+
+	target.mu.Lock()
+	require.Len(t, target.sendQueue, 1)
+	assert.Equal(t, uint64(100), target.sendQueue[0].LastSequence)
+	assert.False(t, target.closed)
+	target.mu.Unlock()
+
+	close(bidi.release)
+
+	var first, second any
+	select {
+	case first = <-bidi.encodedCh:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first encoded status")
+	}
+	select {
+	case second = <-bidi.encodedCh:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for coalesced encoded status")
+	}
+	assert.Equal(t, uint64(1), first.(*api.SegmentStatus).LastSequence)
+	assert.Equal(t, uint64(100), second.(*api.SegmentStatus).LastSequence)
+	target.close(nil, true)
 }
 
 func TestShouldSubscribeClosesWhenInitialHeartbeatFails(t *testing.T) {
