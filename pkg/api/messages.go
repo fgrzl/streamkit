@@ -120,10 +120,18 @@ func (e *Entry) GetSegmentOffset() lexkey.LexKey {
 }
 
 // Consume represents a request to read entries from multiple spaces with optional filters.
+// Entries from each space are interleaved by Timestamp (see server implementation).
+//
+// Limit caps how many entries are streamed for this request (total across all spaces).
+// Zero, omitted JSON field, or Limit set to the maximum uint64 value means no cap (backward compatible).
+// When Limit is positive, results under concurrent producers, identical timestamps, or
+// store ordering differences may be non-deterministic across runs: the first N merged
+// entries can differ even with the same offsets; use cursors and idempotent handling.
 type Consume struct {
 	MinTimestamp int64                    `json:"min_timestamp,omitempty"`
 	MaxTimestamp int64                    `json:"max_timestamp,omitempty"`
 	Offsets      map[string]lexkey.LexKey `json:"offsets,omitempty"`
+	Limit        uint64                   `json:"limit,omitempty"`
 }
 
 // GetDiscriminator returns the unique message type identifier for Consume.
@@ -132,11 +140,15 @@ func (m *Consume) GetDiscriminator() string {
 }
 
 // ConsumeSpace represents a request to read entries from all segments within a space.
+// Limit caps how many entries are streamed; zero, omitted, or maximum uint64 means no cap.
+// Under concurrent writes across segments, ordering and which entries appear within a
+// finite limit may vary across runs.
 type ConsumeSpace struct {
 	Space        string        `json:"space"`
 	MinTimestamp int64         `json:"min_timestamp,omitempty"`
 	MaxTimestamp int64         `json:"max_timestamp,omitempty"`
 	Offset       lexkey.LexKey `json:"offset,omitempty"`
+	Limit        uint64        `json:"limit,omitempty"`
 }
 
 // GetDiscriminator returns the unique message type identifier for ConsumeSpace.
@@ -145,6 +157,7 @@ func (m *ConsumeSpace) GetDiscriminator() string {
 }
 
 // ConsumeSegment represents a request to read entries from a specific segment with optional filters.
+// Limit caps how many entries are streamed; zero, omitted, or maximum uint64 means no cap.
 type ConsumeSegment struct {
 	Space        string `json:"space"`
 	Segment      string `json:"segment"`
@@ -152,6 +165,7 @@ type ConsumeSegment struct {
 	MinTimestamp int64  `json:"min_timestamp,omitempty"`
 	MaxSequence  uint64 `json:"max_sequence,omitempty"`
 	MaxTimestamp int64  `json:"max_timestamp,omitempty"`
+	Limit        uint64 `json:"limit,omitempty"`
 }
 
 // GetDiscriminator returns the unique message type identifier for ConsumeSegment.

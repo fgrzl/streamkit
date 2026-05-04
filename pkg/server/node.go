@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -93,6 +94,23 @@ type defaultNode struct {
 const maxLeaseTTL = 24 * time.Hour
 const defaultNotifyFailureThreshold = 5
 const defaultNotifyCircuitOpenWindow = time.Minute
+
+// serverMaxConsumeEntries caps a single request's Limit to avoid int overflow for
+// enumerators.Take and to bound work; higher requested limits are clamped.
+const serverMaxConsumeEntries uint64 = 10_000_000
+
+// limitConsumeEntries wraps enum to yield at most limit entries. limit 0 or
+// math.MaxUint64 means unlimited (no Take wrapper).
+func limitConsumeEntries(enum enumerators.Enumerator[*api.Entry], limit uint64) enumerators.Enumerator[*api.Entry] {
+	if limit == 0 || limit == math.MaxUint64 {
+		return enum
+	}
+	n := limit
+	if n > serverMaxConsumeEntries {
+		n = serverMaxConsumeEntries
+	}
+	return enumerators.Take(enum, int(n))
+}
 
 func (n *defaultNode) Close() {
 	n.subscriptionRoutersMu.Lock()
@@ -200,7 +218,7 @@ func (n *defaultNode) handleGetSpaces(ctx context.Context, _ *api.GetSpaces, bid
 }
 
 func (n *defaultNode) handleConsumeSpace(ctx context.Context, args *api.ConsumeSpace, bidi api.BidiStream) {
-	enumerator := n.store.ConsumeSpace(ctx, args)
+	enumerator := limitConsumeEntries(n.store.ConsumeSpace(ctx, args), args.Limit)
 	fields := logContextFields(ctx, n.storeID, slog.String("space", args.Space))
 	runAsyncStream(ctx, bidi, fields, func() {
 		streamEntries(ctx, "consume space", enumerator, bidi, fields...)
@@ -216,7 +234,7 @@ func (n *defaultNode) handleGetSegments(ctx context.Context, args *api.GetSegmen
 }
 
 func (n *defaultNode) handleConsumeSegment(ctx context.Context, args *api.ConsumeSegment, bidi api.BidiStream) {
-	enumerator := n.store.ConsumeSegment(ctx, args)
+	enumerator := limitConsumeEntries(n.store.ConsumeSegment(ctx, args), args.Limit)
 	fields := logContextFields(ctx, n.storeID,
 		slog.String("space", args.Space),
 		slog.String("segment", args.Segment))
@@ -497,6 +515,7 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 		}))
 	}
 	enumerator := enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
+	enumerator = limitConsumeEntries(enumerator, args.Limit)
 	fields := logContextFields(ctx, n.storeID, slog.Int("space_count", len(args.Offsets)))
 	runAsyncStream(ctx, bidi, fields, func() {
 		streamEntries(ctx, "consume", enumerator, bidi, fields...)

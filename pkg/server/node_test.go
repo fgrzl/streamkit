@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/fgrzl/enumerators"
+	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/json/polymorphic"
 	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -1357,6 +1359,79 @@ func TestShouldEndConsumeSegmentSpanBeforeStreamingCompletes(t *testing.T) {
 
 	close(release)
 	waitForClosed(t, bidi)
+}
+
+func TestShouldConsumeSegmentEncodeAtMostLimitEntries(t *testing.T) {
+	entries := make([]*api.Entry, 10)
+	for i := range entries {
+		entries[i] = &api.Entry{Space: "s", Segment: "seg", Sequence: uint64(i + 1), Timestamp: int64(i + 1)}
+	}
+	store := &mockStore{entries: entries}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg", Limit: 3}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+	require.Len(t, bidi.encoded, 3)
+}
+
+func TestShouldConsumeSpaceEncodeAtMostLimitEntries(t *testing.T) {
+	entries := make([]*api.Entry, 10)
+	for i := range entries {
+		entries[i] = &api.Entry{Space: "s", Segment: "seg", Sequence: uint64(i + 1), Timestamp: int64(i + 1)}
+	}
+	store := &mockStore{entries: entries}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	env := &polymorphic.Envelope{Content: &api.ConsumeSpace{Space: "s", Limit: 3}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+	require.Len(t, bidi.encoded, 3)
+}
+
+func TestShouldConsumeSegmentWithoutLimitEncodesAll(t *testing.T) {
+	entries := make([]*api.Entry, 4)
+	for i := range entries {
+		entries[i] = &api.Entry{Space: "s", Segment: "seg", Sequence: uint64(i + 1)}
+	}
+	store := &mockStore{entries: entries}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+	require.Len(t, bidi.encoded, 4)
+}
+
+func TestShouldConsumeSegmentMaxUint64LimitStreamsAll(t *testing.T) {
+	entries := make([]*api.Entry, 7)
+	for i := range entries {
+		entries[i] = &api.Entry{Space: "s", Segment: "seg", Sequence: uint64(i + 1)}
+	}
+	store := &mockStore{entries: entries}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg", Limit: math.MaxUint64}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+	require.Len(t, bidi.encoded, 7)
+}
+
+func TestShouldConsumeMultiSpaceRespectsGlobalLimit(t *testing.T) {
+	entries := make([]*api.Entry, 5)
+	for i := range entries {
+		entries[i] = &api.Entry{Space: "s", Segment: "seg", Sequence: uint64(i + 1), Timestamp: int64(i + 1)}
+	}
+	store := &mockStore{entries: entries}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore())
+	env := &polymorphic.Envelope{Content: &api.Consume{
+		Offsets: map[string]lexkey.LexKey{"a": {}, "b": {}},
+		Limit:   2,
+	}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+	require.Len(t, bidi.encoded, 2)
 }
 
 func TestShouldNodeCloseAndManagerClose(t *testing.T) {
