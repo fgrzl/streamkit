@@ -207,13 +207,20 @@ var (
 const (
 	writeQueueSaturationWarnThreshold    int64 = 32
 	writeQueueSaturationWarnEvery        int64 = 256
-	defaultWriteQueueOfferTimeout              = 5 * time.Millisecond
-	defaultMaxLogicalStreams                   = 0
-	defaultMaxFramePayloadBytes                = 8 << 20
-	defaultMaxMessagePayloadBytes              = 6 << 20
-	defaultWriteQueueChannelSize               = 1024
-	defaultStreamRecvQueueSize                 = 1024
-	defaultStreamIngressQueueSize              = defaultStreamRecvQueueSize
+	// defaultWriteQueueOfferTimeout is how long outbound sends wait for the
+	// write pump to drain the multiplexed queue before falling back to a
+	// synchronous send; slightly above minimal reduces fallback under bursts.
+	defaultWriteQueueOfferTimeout = 20 * time.Millisecond
+	defaultMaxLogicalStreams      = 0
+	defaultMaxFramePayloadBytes   = 8 << 20
+	defaultMaxMessagePayloadBytes = 6 << 20
+	// defaultMuxQueueChannelDepth is the default depth for mux write and logical
+	// stream recv/ingress bounded channels. It favors bursty producers/consumers
+	// without unbounded growth; callers may still tune via MuxerOption.
+	defaultMuxQueueChannelDepth   = 8192
+	defaultWriteQueueChannelSize  = defaultMuxQueueChannelDepth
+	defaultStreamRecvQueueSize    = defaultMuxQueueChannelDepth
+	defaultStreamIngressQueueSize = defaultStreamRecvQueueSize
 	defaultStreamRecvOfferTimeout              = 100 * time.Millisecond
 	defaultStreamRecvSaturationThreshold       = 3
 	defaultStreamRecvSaturationPolicy          = StreamRecvSaturationPolicyWait
