@@ -20,6 +20,16 @@ const (
 	StreamRecvSaturationPolicyClose
 )
 
+// WithWriteQueueSize sets the outbound multiplexed write channel buffer depth.
+// Values less than or equal to zero are ignored.
+func WithWriteQueueSize(size int) MuxerOption {
+	return func(m *WebSocketMuxer) {
+		if size > 0 {
+			m.writeQueueSize = size
+		}
+	}
+}
+
 // WithStreamRecvQueueSize sets the inbound buffer size for logical streams.
 // Values less than or equal to zero are ignored.
 func WithStreamRecvQueueSize(size int) MuxerOption {

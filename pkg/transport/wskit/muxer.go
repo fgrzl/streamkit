@@ -211,6 +211,7 @@ const (
 	defaultMaxLogicalStreams                   = 0
 	defaultMaxFramePayloadBytes                = 8 << 20
 	defaultMaxMessagePayloadBytes              = 6 << 20
+	defaultWriteQueueChannelSize               = 1024
 	defaultStreamRecvQueueSize                 = 1024
 	defaultStreamIngressQueueSize              = defaultStreamRecvQueueSize
 	defaultStreamRecvOfferTimeout              = 100 * time.Millisecond
@@ -270,7 +271,9 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	}
 
 	// write pump defaults
-	m.writeQueueSize = 1024
+	if m.writeQueueSize <= 0 {
+		m.writeQueueSize = defaultWriteQueueChannelSize
+	}
 	m.writeQueue = make(chan *MuxerMsg, m.writeQueueSize)
 	m.msgPool = sync.Pool{New: func() any { return &MuxerMsg{} }}
 	m.bufPool = sync.Pool{New: func() any { return make([]byte, 0, 1024) }}
@@ -350,7 +353,9 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	m.applyConnectionLimits()
 	// Initialize write pump infrastructure like the client muxer so server
 	// behavior is symmetric and safe for concurrent use.
-	m.writeQueueSize = 1024
+	if m.writeQueueSize <= 0 {
+		m.writeQueueSize = defaultWriteQueueChannelSize
+	}
 	m.writeQueue = make(chan *MuxerMsg, m.writeQueueSize)
 	m.msgPool = sync.Pool{New: func() any { return &MuxerMsg{} }}
 	m.bufPool = sync.Pool{New: func() any { return make([]byte, 0, 1024) }}

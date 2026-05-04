@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -273,6 +275,55 @@ func TestShouldMuxerReceivePressureOptionsOverrideDefaults(t *testing.T) {
 	assert.Equal(t, 5*time.Millisecond, m.streamRecvOfferTimeout)
 	assert.Equal(t, int64(4), m.streamRecvSaturationThreshold)
 	assert.Equal(t, StreamRecvSaturationPolicyClose, m.streamRecvSaturationPolicy)
+}
+
+func TestShouldMuxerWriteQueueOptionsApplyLikeReceivePressure(t *testing.T) {
+	m := &WebSocketMuxer{}
+	applyMuxerOptions(m, WithWriteQueueSize(8192))
+	assert.Equal(t, 8192, m.writeQueueSize)
+
+	m2 := &WebSocketMuxer{}
+	applyMuxerOptions(m2, WithWriteQueueSize(0), WithWriteQueueSize(-1))
+	assert.Equal(t, 0, m2.writeQueueSize)
+
+	m3 := &WebSocketMuxer{}
+	applyMuxerOptions(m3, WithWriteQueueSize(8192), WithWriteQueueSize(0))
+	assert.Equal(t, 8192, m3.writeQueueSize, "non-positive value should not clear prior size")
+}
+
+func dialLocalDiscardWebSocket(t *testing.T) *websocket.Conn {
+	t.Helper()
+	srv := httptest.NewServer(websocket.Handler(func(conn *websocket.Conn) {
+		var v interface{}
+		for {
+			if err := websocket.JSON.Receive(conn, &v); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	cfg, err := websocket.NewConfig("ws"+strings.TrimPrefix(srv.URL, "http"), "http://localhost")
+	require.NoError(t, err)
+	conn, err := websocket.DialConfig(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+func TestShouldClientMuxerDefaultWriteQueueCapacity(t *testing.T) {
+	conn := dialLocalDiscardWebSocket(t)
+	m := NewClientWebSocketMuxer(context.Background(), NewClientMuxerSession(), conn)
+	t.Cleanup(func() { m.Close(nil) })
+
+	assert.Equal(t, defaultWriteQueueChannelSize, m.DiagnosticsSnapshot().WriteQueueCapacity)
+}
+
+func TestShouldClientMuxerWriteQueueOptionSetsCapacity(t *testing.T) {
+	conn := dialLocalDiscardWebSocket(t)
+	m := NewClientWebSocketMuxer(context.Background(), NewClientMuxerSession(), conn, WithWriteQueueSize(8192))
+	t.Cleanup(func() { m.Close(nil) })
+
+	assert.Equal(t, 8192, m.DiagnosticsSnapshot().WriteQueueCapacity)
 }
 
 func TestShouldValidateInboundMessageRejectsOversizedPayload(t *testing.T) {
