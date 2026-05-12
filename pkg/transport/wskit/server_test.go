@@ -55,10 +55,12 @@ func signWebSocketToken(t *testing.T, secret []byte, scope string) string {
 func TestShouldRejectMissingAuthenticationWhenConfigureWebSocketServer(t *testing.T) {
 	ts, _ := newWebSocketTestServer(t)
 
-	resp, err := ts.Client().Get(ts.URL + "/streamz")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/streamz", nil)
+	require.NoError(t, err)
+	resp, err := ts.Client().Do(req)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	})
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
@@ -68,14 +70,14 @@ func TestShouldRejectPrincipalWithoutStreamkitScopeWhenConfigureWebSocketServer(
 	ts, secret := newWebSocketTestServer(t)
 	token := signWebSocketToken(t, secret, "other::*")
 
-	req, err := http.NewRequest(http.MethodGet, ts.URL+"/streamz", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/streamz", nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := ts.Client().Do(req)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	})
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)

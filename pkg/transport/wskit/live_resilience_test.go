@@ -519,10 +519,10 @@ func newLiveClientWithRetry(t *testing.T, baseURL string, fetchJWT func() (strin
 	return clientInstance
 }
 
-func waitForSubscriptionSequenceAtLeast(t *testing.T, updates <-chan client.SegmentStatus, minSequence uint64, timeout time.Duration) client.SegmentStatus {
+func waitForSubscriptionSequenceAtLeast(t *testing.T, updates <-chan client.SegmentStatus, minSequence uint64) client.SegmentStatus {
 	t.Helper()
 
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {
@@ -536,11 +536,11 @@ func waitForSubscriptionSequenceAtLeast(t *testing.T, updates <-chan client.Segm
 	}
 }
 
-func waitForSubscriptionSegmentsAtLeast(t *testing.T, updates <-chan client.SegmentStatus, expected map[string]uint64, timeout time.Duration) map[string]client.SegmentStatus {
+func waitForSubscriptionSegmentsAtLeast(t *testing.T, updates <-chan client.SegmentStatus, expected map[string]uint64) map[string]client.SegmentStatus {
 	t.Helper()
 
 	seen := make(map[string]client.SegmentStatus, len(expected))
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 
 	for {
@@ -996,7 +996,7 @@ func TestShouldLiveSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *te
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	require.NoError(t, writerClient.Publish(ctx, storeID, "space", "segment", []byte("first"), nil))
-	first := waitForSubscriptionSequenceAtLeast(t, updates, 1, 10*time.Second)
+	first := waitForSubscriptionSequenceAtLeast(t, updates, 1)
 	assert.Equal(t, uint64(1), first.LastSequence)
 
 	allowReconnect := make(chan struct{})
@@ -1039,7 +1039,7 @@ func TestShouldLiveSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(t *te
 	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 2)
 
-	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2, 10*time.Second)
+	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2)
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
@@ -1102,7 +1102,7 @@ func TestShouldLiveSpaceSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(
 
 	initial := waitForSubscriptionSegmentsAtLeast(t, updates, map[string]uint64{
 		"seg-a": 1,
-	}, 10*time.Second)
+	})
 	assert.Equal(t, uint64(1), initial["seg-a"].LastSequence)
 
 	allowReconnect := make(chan struct{})
@@ -1152,7 +1152,7 @@ func TestShouldLiveSpaceSubscriptionRequiresRecreateAfterAuthFailureOnReconnect(
 	recovered := waitForSubscriptionSegmentsAtLeast(t, recreatedUpdates, map[string]uint64{
 		"seg-a": 2,
 		"seg-b": 1,
-	}, 10*time.Second)
+	})
 	assert.Equal(t, uint64(2), recovered["seg-a"].LastSequence)
 	assert.Equal(t, uint64(1), recovered["seg-b"].LastSequence)
 }
@@ -1193,7 +1193,7 @@ func TestShouldLiveSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	require.NoError(t, writerClient.Publish(ctx, storeID, "space", "segment", []byte("first"), nil))
-	first := waitForSubscriptionSequenceAtLeast(t, updates, 1, 10*time.Second)
+	first := waitForSubscriptionSequenceAtLeast(t, updates, 1)
 	assert.Equal(t, uint64(1), first.LastSequence)
 
 	allowReconnect := make(chan struct{})
@@ -1226,7 +1226,7 @@ func TestShouldLiveSubscriptionRequiresRecreateAfterWebSocketDrop(t *testing.T) 
 	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, server.bus, storeID, "space", 2)
 
-	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2, 10*time.Second)
+	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2)
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
@@ -1273,7 +1273,7 @@ func TestShouldLiveSubscriptionRequiresRecreateAfterServerRestart(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	require.NoError(t, writerClient.Publish(ctx, storeID, "space", "segment", []byte("first"), nil))
-	first := waitForSubscriptionSequenceAtLeast(t, updates, 1, 10*time.Second)
+	first := waitForSubscriptionSequenceAtLeast(t, updates, 1)
 	assert.Equal(t, uint64(1), first.LastSequence)
 
 	allowReconnect := make(chan struct{})
@@ -1309,7 +1309,7 @@ func TestShouldLiveSubscriptionRequiresRecreateAfterServerRestart(t *testing.T) 
 	t.Cleanup(recreatedSub.Unsubscribe)
 	waitForLiveSubscriptionRegistration(t, restarted.bus, storeID, "space", 1)
 
-	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2, 10*time.Second)
+	second := waitForSubscriptionSequenceAtLeast(t, recreatedUpdates, 2)
 	assert.Equal(t, uint64(2), second.LastSequence)
 }
 
@@ -1357,7 +1357,7 @@ func TestShouldLiveSpaceSubscriptionRequiresRecreateAfterWebSocketDrop(t *testin
 	initial := waitForSubscriptionSegmentsAtLeast(t, updates, map[string]uint64{
 		"seg-a": 1,
 		"seg-b": 1,
-	}, 10*time.Second)
+	})
 	assert.Equal(t, uint64(1), initial["seg-a"].LastSequence)
 	assert.Equal(t, uint64(1), initial["seg-b"].LastSequence)
 
@@ -1402,7 +1402,7 @@ func TestShouldLiveSpaceSubscriptionRequiresRecreateAfterWebSocketDrop(t *testin
 		"seg-a": 2,
 		"seg-b": 2,
 		"seg-c": 1,
-	}, 10*time.Second)
+	})
 	assert.Equal(t, uint64(2), recovered["seg-a"].LastSequence)
 	assert.Equal(t, uint64(2), recovered["seg-b"].LastSequence)
 	assert.Equal(t, uint64(1), recovered["seg-c"].LastSequence)

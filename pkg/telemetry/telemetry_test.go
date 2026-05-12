@@ -56,7 +56,7 @@ func collectSpan(t *testing.T, fn func(oteltrace.Span)) tracetest.SpanStub {
 	tp := trace.NewTracerProvider(
 		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
 	)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	_, span := tp.Tracer("test").Start(context.Background(), "test_span")
 	fn(span)
@@ -75,7 +75,7 @@ func TestShouldGetTracerReturnsGlobalTracer(t *testing.T) {
 		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
 	)
 	otel.SetTracerProvider(tp)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	// Act
 	tracer1 := telemetry.GetTracer()
@@ -103,7 +103,7 @@ func TestShouldTraceIDFromContextExtractsFromSpan(t *testing.T) {
 	tp := trace.NewTracerProvider(
 		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
 	)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer("test")
 	ctx, span := tracer.Start(context.Background(), "test_span")
@@ -121,14 +121,15 @@ func TestShouldAttributeBuilders(t *testing.T) {
 	// Test that all attribute builder functions work without panicking
 
 	// Act & Assert
-	assert.NotPanics(t, func() { telemetry.WithStoreID(uuid.New()) })
-	assert.NotPanics(t, func() { telemetry.WithSpace("test-space") })
-	assert.NotPanics(t, func() { telemetry.WithSegment("test-segment") })
-	assert.NotPanics(t, func() { telemetry.WithRecordCount(42) })
-	assert.NotPanics(t, func() { telemetry.WithBatchSize(10) })
-	assert.NotPanics(t, func() { telemetry.WithTransportType("websocket") })
-	assert.NotPanics(t, func() { telemetry.WithMuxerRole("client") })
-	assert.NotPanics(t, func() { telemetry.WithBackendType("azure") })
+	id := uuid.New()
+	assert.Equal(t, id.String(), telemetry.WithStoreID(id).Value.AsString())
+	assert.Equal(t, "test-space", telemetry.WithSpace("test-space").Value.AsString())
+	assert.Equal(t, "test-segment", telemetry.WithSegment("test-segment").Value.AsString())
+	assert.Equal(t, int64(42), telemetry.WithRecordCount(42).Value.AsInt64())
+	assert.Equal(t, int64(10), telemetry.WithBatchSize(10).Value.AsInt64())
+	assert.Equal(t, "websocket", telemetry.WithTransportType("websocket").Value.AsString())
+	assert.Equal(t, "client", telemetry.WithMuxerRole("client").Value.AsString())
+	assert.Equal(t, "azure", telemetry.WithBackendType("azure").Value.AsString())
 }
 
 func TestShouldAddTraceContextToLogger(t *testing.T) {
@@ -137,7 +138,7 @@ func TestShouldAddTraceContextToLogger(t *testing.T) {
 	tp := trace.NewTracerProvider(
 		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
 	)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer("test")
 	ctx, span := tracer.Start(context.Background(), "test_span")
@@ -197,7 +198,7 @@ func TestShouldTraceContextHandlerAddsTraceAndRequestID(t *testing.T) {
 	tp := trace.NewTracerProvider(
 		trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)),
 	)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	requestID := uuid.New()
 	tracer := tp.Tracer("test")

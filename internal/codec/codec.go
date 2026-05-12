@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 
 	"github.com/fgrzl/streamkit/internal/txn"
 	"github.com/fgrzl/streamkit/pkg/api"
@@ -27,7 +28,7 @@ func EncodeEntrySnappy(e *api.Entry) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer encoder.Close()
+	defer func() { _ = encoder.Close() }()
 
 	return encoder.EncodeAll(rawData, nil), nil
 }
@@ -148,7 +149,7 @@ func EncodeTransactionSnappy(e *txn.Transaction) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer encoder.Close()
+	defer func() { _ = encoder.Close() }()
 
 	return encoder.EncodeAll(rawData, nil), nil
 }
@@ -201,7 +202,11 @@ func EncodeTransaction(t *txn.Transaction) ([]byte, error) {
 	}
 
 	// Serialize Entries
-	if err := binary.Write(buf, binary.LittleEndian, uint32(len(t.Entries))); err != nil {
+	n := len(t.Entries)
+	if n > math.MaxUint32 {
+		return nil, errors.New("transaction has too many entries")
+	}
+	if err := writeUint32LE(buf, n); err != nil {
 		return nil, err
 	}
 	for _, entry := range t.Entries {
@@ -276,12 +281,23 @@ func DecodeTransaction(data []byte, t *txn.Transaction) error {
 		t.Entries[i] = entry
 	}
 
-	return err
+	return nil
 }
 
-// Helper functions
+// writeUint32LE appends n as a little-endian uint32 after validating n fits in 32 bits.
+func writeUint32LE(buf *bytes.Buffer, n int) error {
+	if n < 0 || n > math.MaxUint32 {
+		return errors.New("length out of range for uint32")
+	}
+	v := uint32(n)
+	return binary.Write(buf, binary.LittleEndian, v)
+}
+
 func writeBytes(buf *bytes.Buffer, data []byte) error {
-	if err := binary.Write(buf, binary.LittleEndian, uint32(len(data))); err != nil {
+	if len(data) > math.MaxUint32 {
+		return errors.New("data too large")
+	}
+	if err := writeUint32LE(buf, len(data)); err != nil {
 		return err
 	}
 	_, err := buf.Write(data)
@@ -293,7 +309,7 @@ func readBytes(buf *bytes.Reader) ([]byte, error) {
 	if err := binary.Read(buf, binary.LittleEndian, &length); err != nil {
 		return nil, err
 	}
-	if length > uint32(buf.Len()) {
+	if int64(length) > int64(buf.Len()) {
 		return nil, errors.New("invalid data length")
 	}
 	data := make([]byte, length)
@@ -311,7 +327,10 @@ func readString(buf *bytes.Reader) (string, error) {
 }
 
 func writeMap(buf *bytes.Buffer, m map[string]string) error {
-	if err := binary.Write(buf, binary.LittleEndian, uint32(len(m))); err != nil {
+	if len(m) > math.MaxUint32 {
+		return errors.New("map too large")
+	}
+	if err := writeUint32LE(buf, len(m)); err != nil {
 		return err
 	}
 	for k, v := range m {

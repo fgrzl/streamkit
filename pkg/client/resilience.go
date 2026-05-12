@@ -225,8 +225,8 @@ func init() {
 	pseudoRandState.Store(time.Now().UnixNano())
 }
 
-func pseudoRand(max int64) int64 {
-	if max <= 0 {
+func pseudoRand(mod int64) int64 {
+	if mod <= 0 {
 		return 0
 	}
 	// Simple LCG: https://en.wikipedia.org/wiki/Linear_congruential_generator
@@ -235,7 +235,7 @@ func pseudoRand(max int64) int64 {
 		old := pseudoRandState.Load()
 		next := (old*1103515245 + 12345) & 0x7fffffff
 		if pseudoRandState.CompareAndSwap(old, next) {
-			return next % max
+			return next % mod
 		}
 	}
 }

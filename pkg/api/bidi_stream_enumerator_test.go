@@ -109,12 +109,12 @@ func TestShouldPropagateDecodeErrorWhenDecodeReturnsError(t *testing.T) {
 
 func TestShouldCollectAllItemsWhenToSliceCalledOnEnumerator(t *testing.T) {
 	// Arrange
-	calls := 0
+	var calls uint64
 	stream := &fakeBidiStream{
 		decodeFn: func(v any) error {
 			if ptr, ok := v.(**SegmentStatus); ok {
 				calls++
-				*ptr = &SegmentStatus{LastSequence: uint64(calls)}
+				*ptr = &SegmentStatus{LastSequence: calls}
 				if calls > 3 {
 					return io.EOF
 				}

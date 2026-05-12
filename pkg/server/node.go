@@ -131,7 +131,6 @@ func (n *defaultNode) Close() {
 }
 
 func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
-
 	defer func() {
 		if r := recover(); r != nil {
 			slog.ErrorContext(ctx, "server: handler panic recovered",
@@ -279,30 +278,30 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 	closeSendAndRelease(bidi, nil)
 }
 
-func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcquire, bidi api.BidiStream) {
+func (n *defaultNode) validateLeaseKeyHolderTTL(key, holder string, ttlSeconds int64) (ttl time.Duration, errMsg string) {
 	if n.leaseStore == nil {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
-		closeSendAndRelease(bidi, nil)
-		return
+		return 0, "lease store not configured"
 	}
-	if args.Key == "" {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
-		closeSendAndRelease(bidi, nil)
-		return
+	if key == "" {
+		return 0, "lease key must not be empty"
 	}
-	if args.Holder == "" {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
-		closeSendAndRelease(bidi, nil)
-		return
+	if holder == "" {
+		return 0, "lease holder must not be empty"
 	}
-	ttl := time.Duration(args.TTLSeconds) * time.Second
+	ttl = time.Duration(ttlSeconds) * time.Second
 	if ttl <= 0 {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
-		closeSendAndRelease(bidi, nil)
-		return
+		return 0, "ttl_seconds must be positive"
 	}
 	if ttl > maxLeaseTTL {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
+		return 0, "ttl_seconds exceeds maximum of 86400"
+	}
+	return ttl, ""
+}
+
+func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcquire, bidi api.BidiStream) {
+	ttl, errMsg := n.validateLeaseKeyHolderTTL(args.Key, args.Holder, args.TTLSeconds)
+	if errMsg != "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: errMsg})
 		closeSendAndRelease(bidi, nil)
 		return
 	}
@@ -316,29 +315,9 @@ func (n *defaultNode) handleLeaseAcquire(ctx context.Context, args *api.LeaseAcq
 }
 
 func (n *defaultNode) handleLeaseRenew(ctx context.Context, args *api.LeaseRenew, bidi api.BidiStream) {
-	if n.leaseStore == nil {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease store not configured"})
-		closeSendAndRelease(bidi, nil)
-		return
-	}
-	if args.Key == "" {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease key must not be empty"})
-		closeSendAndRelease(bidi, nil)
-		return
-	}
-	if args.Holder == "" {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "lease holder must not be empty"})
-		closeSendAndRelease(bidi, nil)
-		return
-	}
-	ttl := time.Duration(args.TTLSeconds) * time.Second
-	if ttl <= 0 {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds must be positive"})
-		closeSendAndRelease(bidi, nil)
-		return
-	}
-	if ttl > maxLeaseTTL {
-		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: "ttl_seconds exceeds maximum of 86400"})
+	ttl, errMsg := n.validateLeaseKeyHolderTTL(args.Key, args.Holder, args.TTLSeconds)
+	if errMsg != "" {
+		_ = bidi.Encode(&api.LeaseResult{Ok: false, Message: errMsg})
 		closeSendAndRelease(bidi, nil)
 		return
 	}

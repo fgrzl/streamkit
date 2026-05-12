@@ -19,7 +19,7 @@ import (
 func TestShouldConcurrentCallStreamDuringMuxerReconnect(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var (
 		dialCount      int32
@@ -95,7 +95,7 @@ func TestShouldConcurrentCallStreamDuringMuxerReconnect(t *testing.T) {
 func TestShouldRapidMuxerReplacementDuringHighLoad(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var (
 		muxerCreationCount int32
@@ -187,7 +187,7 @@ func TestShouldRapidMuxerReplacementDuringHighLoad(t *testing.T) {
 func TestShouldMuxerGracePeriodPreventsRaceCondition(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var (
 		slowEncodeCalled bool
@@ -246,7 +246,7 @@ func TestShouldMuxerGracePeriodPreventsRaceCondition(t *testing.T) {
 func TestShouldReconnectLoopCoordinatesWithGetOrCreateMuxer(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var dialCount int32
 
@@ -293,7 +293,7 @@ func TestShouldReconnectLoopCoordinatesWithGetOrCreateMuxer(t *testing.T) {
 func TestShouldInvalidateMuxerGracePeriodAllowsInflightEncode(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var (
 		slowEncodeCalled atomic.Bool
@@ -359,7 +359,7 @@ func (l *testReconnectListener) count() int {
 
 func TestShouldRegisterReconnectListenerIdempotently(t *testing.T) {
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	listener := &testReconnectListener{}
 	p.RegisterReconnectListener(listener)
@@ -370,7 +370,7 @@ func TestShouldRegisterReconnectListenerIdempotently(t *testing.T) {
 
 func TestShouldUnregisterReconnectListenerWithoutAffectingOthers(t *testing.T) {
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	listenerA := &testReconnectListener{}
 	listenerB := &testReconnectListener{}
@@ -389,7 +389,7 @@ func TestShouldUnregisterReconnectListenerWithoutAffectingOthers(t *testing.T) {
 func TestShouldBackgroundReconnectNotifiesListeners(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	listener := &testReconnectListener{}
 	p.RegisterReconnectListener(listener)
@@ -444,7 +444,7 @@ func TestShouldBackgroundReconnectNotifiesListeners(t *testing.T) {
 func TestShouldGetOrCreateMuxerUsesProviderContext(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var capturedCtx context.Context
 	var mu sync.Mutex

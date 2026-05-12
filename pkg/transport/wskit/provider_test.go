@@ -34,7 +34,7 @@ func TestShouldNormalizeAddressWhenCreatingProvider(t *testing.T) {
 
 func TestShouldGetOrCreateMuxerRetries(t *testing.T) {
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// simulate dialFn always failing; the foreground should surface the inline
 	// error immediately instead of masking it behind a timeout.
@@ -73,9 +73,9 @@ func TestShouldBackgroundReconnectRecreatesMuxer(t *testing.T) {
 	p.newClientMuxer = func(ctx context.Context, session MuxerSession, conn *websocket.Conn) providerMuxer {
 		n := atomic.AddInt32(&calls, 1)
 		if n == 1 {
-			return &struct{ providerMuxer }{providerMuxer: &fakeMuxer{pingFn: func() bool { return f1Healthy.Load() }}}
+			return &struct{ providerMuxer }{providerMuxer: &fakeMuxer{pingFn: f1Healthy.Load}}
 		}
-		return &struct{ providerMuxer }{providerMuxer: &fakeMuxer{pingFn: func() bool { return f2Healthy.Load() }}}
+		return &struct{ providerMuxer }{providerMuxer: &fakeMuxer{pingFn: f2Healthy.Load}}
 	}
 
 	// Act: create initial muxer
@@ -110,7 +110,7 @@ func TestShouldBackgroundReconnectRecreatesMuxer(t *testing.T) {
 func TestShouldCallStreamRetriesOnMuxerClosed(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// failing bidi: Encode returns ErrMuxerClosed and clears provider muxer to force reconnect
 	var failingEncodeCount int32
@@ -161,7 +161,7 @@ func TestShouldCallStreamRetriesOnMuxerClosed(t *testing.T) {
 func TestShouldCallStreamRetriesOnBenignDisconnect(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var failingEncodeCount int32
 	failing := &testBidi{
@@ -213,10 +213,10 @@ func TestShouldDetachCallStreamSpanFromCaller(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := trace.NewTracerProvider(trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(exporter)))
 	otel.SetTracerProvider(tp)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	capture := &capturingMuxer{
 		bidi: &testBidi{
@@ -295,7 +295,7 @@ func (t *testBidi) Closed() <-chan struct{}   { c := make(chan struct{}); close(
 func TestShouldTreatAuthErrorsAsPermanentByDefault(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var calls int32
 	p.maxDialAttempts = 5
@@ -318,7 +318,7 @@ func TestShouldTreatAuthErrorsAsPermanentByDefault(t *testing.T) {
 func TestShouldRetryAuthErrorsWhenRetryAuthFailuresEnabled(t *testing.T) {
 	// Arrange
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	p.RetryAuthFailures = true
 
 	var calls int32
@@ -343,7 +343,7 @@ func TestShouldRetryAuthErrorsWhenRetryAuthFailuresEnabled(t *testing.T) {
 
 func TestShouldGetOrCreateMuxerInvokesOnDialFailureForInlineErrors(t *testing.T) {
 	p := NewBidiStreamProvider("https://example.com/", func() (string, error) { return "tok", nil }).(*WebSocketBidiStreamProvider)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var callbackCalls atomic.Int32
 	p.OnDialFailure = func(err error) {

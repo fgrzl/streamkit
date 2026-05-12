@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -37,9 +36,6 @@ type WebSocketBidiStreamProvider struct {
 	mu      sync.Mutex
 	muxer   providerMuxer
 	dialing atomic.Bool // prevents concurrent dial storms
-	// reconnect RNG for jittered backoff (protected by rngMu for thread-safety)
-	rng   *rand.Rand
-	rngMu sync.Mutex
 	// testable hooks / configuration
 	dialFn          func() (*websocket.Conn, error)
 	maxDialAttempts int
@@ -80,17 +76,15 @@ type WebSocketBidiStreamProvider struct {
 //	provider := wskit.NewBidiStreamProvider(addr, fetchJWT).(*wskit.WebSocketBidiStreamProvider)
 //	provider.RetryAuthFailures = true
 func NewBidiStreamProvider(addr string, fetchJWT func() (string, error), opts ...MuxerOption) api.BidiStreamProvider {
-
 	// normalize address: ensure it ends with /streamz and avoid duplicate slashes
 	// trim any trailing slashes, then append the segment
 	a := strings.TrimRight(addr, "/")
-	a = a + "/streamz"
+	a += "/streamz"
 
 	p := &WebSocketBidiStreamProvider{
 		addr:     a,
 		origin:   "http://localhost",
 		fetchJWT: fetchJWT,
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 		// sensible defaults; tests may override
 		dialFn:          nil,
 		maxDialAttempts: 5,
@@ -148,9 +142,9 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 			}
 			jitter := time.Duration(p.randInt63n(int64(jitterMax))) * time.Nanosecond
 			if p.randIntn(2) == 0 {
-				backoff = backoff + jitter
+				backoff += jitter
 			} else {
-				backoff = backoff - jitter
+				backoff -= jitter
 			}
 
 			select {
@@ -198,9 +192,9 @@ func (p *WebSocketBidiStreamProvider) CallStream(ctx context.Context, storeID uu
 				}
 				jitter := time.Duration(p.randInt63n(int64(jitterMax))) * time.Nanosecond
 				if p.randIntn(2) == 0 {
-					backoff = backoff + jitter
+					backoff += jitter
 				} else {
-					backoff = backoff - jitter
+					backoff -= jitter
 				}
 
 				select {
@@ -273,18 +267,16 @@ func shortDiscriminator(discriminator string) string {
 	return discriminator
 }
 
-// randInt63n returns a thread-safe random int64 in [0,n)
+// randInt63n returns a random int64 in [0,n) using crypto/rand.
 func (p *WebSocketBidiStreamProvider) randInt63n(n int64) int64 {
-	p.rngMu.Lock()
-	defer p.rngMu.Unlock()
-	return p.rng.Int63n(n)
+	_ = p
+	return int64nCrypto(n)
 }
 
-// randIntn returns a thread-safe random int in [0,n)
+// randIntn returns a random int in [0,n) using crypto/rand.
 func (p *WebSocketBidiStreamProvider) randIntn(n int) int {
-	p.rngMu.Lock()
-	defer p.rngMu.Unlock()
-	return p.rng.Intn(n)
+	_ = p
+	return intnCrypto(n)
 }
 
 // startReconnectLoop ensures a background goroutine keeps a healthy muxer alive.
@@ -335,7 +327,7 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					// Check if provider was stopped during dial
 					if p.stopped.Load() {
 						if conn != nil {
-							conn.Close()
+							_ = conn.Close()
 						}
 						p.dialing.Store(false)
 						return
@@ -349,7 +341,7 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 					p.mu.Unlock()
 					if alreadyHealthy {
 						if conn != nil {
-							conn.Close()
+							_ = conn.Close()
 						}
 						p.dialing.Store(false)
 						backoff = time.Second
@@ -399,7 +391,6 @@ func (p *WebSocketBidiStreamProvider) startReconnectLoop() {
 				}
 			}
 		}()
-
 	})
 }
 
@@ -543,8 +534,7 @@ func (p *WebSocketBidiStreamProvider) replaceMuxer(newMuxer providerMuxer) {
 // reusing a closed or closing muxer.
 // The old muxer is closed after a grace period to allow in-flight streams
 // on the old muxer to complete — matching replaceMuxer's behavior.
-// Returns true if there was an existing muxer that will be closed.
-func (p *WebSocketBidiStreamProvider) invalidateMuxer() bool {
+func (p *WebSocketBidiStreamProvider) invalidateMuxer() {
 	p.mu.Lock()
 	oldMuxer := p.muxer
 	p.muxer = nil
@@ -559,9 +549,7 @@ func (p *WebSocketBidiStreamProvider) invalidateMuxer() bool {
 		go func(m providerMuxer) {
 			p.closeMuxer(m)
 		}(oldMuxer)
-		return true
 	}
-	return false
 }
 
 // closeMuxer closes the given muxer via the providerMuxer interface.

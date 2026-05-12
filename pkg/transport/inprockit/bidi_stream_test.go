@@ -61,7 +61,7 @@ func TestShouldCloseSendAndSignalClosed(t *testing.T) {
 	stream := NewInProcBidiStream()
 
 	// Act
-	stream.CloseSend(io.ErrClosedPipe)
+	_ = stream.CloseSend(io.ErrClosedPipe)
 
 	// Assert
 	require.Equal(t, io.ErrClosedPipe, stream.CloseSend(nil))

@@ -25,7 +25,7 @@ func TestShouldDeliverSegmentUpdatesGivenSubscriptionWhenRecordsAreProduced(t *t
 			var seenMu sync.Mutex
 			seenCount := 0
 
-			sub, err := harness.Client.SubscribeToSegment(ctx, storeID, space, segment, func(status *client.SegmentStatus) {
+			sub, err := harness.SubscribeToSegment(ctx, storeID, space, segment, func(status *client.SegmentStatus) {
 				if status == nil || status.Heartbeat {
 					return
 				}
@@ -41,7 +41,7 @@ func TestShouldDeliverSegmentUpdatesGivenSubscriptionWhenRecordsAreProduced(t *t
 			t.Cleanup(func() { sub.Unsubscribe() })
 
 			require.Eventually(t, func() bool {
-				status := harness.Client.GetSubscriptionStatus(sub.ID())
+				status := harness.GetSubscriptionStatus(sub.ID())
 				return status != nil && status.Status == "active"
 			}, 3*time.Second, 25*time.Millisecond)
 
@@ -90,7 +90,7 @@ func TestShouldDeliverSpaceUpdatesGivenWildcardSubscriptionWhenMultipleSegmentsC
 			space := "space-sub-space"
 
 			updates := make(chan client.SegmentStatus, 64)
-			sub, err := harness.Client.SubscribeToSpace(ctx, storeID, space, func(status *client.SegmentStatus) {
+			sub, err := harness.SubscribeToSpace(ctx, storeID, space, func(status *client.SegmentStatus) {
 				if status == nil || status.Heartbeat {
 					return
 				}
@@ -103,7 +103,7 @@ func TestShouldDeliverSpaceUpdatesGivenWildcardSubscriptionWhenMultipleSegmentsC
 			defer sub.Unsubscribe()
 
 			require.Eventually(t, func() bool {
-				status := harness.Client.GetSubscriptionStatus(sub.ID())
+				status := harness.GetSubscriptionStatus(sub.ID())
 				return status != nil && status.Status == "active"
 			}, 3*time.Second, 25*time.Millisecond)
 

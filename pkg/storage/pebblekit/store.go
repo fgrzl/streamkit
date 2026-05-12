@@ -63,12 +63,12 @@ func (s *PebbleStore) getSegmentLock(space, segment string) *sync.Mutex {
 		return mu
 	}
 
-	max := s.maxSegLocks
-	if max <= 0 {
-		max = MaxSegLocks
+	maxLocks := s.maxSegLocks
+	if maxLocks <= 0 {
+		maxLocks = MaxSegLocks
 	}
-	if len(s.segLocks) >= max {
-		toRemove := max / 10
+	if len(s.segLocks) >= maxLocks {
+		toRemove := maxLocks / 10
 		if toRemove < 1 {
 			toRemove = 1
 		}
@@ -132,7 +132,7 @@ func (s *PebbleStore) Peek(ctx context.Context, space, segment string) (*api.Ent
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	if !iter.SeekLT(upper) {
 		if err := iter.Error(); err != nil {
@@ -164,17 +164,17 @@ func (s *PebbleStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) 
 	return s.filterSpaceEntries(ctx, lower, upper, bounds)
 }
 
-func (s *PebbleStore) calculateTimeBounds(current, min, max int64) struct{ Min, Max int64 } {
-	bounds := struct{ Min, Max int64 }{Min: min}
+func (s *PebbleStore) calculateTimeBounds(current, minBound, maxBound int64) struct{ Min, Max int64 } {
+	bounds := struct{ Min, Max int64 }{Min: minBound}
 	// If min is in the future, clamp to current to avoid empty window
-	if min > current {
+	if minBound > current {
 		bounds.Min = current
 	}
 	// Issue #19: Align with Azure backend behavior.
-	// When max == 0 (unspecified) or max > current, clamp to current timestamp.
+	// When maxBound == 0 (unspecified) or maxBound > current, clamp to current timestamp.
 	// This ensures both backends return identical results for the same query.
-	bounds.Max = max
-	if max == 0 || max > current {
+	bounds.Max = maxBound
+	if maxBound == 0 || maxBound > current {
 		bounds.Max = current
 	}
 	return bounds
@@ -236,7 +236,7 @@ func (s *PebbleStore) Produce(ctx context.Context, args *api.Produce, records en
 		ts := timestamp.GetTimestamp()
 		trx := api.TRX{ID: uuid.New(), Number: lastTrx + 1}
 		batch := s.db.NewBatch()
-		defer batch.Close()
+		defer func() { _ = batch.Close() }()
 
 		var firstEntry, lastWritten *api.Entry
 		for chunk.MoveNext() {
@@ -356,7 +356,7 @@ func (s *PebbleStore) readStoredSegmentStatus(_ context.Context, space, segment 
 		}
 		return nil, err
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 
 	status := &api.SegmentStatus{}
 	if err := json.Unmarshal(value, status); err != nil {
@@ -376,7 +376,7 @@ func (s *PebbleStore) buildSegmentStatusFromData(ctx context.Context, space, seg
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	if !iter.First() {
 		if err := iter.Error(); err != nil {
@@ -425,7 +425,7 @@ func mergeSegmentStatus(current *api.SegmentStatus, firstEntry, lastEntry *api.E
 }
 
 func encodeSegmentStatusInventoryKey(space, segment string) []byte {
-	return lexkey.Encode(api.INVENTORY, api.SEGMENT_STATUSES, space, segment)
+	return lexkey.Encode(api.INVENTORY, api.SegmentStatuses, space, segment)
 }
 
 func (s *PebbleStore) calculateSegmentBounds(ts int64, args *api.ConsumeSegment) struct {
@@ -443,11 +443,12 @@ func (s *PebbleStore) calculateSegmentBounds(ts int64, args *api.ConsumeSegment)
 	if bounds.MinTS > ts {
 		bounds.MinTS = ts
 	}
-	if args.MaxTimestamp == 0 {
+	switch {
+	case args.MaxTimestamp == 0:
 		bounds.MaxTS = math.MaxInt64
-	} else if args.MaxTimestamp > ts {
+	case args.MaxTimestamp > ts:
 		bounds.MaxTS = ts
-	} else {
+	default:
 		bounds.MaxTS = args.MaxTimestamp
 	}
 	if bounds.MaxSeq == 0 {

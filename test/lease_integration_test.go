@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -22,7 +23,7 @@ func TestShouldReturnLeaseNotAcquiredGivenActiveLeaseWhenSecondHolderRequestsSam
 			firstErrCh := make(chan error, 1)
 
 			go func() {
-				err := harness.Client.WithLease(t.Context(), storeID, key, 2*time.Second, func(context.Context) error {
+				err := harness.WithLease(t.Context(), storeID, key, 2*time.Second, func(context.Context) error {
 					close(leaseAcquired)
 					<-releaseLease
 					return nil
@@ -39,7 +40,7 @@ func TestShouldReturnLeaseNotAcquiredGivenActiveLeaseWhenSecondHolderRequestsSam
 				}
 			}, 2*time.Second, 10*time.Millisecond)
 
-			err := harness.Client.WithLease(t.Context(), storeID, key, 2*time.Second, func(context.Context) error {
+			err := harness.WithLease(t.Context(), storeID, key, 2*time.Second, func(context.Context) error {
 				return nil
 			})
 			require.ErrorIs(t, err, client.ErrLeaseNotAcquired)
@@ -47,7 +48,7 @@ func TestShouldReturnLeaseNotAcquiredGivenActiveLeaseWhenSecondHolderRequestsSam
 			close(releaseLease)
 			require.NoError(t, <-firstErrCh)
 
-			err = harness.Client.WithLease(t.Context(), storeID, key, 2*time.Second, func(context.Context) error {
+			err = harness.WithLease(t.Context(), storeID, key, 2*time.Second, func(context.Context) error {
 				return nil
 			})
 			require.NoError(t, err)
@@ -67,7 +68,7 @@ func TestShouldCancelLeaseContextGivenParentContextCanceledWhenWithLeaseRuns(t *
 
 			errCh := make(chan error, 1)
 			go func() {
-				err := harness.Client.WithLease(parentCtx, storeID, key, 3*time.Second, func(leaseCtx context.Context) error {
+				err := harness.WithLease(parentCtx, storeID, key, 3*time.Second, func(leaseCtx context.Context) error {
 					close(started)
 					<-leaseCtx.Done()
 					return leaseCtx.Err()
@@ -89,7 +90,7 @@ func TestShouldCancelLeaseContextGivenParentContextCanceledWhenWithLeaseRuns(t *
 			require.Eventually(t, func() bool {
 				select {
 				case err := <-errCh:
-					return err == context.Canceled
+					return errors.Is(err, context.Canceled)
 				default:
 					return false
 				}

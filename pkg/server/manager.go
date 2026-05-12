@@ -215,7 +215,7 @@ func (m *nodeManager) GetOrCreate(ctx context.Context, storeID uuid.UUID) (Node,
 	return &refCountedNode{m: m, storeID: storeID, entry: newEnt}, nil
 }
 
-func (m *nodeManager) Remove(ctx context.Context, storeID uuid.UUID) {
+func (m *nodeManager) Remove(_ context.Context, storeID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.failures, storeID)

@@ -36,7 +36,7 @@ const (
 	CacheTTL             time.Duration = time.Second * 97
 	CacheCleanupInterval time.Duration = time.Second * 59
 	ShutdownTimeout      time.Duration = time.Second * 59
-	LAST_ENTRY           string        = "LAST_ENTRY"
+	LastEntry            string        = "LAST_ENTRY"
 	// Max payload size per Azure Table transaction (keep a cushion)
 	MaxTransactionPayloadBytes int = 4*1024*1024 - 256*1024 // ~3.75MB
 	// Number of parallel AddEntity operations within a payload-chunk
@@ -302,7 +302,7 @@ func (s *AzureStore) Peek(ctx context.Context, space, segment string) (*api.Entr
 		}
 	}
 
-	pk := lexkey.Encode(LAST_ENTRY, space, segment).ToHexString()
+	pk := lexkey.Encode(LastEntry, space, segment).ToHexString()
 	rk := lexkey.Encode(lexkey.EndMarker).ToHexString()
 
 	resp, err := s.client.GetEntity(ctx, pk, rk)
@@ -461,7 +461,7 @@ func (s *AzureStore) processBufferedChunk(ctx context.Context, space, segment st
 		status, err := s.processChunk(ctx, space, segment, records, *lastSeq, *lastTrx)
 		if err == nil {
 			*lastSeq = status.LastSequence
-			*lastTrx += 1
+			(*lastTrx)++
 			return status, nil
 		}
 		var inventoryErr *committedInventoryError
@@ -787,7 +787,7 @@ func (s *AzureStore) fanoutTransaction(ctx context.Context, transaction *txn.Tra
 
 func (s *AzureStore) writeLastEntry(ctx context.Context, entry batchEntry) error {
 	entity := client.Entity{
-		PartitionKey: lexkey.Encode(LAST_ENTRY, entry.Entry.Space, entry.Entry.Segment).ToHexString(),
+		PartitionKey: lexkey.Encode(LastEntry, entry.Entry.Space, entry.Entry.Segment).ToHexString(),
 		RowKey:       lexkey.Encode(lexkey.EndMarker).ToHexString(),
 		Value:        entry.EncodedValue,
 	}
@@ -796,10 +796,7 @@ func (s *AzureStore) writeLastEntry(ctx context.Context, entry batchEntry) error
 	if err != nil {
 		return err
 	}
-	if err := s.client.UpsertEntity(ctx, data, "Replace"); err != nil {
-		return err
-	}
-	return nil
+	return s.client.UpsertEntity(ctx, data, "Replace")
 }
 
 func (s *AzureStore) writeSegmentBatch(ctx context.Context, entries []batchEntry, errChan chan<- error, wg *sync.WaitGroup) {
@@ -1094,7 +1091,7 @@ func (s *AzureStore) writeSegmentStatus(ctx context.Context, status *api.Segment
 }
 
 func segmentStatusPartitionKey(space string) string {
-	return lexkey.Encode(api.INVENTORY, api.SEGMENT_STATUSES, space).ToHexString()
+	return lexkey.Encode(api.INVENTORY, api.SegmentStatuses, space).ToHexString()
 }
 
 func (s *AzureStore) retryInventoryUpdate(ctx context.Context, space, segment string) error {
@@ -1207,7 +1204,7 @@ func createEntries(records []*api.Record, space, segment string, trx api.TRX, la
 	for _, r := range records {
 		lastSeq++
 		if r.Sequence != lastSeq {
-			return nil, api.ERR_SEQUENCE_MISMATCH
+			return nil, api.ErrSequenceMismatch
 		}
 		entries = append(entries, &api.Entry{
 			TRX:       trx,
@@ -1416,13 +1413,13 @@ func (s *AzureStore) maxTransactionPayloadBytes() int {
 	return MaxTransactionPayloadBytes
 }
 
-func calculateTimeBounds(current, min, max int64) struct{ Min, Max int64 } {
-	bounds := struct{ Min, Max int64 }{Min: min}
-	if min > current {
+func calculateTimeBounds(current, minTS, maxTS int64) struct{ Min, Max int64 } {
+	bounds := struct{ Min, Max int64 }{Min: minTS}
+	if minTS > current {
 		bounds.Min = current
 	}
-	bounds.Max = max
-	if max == 0 || max > current {
+	bounds.Max = maxTS
+	if maxTS == 0 || maxTS > current {
 		bounds.Max = current
 	}
 	return bounds

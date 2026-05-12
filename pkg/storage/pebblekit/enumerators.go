@@ -26,7 +26,6 @@ type PebbleEnumerator struct {
 
 // NewPebbleEnumerator creates a new enumerator for a given Pebble iterator.
 func NewPebbleEnumerator(ctx context.Context, db *pebble.DB, opts *pebble.IterOptions) enumerators.Enumerator[KeyValuePair] {
-
 	iter, err := db.NewIterWithContext(ctx, opts)
 	if err != nil {
 		return enumerators.Error[KeyValuePair](err)
@@ -64,7 +63,6 @@ func (e *PebbleEnumerator) MoveNext() bool {
 
 // Current returns the current key-value pair or an error if iteration is invalid.
 func (e *PebbleEnumerator) Current() (KeyValuePair, error) {
-
 	if !e.valid {
 		return KeyValuePair{}, errors.New("iterator is not valid")
 	}
@@ -76,7 +74,6 @@ func (e *PebbleEnumerator) Current() (KeyValuePair, error) {
 		Key:   key,
 		Value: value,
 	}, nil
-
 }
 
 // Err returns any encountered error.
@@ -87,7 +84,7 @@ func (e *PebbleEnumerator) Err() error {
 // Dispose closes the iterator.
 func (e *PebbleEnumerator) Dispose() {
 	e.disposed.Do(func() {
-		e.iter.Close()
+		_ = e.iter.Close()
 		e.iter = nil
 	})
 }

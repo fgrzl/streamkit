@@ -84,7 +84,7 @@ func TestShouldCreateEntriesWithSharedTimestampAndCopiedFields(t *testing.T) {
 func TestShouldReturnSequenceMismatchWhenCreateEntriesSeesGap(t *testing.T) {
 	entries, err := createEntries([]*api.Record{{Sequence: 2}}, "space-a", "segment-a", api.TRX{ID: uuid.New(), Number: 1}, 0)
 
-	require.ErrorIs(t, err, api.ERR_SEQUENCE_MISMATCH)
+	require.ErrorIs(t, err, api.ErrSequenceMismatch)
 	assert.Nil(t, entries)
 }
 

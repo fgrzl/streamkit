@@ -18,9 +18,9 @@ import (
 
 var (
 	// CacheTTL defines the time-to-live for cached entries.
-	CacheTTL time.Duration = time.Second * 97
+	CacheTTL = time.Second * 97
 	// CacheCleanupInterval defines how often expired cache entries are removed.
-	CacheCleanupInterval time.Duration = time.Second * 59
+	CacheCleanupInterval = time.Second * 59
 )
 
 // PebbleStoreOptions configures the PebbleDB storage implementation.
@@ -40,7 +40,7 @@ func NewStoreFactory(options *PebbleStoreOptions) (*StoreFactory, error) {
 }
 
 // NewStore creates a new PebbleDB store instance for the given store ID.
-func (f *StoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) (storage.Store, error) {
+func (f *StoreFactory) NewStore(_ context.Context, storeID uuid.UUID) (storage.Store, error) {
 	path := filepath.Join(f.options.Path, storeID.String())
 	cache := cache.NewExpiringCache(CacheTTL, CacheCleanupInterval)
 	return NewPebbleStore(path, cache)

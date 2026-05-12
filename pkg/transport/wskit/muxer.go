@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -98,6 +97,7 @@ type MuxerMsg struct {
 	StoreID      uuid.UUID         `json:"store_id"`
 	ChannelID    uuid.UUID         `json:"channel_id"`
 	Payload      []byte            `json:"payload"`
+	payloadPool  *[]byte           // when non-nil, Payload is backed by bufPool
 	TraceContext map[string]string `json:"trace_context,omitempty"`
 }
 
@@ -163,7 +163,6 @@ type WebSocketMuxer struct {
 	streamRecvSaturationThreshold int64
 	streamRecvSaturationPolicy    StreamRecvSaturationPolicy
 	logger                        *slog.Logger
-	rng                           *rand.Rand
 	// JSON send/receive hooks (set to websocket.JSON.Send/Receive by default).
 	// Tests may override these to simulate network behavior.
 	sendJSON func(conn *websocket.Conn, v interface{}) error
@@ -205,8 +204,8 @@ var (
 )
 
 const (
-	writeQueueSaturationWarnThreshold    int64 = 32
-	writeQueueSaturationWarnEvery        int64 = 256
+	writeQueueSaturationWarnThreshold int64 = 32
+	writeQueueSaturationWarnEvery     int64 = 256
 	// defaultWriteQueueOfferTimeout is how long outbound sends wait for the
 	// write pump to drain the multiplexed queue before falling back to a
 	// synchronous send; slightly above minimal reduces fallback under bursts.
@@ -217,15 +216,15 @@ const (
 	// defaultMuxQueueChannelDepth is the default depth for mux write and logical
 	// stream recv/ingress bounded channels. It favors bursty producers/consumers
 	// without unbounded growth; callers may still tune via MuxerOption.
-	defaultMuxQueueChannelDepth   = 8192
-	defaultWriteQueueChannelSize  = defaultMuxQueueChannelDepth
-	defaultStreamRecvQueueSize    = defaultMuxQueueChannelDepth
-	defaultStreamIngressQueueSize = defaultStreamRecvQueueSize
-	defaultStreamRecvOfferTimeout              = 100 * time.Millisecond
-	defaultStreamRecvSaturationThreshold       = 3
-	defaultStreamRecvSaturationPolicy          = StreamRecvSaturationPolicyWait
-	defaultTombstoneMax                        = 1024
-	defaultTombstoneMaxAge                     = 60 * time.Second
+	defaultMuxQueueChannelDepth          = 8192
+	defaultWriteQueueChannelSize         = defaultMuxQueueChannelDepth
+	defaultStreamRecvQueueSize           = defaultMuxQueueChannelDepth
+	defaultStreamIngressQueueSize        = defaultStreamRecvQueueSize
+	defaultStreamRecvOfferTimeout        = 100 * time.Millisecond
+	defaultStreamRecvSaturationThreshold = 3
+	defaultStreamRecvSaturationPolicy    = StreamRecvSaturationPolicyWait
+	defaultTombstoneMax                  = 1024
+	defaultTombstoneMaxAge               = 60 * time.Second
 )
 
 // NewClientWebSocketMuxer will spawn a read loop as a go routine and returns the *WebSocketMuxer
@@ -283,13 +282,14 @@ func NewClientWebSocketMuxer(ctx context.Context, session MuxerSession, conn *we
 	}
 	m.writeQueue = make(chan *MuxerMsg, m.writeQueueSize)
 	m.msgPool = sync.Pool{New: func() any { return &MuxerMsg{} }}
-	m.bufPool = sync.Pool{New: func() any { return make([]byte, 0, 1024) }}
+	m.bufPool = sync.Pool{New: func() any {
+		b := make([]byte, 0, 1024)
+		return &b
+	}}
 	m.writerDone = make(chan struct{})
 	m.logger = slog.With(slog.String("muxer", m.name))
 	// per-muxer logger with common fields
 	m.Context = cctx
-	// per-muxer RNG for jittered heartbeat
-	m.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	// initialize lastPongUnix atomically
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	// default send/recv use websocket.JSON
@@ -353,7 +353,6 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	}
 	m.Context = cctx
 	m.logger = slog.With(slog.String("muxer", m.name))
-	m.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	atomic.StoreInt64(&m.lastPongUnix, timestamp.GetTimestamp())
 	m.sendJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Send(conn, v) }
 	m.recvJSON = func(conn *websocket.Conn, v interface{}) error { return websocket.JSON.Receive(conn, v) }
@@ -365,7 +364,10 @@ func NewServerWebSocketMuxer(ctx context.Context, session MuxerSession, nodeMana
 	}
 	m.writeQueue = make(chan *MuxerMsg, m.writeQueueSize)
 	m.msgPool = sync.Pool{New: func() any { return &MuxerMsg{} }}
-	m.bufPool = sync.Pool{New: func() any { return make([]byte, 0, 1024) }}
+	m.bufPool = sync.Pool{New: func() any {
+		b := make([]byte, 0, 1024)
+		return &b
+	}}
 	m.writerDone = make(chan struct{})
 
 	// per-muxer logger and RNG already assigned above
@@ -709,31 +711,12 @@ func (m *WebSocketMuxer) sendData(storeID, channelID uuid.UUID, payload []byte, 
 	}
 
 	msg := pooled.(*MuxerMsg)
+	msg.payloadPool = nil
 	msg.ControlType = ControlTypeData
 	msg.StoreID = storeID
 	msg.ChannelID = channelID
 	msg.TraceContext = traceContext
-	if len(payload) > 0 {
-		// try to reuse buffer from pool when possible
-		bp := m.bufPool.Get()
-		if bp != nil {
-			if buf, ok := bp.([]byte); ok && cap(buf) >= len(payload) {
-				b := buf[:len(payload)]
-				copy(b, payload)
-				msg.Payload = b
-			} else {
-				nb := make([]byte, len(payload))
-				copy(nb, payload)
-				msg.Payload = nb
-			}
-		} else {
-			nb := make([]byte, len(payload))
-			copy(nb, payload)
-			msg.Payload = nb
-		}
-	} else {
-		msg.Payload = nil
-	}
+	m.assignPooledPayload(msg, payload)
 
 	return m.enqueueWriteMessage(msg, func() error {
 		return m.sendJSONWithLock(&MuxerMsg{ControlType: ControlTypeData, StoreID: storeID, ChannelID: channelID, Payload: payload, TraceContext: traceContext}, true)
@@ -858,9 +841,7 @@ func (m *WebSocketMuxer) enqueueWriteMessage(msg *MuxerMsg, fallback func() erro
 func (m *WebSocketMuxer) readLoop() {
 	for {
 		var msg MuxerMsg
-		var err error
-
-		err = m.recvJSON(m.conn, &msg)
+		var err = m.recvJSON(m.conn, &msg)
 
 		if err != nil {
 			// Delegate receive-error handling (logs + shutdown) to helper for clarity.
@@ -901,7 +882,7 @@ func (m *WebSocketMuxer) handleReceiveError(err error) {
 		slog.String("error_type", classifyTransportError(err)),
 	}
 	if errors.As(err, &netErr) {
-		fields = append(fields, slog.String("net_err", netErr.Error()), slog.Bool("temporary", netErr.Temporary()))
+		fields = append(fields, slog.String("net_err", netErr.Error()))
 	}
 	if errors.As(err, &opErr) && opErr != nil {
 		if opErr.Op != "" {
@@ -1266,7 +1247,7 @@ func (m *WebSocketMuxer) runStreamIngressWorker(bidi *MuxerBidiStream, ing *stre
 					return
 				}
 			}
-			m.deliverToStream(bidi, item.ctx, msg)
+			m.deliverToStream(item.ctx, bidi, msg)
 
 			ing.mu.Lock()
 			if ing.closed {
@@ -1345,7 +1326,7 @@ func (m *WebSocketMuxer) enqueueIngress(ctx context.Context, msg *MuxerMsg) {
 }
 
 // deliverToStream offers the payload to the bidi stream and logs delivery or drop.
-func (m *WebSocketMuxer) deliverToStream(bidi *MuxerBidiStream, ctx context.Context, msg *MuxerMsg) {
+func (m *WebSocketMuxer) deliverToStream(ctx context.Context, bidi *MuxerBidiStream, msg *MuxerMsg) {
 	if bidi == nil {
 		slog.ErrorContext(ctx, "muxer: cannot deliver message, bidi is nil", m.msgLogFields(msg)...)
 		return
@@ -1502,7 +1483,7 @@ func (m *WebSocketMuxer) computeHeartbeatWait(base, jitter time.Duration) time.D
 	if effectiveJitter <= 0 {
 		return base
 	}
-	delta := time.Duration(m.rng.Int63n(int64(effectiveJitter)))
+	delta := time.Duration(int64nCrypto(int64(effectiveJitter)))
 	return base - delta
 }
 
@@ -1544,29 +1525,11 @@ func (m *WebSocketMuxer) sendControl(control ControlType, storeID, channelID uui
 	}
 
 	msg := pooled.(*MuxerMsg)
+	msg.payloadPool = nil
 	msg.ControlType = control
 	msg.StoreID = storeID
 	msg.ChannelID = channelID
-	if len(payload) > 0 {
-		bp := m.bufPool.Get()
-		if bp != nil {
-			if buf, ok := bp.([]byte); ok && cap(buf) >= len(payload) {
-				b := buf[:len(payload)]
-				copy(b, payload)
-				msg.Payload = b
-			} else {
-				nb := make([]byte, len(payload))
-				copy(nb, payload)
-				msg.Payload = nb
-			}
-		} else {
-			nb := make([]byte, len(payload))
-			copy(nb, payload)
-			msg.Payload = nb
-		}
-	} else {
-		msg.Payload = nil
-	}
+	m.assignPooledPayload(msg, payload)
 
 	return m.enqueueWriteMessage(msg, func() error {
 		return m.syncSendIncrementOnError(&MuxerMsg{ControlType: control, StoreID: storeID, ChannelID: channelID, Payload: payload}, true)
@@ -1585,6 +1548,7 @@ func (m *WebSocketMuxer) sendPing() error {
 	}
 
 	msg := pooled.(*MuxerMsg)
+	msg.payloadPool = nil
 	msg.ControlType = ControlTypePing
 	msg.StoreID = uuid.Nil
 	msg.ChannelID = uuid.Nil
@@ -1662,7 +1626,7 @@ func (m *WebSocketMuxer) buildSendErrorFields(err error, msg *MuxerMsg) []any {
 		fields = append(fields, slog.Int("bytes", len(msg.Payload)))
 	}
 	if errors.As(err, &netErr) {
-		fields = append(fields, slog.String("net_err", netErr.Error()), slog.Bool("temporary", netErr.Temporary()))
+		fields = append(fields, slog.String("net_err", netErr.Error()))
 	}
 	if errors.As(err, &opErr) && opErr != nil {
 		if opErr.Op != "" {
@@ -1678,7 +1642,7 @@ func (m *WebSocketMuxer) buildSendErrorFields(err error, msg *MuxerMsg) []any {
 			fields = append(fields, slog.String("op_err", opErr.Err.Error()))
 		}
 	}
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		fields = append(fields, slog.String("err", "EOF"))
 	} else {
 		fields = append(fields, slog.String("err", err.Error()))
@@ -1699,16 +1663,53 @@ func (m *WebSocketMuxer) releaseMsg(msg *MuxerMsg) {
 	if msg == nil {
 		return
 	}
-	if msg.Payload != nil {
-		if cap(msg.Payload) == 1024 {
-			m.bufPool.Put(msg.Payload[:0])
-		}
+	if msg.payloadPool != nil {
+		*msg.payloadPool = msg.Payload[:0]
+		m.bufPool.Put(msg.payloadPool)
+		msg.payloadPool = nil
 	}
 	msg.ControlType = ""
 	msg.StoreID = uuid.Nil
 	msg.ChannelID = uuid.Nil
 	msg.Payload = nil
 	m.msgPool.Put(msg)
+}
+
+func (m *WebSocketMuxer) assignPooledPayload(msg *MuxerMsg, payload []byte) {
+	if len(payload) == 0 {
+		msg.Payload = nil
+		msg.payloadPool = nil
+		return
+	}
+	bp := m.bufPool.Get()
+	if bp == nil {
+		msg.Payload = cloneByteSlice(payload)
+		msg.payloadPool = nil
+		return
+	}
+	pbuf, ok := bp.(*[]byte)
+	if !ok {
+		msg.Payload = cloneByteSlice(payload)
+		msg.payloadPool = nil
+		return
+	}
+	buf := *pbuf
+	if cap(buf) >= len(payload) {
+		b := buf[:len(payload)]
+		copy(b, payload)
+		msg.Payload = b
+		msg.payloadPool = pbuf
+		return
+	}
+	m.bufPool.Put(pbuf)
+	msg.Payload = cloneByteSlice(payload)
+	msg.payloadPool = nil
+}
+
+func cloneByteSlice(p []byte) []byte {
+	nb := make([]byte, len(p))
+	copy(nb, p)
+	return nb
 }
 
 // writePump serializes outgoing messages to the websocket connection.
@@ -1723,7 +1724,7 @@ func (m *WebSocketMuxer) writePump() {
 	for {
 		select {
 		case <-m.done:
-			// shutdown signalled: drain any in-flight messages without blocking
+			// shutdown signaled: drain any in-flight messages without blocking
 			for {
 				select {
 				case msg := <-m.writeQueue:

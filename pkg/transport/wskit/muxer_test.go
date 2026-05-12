@@ -812,7 +812,7 @@ func TestShouldDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
 		require.True(t, slow.Offer([]byte(`"blocked"`)))
 	}
 
-	m.deliverToStream(slow, context.Background(), &MuxerMsg{
+	m.deliverToStream(context.Background(), slow, &MuxerMsg{
 		ControlType: ControlTypeData,
 		StoreID:     storeID,
 		ChannelID:   slowID,
@@ -825,7 +825,7 @@ func TestShouldDeliverToStreamClosesAfterSustainedBackpressure(t *testing.T) {
 	assert.GreaterOrEqual(t, m.StreamRecvTimeouts(), int64(2))
 	assert.Equal(t, int64(1), m.StreamRecvOverloads())
 
-	m.deliverToStream(fast, context.Background(), &MuxerMsg{
+	m.deliverToStream(context.Background(), fast, &MuxerMsg{
 		ControlType: ControlTypeData,
 		StoreID:     storeID,
 		ChannelID:   fastID,
@@ -877,7 +877,7 @@ func TestShouldDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		m.deliverToStream(slow, context.Background(), &MuxerMsg{
+		m.deliverToStream(context.Background(), slow, &MuxerMsg{
 			ControlType: ControlTypeData,
 			StoreID:     storeID,
 			ChannelID:   slowID,
@@ -907,7 +907,7 @@ func TestShouldDeliverToStreamWaitsForTemporaryBackpressure(t *testing.T) {
 	require.NoError(t, slow.Decode(&slowValue))
 	assert.Equal(t, "recovered", slowValue)
 
-	m.deliverToStream(fast, context.Background(), &MuxerMsg{
+	m.deliverToStream(context.Background(), fast, &MuxerMsg{
 		ControlType: ControlTypeData,
 		StoreID:     storeID,
 		ChannelID:   fastID,
@@ -940,7 +940,7 @@ func TestShouldDeliverToStreamWaitModeDoesNotCloseOnSustainedBackpressure(t *tes
 
 	done := make(chan struct{})
 	go func() {
-		m.deliverToStream(slow, context.Background(), &MuxerMsg{
+		m.deliverToStream(context.Background(), slow, &MuxerMsg{
 			ControlType: ControlTypeData,
 			StoreID:     storeID,
 			ChannelID:   slowID,

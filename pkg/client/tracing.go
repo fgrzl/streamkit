@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -93,7 +94,7 @@ func (s *tracedSubscription) Unsubscribe() {
 
 // operationContext starts a new root span (new trace) for this operation so each call gets its own
 // trace and does not grow unbounded span chains when the same ctx is reused for many operations.
-// The returned context is cancelled when parent ctx is cancelled. Caller must defer cancel() and span.End().
+// The returned context is canceled when parent ctx is canceled. Caller must defer cancel() and span.End().
 func (c *tracingClient) operationContext(ctx context.Context, spanName string, opts ...trace.SpanStartOption) (context.Context, trace.Span, context.CancelFunc) {
 	if callerSpanContext := trace.SpanContextFromContext(ctx); callerSpanContext.IsValid() {
 		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: callerSpanContext}))
@@ -209,7 +210,7 @@ func (c *tracingClient) ConsumeSegment(ctx context.Context, storeID uuid.UUID, a
 		telemetry.WithRequestID(requestID),
 	}
 	seqAttrs := telemetry.WithSequenceRange(args.MinSequence, args.MaxSequence)
-	allAttrs := append(baseAttrs, seqAttrs...)
+	allAttrs := slices.Concat(baseAttrs, seqAttrs)
 	opCtx, span, cancel := c.operationContext(ctx, "streamkit.client.consume_segment",
 		trace.WithAttributes(allAttrs...))
 	inner := c.client.ConsumeSegment(opCtx, storeID, args)

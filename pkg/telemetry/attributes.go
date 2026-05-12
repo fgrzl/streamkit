@@ -1,6 +1,8 @@
 package telemetry
 
 import (
+	"math"
+
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -48,6 +50,13 @@ const (
 )
 
 // Attribute builder functions for convenience and consistency.
+
+func uint64ToInt64(u uint64) int64 {
+	if u > uint64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(u)
+}
 
 // WithStoreID returns an attribute for the store ID.
 func WithStoreID(id uuid.UUID) attribute.KeyValue {
@@ -97,16 +106,16 @@ func WithPayloadSize(size int) attribute.KeyValue {
 // WithSequenceRange returns attributes for sequence start and end.
 func WithSequenceRange(start, end uint64) []attribute.KeyValue {
 	return []attribute.KeyValue{
-		AttrSequenceStart.Int64(int64(start)),
-		AttrSequenceEnd.Int64(int64(end)),
+		AttrSequenceStart.Int64(uint64ToInt64(start)),
+		AttrSequenceEnd.Int64(uint64ToInt64(end)),
 	}
 }
 
 // WithTimestampRange returns attributes for timestamp min and max.
-func WithTimestampRange(min, max int64) []attribute.KeyValue {
+func WithTimestampRange(tsMin, tsMax int64) []attribute.KeyValue {
 	return []attribute.KeyValue{
-		AttrTimestampMin.Int64(min),
-		AttrTimestampMax.Int64(max),
+		AttrTimestampMin.Int64(tsMin),
+		AttrTimestampMax.Int64(tsMax),
 	}
 }
 
@@ -117,7 +126,7 @@ func WithTransactionID(id uuid.UUID) attribute.KeyValue {
 
 // WithTransactionNum returns an attribute for the transaction number.
 func WithTransactionNum(num uint64) attribute.KeyValue {
-	return AttrTransactionNum.Int64(int64(num))
+	return AttrTransactionNum.Int64(uint64ToInt64(num))
 }
 
 // WithBatchSize returns an attribute for batch size.

@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"testing"
@@ -54,7 +55,7 @@ func setupConsumerData(t *testing.T, storeID uuid.UUID, c client.Client) {
 func generateRange(seed, count int) enumerators.Enumerator[*client.Record] {
 	return enumerators.Range(seed, count, func(i int) *client.Record {
 		return &client.Record{
-			Sequence: uint64(i + 1),
+			Sequence: sequenceForTestIndex(i),
 			Payload:  []byte(fmt.Sprintf("test data %d", i+1)),
 		}
 	})
@@ -63,8 +64,19 @@ func generateRange(seed, count int) enumerators.Enumerator[*client.Record] {
 func generateLargeRange(seed, count, size int) enumerators.Enumerator[*client.Record] {
 	return enumerators.Range(seed, count, func(i int) *client.Record {
 		return &client.Record{
-			Sequence: uint64(i + 1),
+			Sequence: sequenceForTestIndex(i),
 			Payload:  bytes.Repeat([]byte("x"), size),
 		}
 	})
+}
+
+// sequenceForTestIndex maps a non-negative enumerator index to a 1-based sequence.
+func sequenceForTestIndex(i int) uint64 {
+	if i < 0 {
+		return 1
+	}
+	if i > math.MaxInt64-1 {
+		panic("streamkit test: record index overflow")
+	}
+	return uint64(uint(i)) + 1
 }

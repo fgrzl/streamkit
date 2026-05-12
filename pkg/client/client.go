@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -220,7 +221,11 @@ func subscriptionShardIndex(id string, shardCount int) int {
 		hash *= 16777619
 	}
 
-	return int(hash % uint32(shardCount))
+	sc, ok := intToUint32IfNonNegative(shardCount)
+	if !ok {
+		return 0
+	}
+	return uint32ToIntSafe(hash % sc)
 }
 
 func (c *client) subscriptionShard(id string) *subscriptionRegistryShard {
@@ -360,17 +365,17 @@ func (c *client) GetSegments(ctx context.Context, storeID uuid.UUID, space strin
 
 func (c *client) ConsumeSpace(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSpace) enumerators.Enumerator[*Entry] {
 	ctx = ensureRequestIDContext(ctx)
-	return newConsumeEnumerator(c, ctx, storeID, args)
+	return newConsumeEnumerator(ctx, c, storeID, args)
 }
 
 func (c *client) ConsumeSegment(ctx context.Context, storeID uuid.UUID, args *api.ConsumeSegment) enumerators.Enumerator[*Entry] {
 	ctx = ensureRequestIDContext(ctx)
-	return newConsumeEnumerator(c, ctx, storeID, args)
+	return newConsumeEnumerator(ctx, c, storeID, args)
 }
 
 func (c *client) Consume(ctx context.Context, storeID uuid.UUID, args *api.Consume) enumerators.Enumerator[*Entry] {
 	ctx = ensureRequestIDContext(ctx)
-	return newConsumeEnumerator(c, ctx, storeID, args)
+	return newConsumeEnumerator(ctx, c, storeID, args)
 }
 
 // consumeEnumerator opens a consume stream lazily on first MoveNext and keeps
@@ -584,6 +589,9 @@ func normalizeHandlerConcurrency(limit int) int {
 	if limit < 1 {
 		return 1
 	}
+	if limit > math.MaxInt32 {
+		return math.MaxInt32
+	}
 	return limit
 }
 
@@ -625,7 +633,11 @@ func (c *client) startHandlerWorkers() {
 }
 
 func (s *activeSubscription) tryAcquireHandlerSlot(limit int) bool {
-	maxInFlight := int32(normalizeHandlerConcurrency(limit))
+	v := normalizeHandlerConcurrency(limit)
+	maxInFlight, ok := intToInt32InRange(v)
+	if !ok {
+		maxInFlight = math.MaxInt32
+	}
 	for {
 		current := s.inFlightHandlers.Load()
 		if current >= maxInFlight {
@@ -669,15 +681,6 @@ func (s *activeSubscription) queuePendingStatus(status SegmentStatus) bool {
 		s.pendingOrder = append(s.pendingOrder, key)
 	}
 	return coalesced
-}
-
-func (s *activeSubscription) hasPendingStatus() bool {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if !s.pendingPerSegment {
-		return s.pendingSingleSet
-	}
-	return len(s.pendingOrder) > 0
 }
 
 func (s *activeSubscription) pendingStatusCount() int {
@@ -934,7 +937,7 @@ func isValidConsumeEntry(entry *Entry) bool {
 	return true
 }
 
-func newConsumeEnumerator(client *client, ctx context.Context, storeID uuid.UUID, args api.Routeable) enumerators.Enumerator[*Entry] {
+func newConsumeEnumerator(ctx context.Context, client *client, storeID uuid.UUID, args api.Routeable) enumerators.Enumerator[*Entry] {
 	enumCtx, cancel := newDetachedCancelableContext(ctx)
 
 	return &consumeEnumerator{
@@ -1025,7 +1028,7 @@ func (c *client) WithLease(ctx context.Context, storeID uuid.UUID, key string, t
 	if err != nil {
 		return err
 	}
-	defer lease.Release()
+	defer func() { _ = lease.Release() }()
 
 	runCtx, runCancel := newDetachedCancelableContext(ctx)
 	stopLeaseCancel := context.AfterFunc(lease.Context(), runCancel)
@@ -1147,7 +1150,7 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 					appendClientLogFields(produceLogFields(storeID, space, segment),
 						slog.Int("count", count),
 						"err", err)...)
-				bidi.CloseSend(err)
+				_ = bidi.CloseSend(err)
 				return
 			}
 			if err := bidi.Encode(entry); err != nil {
@@ -1155,12 +1158,12 @@ func (c *client) Produce(ctx context.Context, storeID uuid.UUID, space, segment 
 					appendClientLogFields(produceLogFields(storeID, space, segment),
 						slog.Int("count", count),
 						"err", err)...)
-				bidi.CloseSend(err)
+				_ = bidi.CloseSend(err)
 				return
 			}
 			count++
 		}
-		bidi.CloseSend(entries.Err())
+		_ = bidi.CloseSend(entries.Err())
 	}(bidi, entries)
 
 	return api.NewStreamEnumerator[*SegmentStatus](bidi)
@@ -1263,10 +1266,10 @@ func (c *client) Publish(ctx context.Context, storeID uuid.UUID, space, segment 
 	}
 
 	if err := bidi.Encode(record); err != nil {
-		bidi.CloseSend(err)
+		_ = bidi.CloseSend(err)
 		return err
 	}
-	bidi.CloseSend(nil)
+	_ = bidi.CloseSend(nil)
 
 	// Issue #2 (CRITICAL): Wait for server confirmation before returning.
 	// Previously this was fire-and-forget, causing Publish to return success
@@ -1456,7 +1459,8 @@ func (c *client) runHandlerSafely(ctx context.Context, sub *activeSubscription, 
 // runHandler executes a subscription handler with optional timeout and panic recovery.
 func (c *client) runHandler(ctx context.Context, sub *activeSubscription, subID string, handler func(*SegmentStatus), status *SegmentStatus) {
 	if status.LastSequence > 0 {
-		sub.lastDelivered.Store(int64(status.LastSequence))
+		seq := min(status.LastSequence, uint64(math.MaxInt64))
+		sub.lastDelivered.Store(uint64ToPositiveInt64(seq))
 	}
 
 	if c.handlerTimeout <= 0 {
@@ -1627,4 +1631,32 @@ func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
 		CoalescedUpdates: sub.coalescedUpdates.Load(),
 		PendingStatuses:  sub.pendingStatusCount(),
 	}
+}
+
+func intToUint32IfNonNegative(v int) (uint32, bool) {
+	if v < 0 || v > math.MaxUint32 {
+		return 0, false
+	}
+	return uint32(v), true
+}
+
+func uint32ToIntSafe(v uint32) int {
+	if uint64(v) > uint64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(v)
+}
+
+func intToInt32InRange(v int) (int32, bool) {
+	if v < math.MinInt32 || v > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(v), true
+}
+
+func uint64ToPositiveInt64(v uint64) int64 {
+	if v > uint64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(v)
 }

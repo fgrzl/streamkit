@@ -54,7 +54,7 @@ func TestShouldConsumerOperations(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, "space0", peek.Space)
 				assert.Equal(t, "segment0", peek.Segment)
-				assert.Equal(t, uint64(IntegrationSegmentCount), peek.Sequence)
+				assert.EqualValues(t, IntegrationSegmentCount, peek.Sequence)
 			})
 
 			t.Run("should consume segment", func(t *testing.T) {
@@ -134,7 +134,7 @@ func TestShouldConsumerOperations(t *testing.T) {
 				var entries []*client.Entry
 				var err error
 				for attempt := 0; attempt < 10; attempt++ {
-					results := harness.Client.Consume(ctx, storeID, args)
+					results := harness.Consume(ctx, storeID, args)
 					entries, err = enumerators.ToSlice(results)
 					if err == nil && len(entries) == 25*IntegrationSegmentCount {
 						break

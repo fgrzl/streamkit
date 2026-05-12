@@ -33,7 +33,7 @@ func TestShouldOtelTraceContinuityOverWskit(t *testing.T) {
 		propagation.TraceContext{},
 		propagation.Baggage{},
 	))
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	harness := pebblekitTestHarness(t)
 	storeID := uuid.New()
@@ -78,7 +78,7 @@ func TestShouldOtelNoEnumeratorChunkSpans(t *testing.T) {
 		propagation.TraceContext{},
 		propagation.Baggage{},
 	))
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	options := &pebblekit.PebbleStoreOptions{Path: t.TempDir()}
 	factory, err := pebblekit.NewStoreFactory(options)
@@ -87,7 +87,7 @@ func TestShouldOtelNoEnumeratorChunkSpans(t *testing.T) {
 	provider := inprockit.NewInProcBidiStreamProvider(t.Context(), nodeManager)
 	tracingClient := client.NewClientWithTracing(provider)
 	t.Cleanup(func() {
-		tracingClient.Close()
+		_ = tracingClient.Close()
 		nodeManager.Close()
 	})
 
@@ -122,7 +122,7 @@ func TestShouldOtelConsumeTraceContinuityOverInproc(t *testing.T) {
 		propagation.TraceContext{},
 		propagation.Baggage{},
 	))
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	options := &pebblekit.PebbleStoreOptions{Path: t.TempDir()}
 	factory, err := pebblekit.NewStoreFactory(options)
@@ -133,8 +133,8 @@ func TestShouldOtelConsumeTraceContinuityOverInproc(t *testing.T) {
 	baseClient := client.NewClient(provider)
 	tracingClient := client.NewClientWithTracing(provider)
 	t.Cleanup(func() {
-		tracingClient.Close()
-		baseClient.Close()
+		_ = tracingClient.Close()
+		_ = baseClient.Close()
 		nodeManager.Close()
 	})
 

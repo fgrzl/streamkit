@@ -221,10 +221,7 @@ func (c *MuxerBidiStream) CloseSend(err error) error {
 	if err != nil {
 		msg.Err = err.Error()
 	}
-	if encErr := c.Encode(msg); encErr != nil {
-		return encErr
-	}
-	return nil
+	return c.Encode(msg)
 }
 
 // Close tears down the stream and invokes the onClose hook.

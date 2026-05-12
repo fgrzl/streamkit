@@ -92,7 +92,7 @@ func (o *otelClientMetrics) RecordConsumeLatency(space, segment string, duration
 	}
 }
 
-func (o *otelClientMetrics) RecordSubscriptionReplay(id string, success bool, duration time.Duration) {
+func (o *otelClientMetrics) RecordSubscriptionReplay(_ string, success bool, duration time.Duration) {
 	// Low-cardinality attributes only (no subscription_id) for production backends.
 	successAttr := attribute.Bool("streamkit.replay.success", success)
 	if o.replayTotal != nil {
@@ -107,19 +107,19 @@ func (o *otelClientMetrics) RecordSubscriptionReplay(id string, success bool, du
 	}
 }
 
-func (o *otelClientMetrics) RecordHandlerTimeout(id string) {
+func (o *otelClientMetrics) RecordHandlerTimeout(_ string) {
 	if o.handlerTimeoutTotal != nil {
 		o.handlerTimeoutTotal.Add(context.Background(), 1)
 	}
 }
 
-func (o *otelClientMetrics) RecordHandlerPanic(id string) {
+func (o *otelClientMetrics) RecordHandlerPanic(_ string) {
 	if o.handlerPanicTotal != nil {
 		o.handlerPanicTotal.Add(context.Background(), 1)
 	}
 }
 
-func (o *otelClientMetrics) RecordSubscriptionCoalesced(id string) {
+func (o *otelClientMetrics) RecordSubscriptionCoalesced(_ string) {
 	if o.coalescedTotal != nil {
 		o.coalescedTotal.Add(context.Background(), 1)
 	}

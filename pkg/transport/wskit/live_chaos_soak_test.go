@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net/http/httptest"
 	"os"
 	"strconv"
@@ -76,7 +75,6 @@ type localChaosSoakState struct {
 
 func TestShouldLocalWebSocketChaosSoak(t *testing.T) {
 	cfg := loadLocalChaosSoakConfig(t)
-	rng := rand.New(rand.NewSource(cfg.seed))
 	t.Logf("local websocket chaos soak duration=%s seed=%d endpoint=%s", cfg.duration, cfg.seed, cfg.endpoint)
 
 	const subscribedSpace = "space-a"
@@ -173,7 +171,7 @@ func TestShouldLocalWebSocketChaosSoak(t *testing.T) {
 		failOnLocalChaosError(t, errCh)
 		assertLocalChaosProgress(t, state)
 
-		action := rng.Intn(4)
+		action := intnCrypto(4)
 		switch action {
 		case 0:
 			state.incrementDisruption("websocket-drop")
@@ -216,7 +214,7 @@ func TestShouldLocalWebSocketChaosSoak(t *testing.T) {
 		failOnLocalChaosError(t, errCh)
 		assertLocalChaosProgress(t, state)
 
-		sleepFor := time.Duration(250+rng.Intn(300)) * time.Millisecond
+		sleepFor := time.Duration(250+intnCrypto(300)) * time.Millisecond
 		timer := time.NewTimer(sleepFor)
 		select {
 		case <-timer.C:

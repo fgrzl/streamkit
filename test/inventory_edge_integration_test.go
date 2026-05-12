@@ -57,7 +57,7 @@ func TestShouldReturnDefaultPeekAndEmptyConsumesGivenMissingSegmentWhenReadOpera
 			require.NoError(t, err)
 			assert.Len(t, spaceEntries, 0)
 
-			consumeEntries, err := enumerators.ToSlice(harness.Client.Consume(ctx, storeID, &client.Consume{
+			consumeEntries, err := enumerators.ToSlice(harness.Consume(ctx, storeID, &client.Consume{
 				Offsets: map[string]lexkey.LexKey{"missing-space": {}},
 			}))
 			require.NoError(t, err)

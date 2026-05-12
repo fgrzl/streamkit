@@ -78,10 +78,9 @@ var _ api.BidiStream = (*mockBidiStream)(nil)
 
 // mockProvider is a test double for api.BidiStreamProvider
 type mockProvider struct {
-	mu                sync.RWMutex
-	callStreamFn      func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error)
-	listeners         []api.ReconnectListener
-	closedStreamsFunc func(ctx context.Context)
+	mu           sync.RWMutex
+	callStreamFn func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error)
+	listeners    []api.ReconnectListener
 }
 
 func (m *mockProvider) CallStream(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
@@ -488,7 +487,7 @@ func TestShouldHandlerPanicResilience(t *testing.T) {
 	// We ensure that a panicking handler doesn't crash the subscription goroutine
 	// and that the subscription continues to function.
 
-	messagesSent := 0
+	messagesSent := uint64(0)
 	messagesSentMu := sync.Mutex{}
 
 	provider := &mockProvider{
@@ -503,7 +502,7 @@ func TestShouldHandlerPanicResilience(t *testing.T) {
 
 				if status, ok := m.(*SegmentStatus); ok {
 					status.Segment = "test-segment"
-					status.LastSequence = uint64(currentMsg)
+					status.LastSequence = currentMsg
 				}
 
 				// After first message, cancel to end stream
@@ -758,12 +757,12 @@ func TestShouldOffsetTracking(t *testing.T) {
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 
-			callCount := 0
+			callCount := uint64(0)
 			stream.decodeFn = func(m any) error {
 				callCount++
 				if status, ok := m.(*SegmentStatus); ok {
 					status.Segment = "test-segment"
-					status.LastSequence = uint64(callCount * 10) // 10, 20, 30...
+					status.LastSequence = callCount * 10 // 10, 20, 30...
 				}
 
 				if callCount >= 2 {
@@ -784,13 +783,13 @@ func TestShouldOffsetTracking(t *testing.T) {
 
 	storeID := uuid.New()
 
-	maxSequenceSeen := int64(0)
+	maxSequenceSeen := uint64(0)
 	maxSequenceSeenMu := sync.Mutex{}
 
 	handler := func(status *SegmentStatus) {
 		maxSequenceSeenMu.Lock()
-		if status.LastSequence > uint64(maxSequenceSeen) {
-			maxSequenceSeen = int64(status.LastSequence)
+		if status.LastSequence > maxSequenceSeen {
+			maxSequenceSeen = status.LastSequence
 		}
 		maxSequenceSeenMu.Unlock()
 	}
@@ -825,12 +824,12 @@ func TestShouldHandlerTimeoutTracking(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			callCount := 0
+			callCount := uint64(0)
 			stream.decodeFn = func(m any) error {
 				callCount++
 				if callCount <= 3 {
 					if status, ok := m.(*SegmentStatus); ok {
-						*status = SegmentStatus{LastSequence: uint64(callCount)}
+						*status = SegmentStatus{LastSequence: callCount}
 					}
 					return nil
 				}
@@ -912,12 +911,12 @@ func TestShouldHandlerTimeoutMetrics(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			callCount := 0
+			streamCalls := uint64(0)
 			stream.decodeFn = func(m any) error {
-				callCount++
-				if callCount <= 3 {
+				streamCalls++
+				if streamCalls <= 3 {
 					if status, ok := m.(*SegmentStatus); ok {
-						*status = SegmentStatus{LastSequence: uint64(callCount)}
+						*status = SegmentStatus{LastSequence: streamCalls}
 					}
 					return nil
 				}
@@ -981,13 +980,13 @@ func TestShouldSlowHandlerDoesNotBlockOtherMessages(t *testing.T) {
 	provider := &mockProvider{
 		callStreamFn: func(ctx context.Context, storeID uuid.UUID, routeable api.Routeable) (api.BidiStream, error) {
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
-			seqNum := 0
+			seqNum := uint64(0)
 			stream.decodeFn = func(m any) error {
 				seqNum++
 				// Generate many messages quickly
 				if seqNum <= 10 {
 					if status, ok := m.(*SegmentStatus); ok {
-						*status = SegmentStatus{LastSequence: uint64(seqNum)}
+						*status = SegmentStatus{LastSequence: seqNum}
 					}
 					return nil
 				}
@@ -1028,7 +1027,7 @@ func TestShouldSlowHandlerDoesNotBlockOtherMessages(t *testing.T) {
 }
 
 func TestShouldSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.T) {
-	var decodeCount atomic.Int32
+	var decodeCount atomic.Uint64
 	firstHandlerStarted := make(chan struct{})
 	releaseFirstHandler := make(chan struct{})
 	received := make(chan uint64, 4)
@@ -1047,7 +1046,7 @@ func TestShouldSubscriptionCoalescesLatestStatusWhenHandlersSaturate(t *testing.
 					<-firstHandlerStarted
 				}
 				if seq <= 20 {
-					*status = SegmentStatus{Space: "space", Segment: "segment", LastSequence: uint64(seq)}
+					*status = SegmentStatus{Space: "space", Segment: "segment", LastSequence: seq}
 					return nil
 				}
 
@@ -1236,7 +1235,7 @@ func TestShouldSpaceSubscriptionRetainsLatestPendingStatusPerSegmentWhenHandlers
 	}
 
 	require.Eventually(t, func() bool {
-		return decodeCount.Load() >= int32(len(statuses))
+		return decodeCount.Load() >= 5 // len(statuses)
 	}, time.Second, 10*time.Millisecond)
 
 	require.Eventually(t, func() bool {
@@ -1886,7 +1885,7 @@ func TestShouldSubscriptionStopsOnStreamOverloadedError(t *testing.T) {
 			attempts.Add(1)
 			stream := &mockBidiStream{closedChan: make(chan struct{})}
 			stream.decodeFn = func(any) error {
-				return fmt.Errorf("remote error: %s", wskit.ErrStreamOverloaded)
+				return fmt.Errorf("remote error: %w", wskit.ErrStreamOverloaded)
 			}
 			return stream, nil
 		},

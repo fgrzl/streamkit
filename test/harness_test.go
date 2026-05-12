@@ -141,8 +141,11 @@ func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 	})
 
 	httpClient := server.Client()
-	resp, err := httpClient.Get(server.URL + "/healthz")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/healthz", nil)
 	require.NoError(t, err)
+	resp, err := httpClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	signer := jwtkit.HMAC256Signer{Secret: secret}
@@ -156,7 +159,7 @@ func wskitTestHarness(t *testing.T, factory storage.StoreFactory) *TestHarness {
 	provider := wskit.NewBidiStreamProvider(addr, func() (string, error) { return token, nil })
 	clientInstance := client.NewClient(provider)
 	t.Cleanup(func() {
-		clientInstance.Close()
+		_ = clientInstance.Close()
 	})
 
 	return &TestHarness{Client: clientInstance}
@@ -199,7 +202,7 @@ func inprockitTestHarness(t *testing.T) *TestHarness {
 	clientInstance := client.NewClient(provider)
 
 	t.Cleanup(func() {
-		clientInstance.Close()
+		_ = clientInstance.Close()
 		_ = messageBus.Close()
 		nodeManager.Close()
 	})

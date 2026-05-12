@@ -108,7 +108,7 @@ func (s *InProcBidiStream) decodeMessage(msg any, v any) error {
 	}
 
 	// Handle ErrorMessage control payloads.
-	if handleErr, done := handleErrorMessage(msg, payload, bufPtr); done {
+	if done, handleErr := handleErrorMessage(msg, payload, bufPtr); done {
 		return handleErr
 	}
 
@@ -128,7 +128,7 @@ func (s *InProcBidiStream) decodeMessage(msg any, v any) error {
 	}
 
 	val := reflect.ValueOf(v)
-	if val.Kind() != reflect.Ptr || val.IsNil() {
+	if val.Kind() != reflect.Pointer || val.IsNil() {
 		return fmt.Errorf("Decode: expected non-nil pointer, got %T", v)
 	}
 
@@ -181,10 +181,8 @@ func extractRawPayload(msg any, v any) (payload []byte, bufPtr *bytes.Buffer, ha
 }
 
 // handleErrorMessage attempts a cheap JSON scan for error control messages
-// when we were given a byte payload. Returns (error, done) where done
-// indicates caller should return (with provided error, which may be nil for
-// EndOfStreamError).
-func handleErrorMessage(msg any, payload []byte, bufPtr *bytes.Buffer) (error, bool) {
+// when we were given a byte payload. If done is true, the caller should return err.
+func handleErrorMessage(msg any, payload []byte, bufPtr *bytes.Buffer) (bool, error) {
 	if len(payload) > 0 && payload[0] == '{' && bytes.Contains(payload, []byte(`"type"`)) {
 		var errMsg ErrorMessage
 		if err := json.Unmarshal(payload, &errMsg); err == nil && errMsg.Type != "" {
@@ -194,13 +192,13 @@ func handleErrorMessage(msg any, payload []byte, bufPtr *bytes.Buffer) (error, b
 			switch errMsg.Type {
 			case "close":
 				if errMsg.Err != "" {
-					return fmt.Errorf("remote closed stream: %s", errMsg.Err), true
+					return true, fmt.Errorf("remote closed stream: %s", errMsg.Err)
 				}
-				return io.EOF, true
+				return true, io.EOF
 			case "error":
-				return fmt.Errorf("remote error: %s", errMsg.Err), true
+				return true, fmt.Errorf("remote error: %s", errMsg.Err)
 			default:
-				return fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err), true
+				return true, fmt.Errorf("unknown error type %q: %s", errMsg.Type, errMsg.Err)
 			}
 		}
 	}
@@ -211,30 +209,30 @@ func handleErrorMessage(msg any, payload []byte, bufPtr *bytes.Buffer) (error, b
 			switch m.Type {
 			case "close":
 				if m.Err != "" {
-					return fmt.Errorf("remote closed stream: %s", m.Err), true
+					return true, fmt.Errorf("remote closed stream: %s", m.Err)
 				}
-				return io.EOF, true
+				return true, io.EOF
 			case "error":
-				return fmt.Errorf("remote error: %s", m.Err), true
+				return true, fmt.Errorf("remote error: %s", m.Err)
 			default:
-				return fmt.Errorf("unknown error type %q: %s", m.Type, m.Err), true
+				return true, fmt.Errorf("unknown error type %q: %s", m.Type, m.Err)
 			}
 		}
 	case *ErrorMessage:
 		if m != nil && m.Type != "" {
 			if m.Type == "close" {
 				if m.Err != "" {
-					return fmt.Errorf("remote closed stream: %s", m.Err), true
+					return true, fmt.Errorf("remote closed stream: %s", m.Err)
 				}
-				return io.EOF, true
+				return true, io.EOF
 			}
 			if m.Type == "error" {
-				return fmt.Errorf("remote error: %s", m.Err), true
+				return true, fmt.Errorf("remote error: %s", m.Err)
 			}
-			return fmt.Errorf("unknown error type %q: %s", m.Type, m.Err), true
+			return true, fmt.Errorf("unknown error type %q: %s", m.Type, m.Err)
 		}
 	}
-	return nil, false
+	return false, nil
 }
 
 // typedFastPathAssign tries to perform direct assignments for the hottest
@@ -399,14 +397,14 @@ func typedFastPathAssign(msg any, v any) error {
 // nil on success, non-nil if not handled.
 func reflectFallbackAssign(msg any, v any) error {
 	val := reflect.ValueOf(v)
-	if val.Kind() == reflect.Ptr && !val.IsNil() {
+	if val.Kind() == reflect.Pointer && !val.IsNil() {
 		mv := reflect.ValueOf(msg)
 		if mv.IsValid() {
 			if mv.Type().AssignableTo(val.Elem().Type()) {
 				val.Elem().Set(mv)
 				return nil
 			}
-			if mv.Kind() == reflect.Ptr && mv.Elem().IsValid() && mv.Elem().Type().AssignableTo(val.Elem().Type()) {
+			if mv.Kind() == reflect.Pointer && mv.Elem().IsValid() && mv.Elem().Type().AssignableTo(val.Elem().Type()) {
 				val.Elem().Set(mv.Elem())
 				return nil
 			}
@@ -414,7 +412,7 @@ func reflectFallbackAssign(msg any, v any) error {
 				val.Elem().Set(mv.Convert(val.Elem().Type()))
 				return nil
 			}
-			if mv.Kind() == reflect.Ptr && mv.Elem().IsValid() && mv.Elem().Type().ConvertibleTo(val.Elem().Type()) {
+			if mv.Kind() == reflect.Pointer && mv.Elem().IsValid() && mv.Elem().Type().ConvertibleTo(val.Elem().Type()) {
 				val.Elem().Set(mv.Elem().Convert(val.Elem().Type()))
 				return nil
 			}

@@ -9,7 +9,8 @@ import (
 	"github.com/google/uuid"
 )
 
-func benchEntry(size int) *api.Entry {
+func benchEntry() *api.Entry {
+	const size = 1024
 	payload := make([]byte, size)
 	_, _ = rand.Read(payload)
 	return &api.Entry{
@@ -27,7 +28,8 @@ func benchEntry(size int) *api.Entry {
 	}
 }
 
-func benchTxn(entries, payloadSize int) *txn.Transaction {
+func benchTxn() *txn.Transaction {
+	const entries = 10
 	t := &txn.Transaction{
 		TRX:           api.TRX{ID: uuid.New(), Node: uuid.New(), Number: 77},
 		Space:         "benchspace",
@@ -38,7 +40,7 @@ func benchTxn(entries, payloadSize int) *txn.Transaction {
 		Entries:       make([]*api.Entry, 0, entries),
 	}
 	for i := 0; i < entries; i++ {
-		e := benchEntry(payloadSize)
+		e := benchEntry()
 		e.Sequence = uint64(i + 1)
 		t.Entries = append(t.Entries, e)
 	}
@@ -46,7 +48,7 @@ func benchTxn(entries, payloadSize int) *txn.Transaction {
 }
 
 func BenchmarkEncodeEntry_1KB(b *testing.B) {
-	e := benchEntry(1024)
+	e := benchEntry()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -57,7 +59,7 @@ func BenchmarkEncodeEntry_1KB(b *testing.B) {
 }
 
 func BenchmarkDecodeEntry_1KB(b *testing.B) {
-	e := benchEntry(1024)
+	e := benchEntry()
 	buf, err := EncodeEntry(e)
 	if err != nil {
 		b.Fatal(err)
@@ -75,7 +77,7 @@ func BenchmarkDecodeEntry_1KB(b *testing.B) {
 }
 
 func BenchmarkEncodeEntrySnappy_1KB(b *testing.B) {
-	e := benchEntry(1024)
+	e := benchEntry()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -86,7 +88,7 @@ func BenchmarkEncodeEntrySnappy_1KB(b *testing.B) {
 }
 
 func BenchmarkDecodeEntrySnappy_1KB(b *testing.B) {
-	e := benchEntry(1024)
+	e := benchEntry()
 	buf, err := EncodeEntrySnappy(e)
 	if err != nil {
 		b.Fatal(err)
@@ -104,7 +106,7 @@ func BenchmarkDecodeEntrySnappy_1KB(b *testing.B) {
 }
 
 func BenchmarkEncodeTransaction_10x1KB(b *testing.B) {
-	t := benchTxn(10, 1024)
+	t := benchTxn()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -115,7 +117,7 @@ func BenchmarkEncodeTransaction_10x1KB(b *testing.B) {
 }
 
 func BenchmarkDecodeTransaction_10x1KB(b *testing.B) {
-	t := benchTxn(10, 1024)
+	t := benchTxn()
 	buf, err := EncodeTransaction(t)
 	if err != nil {
 		b.Fatal(err)
@@ -133,7 +135,7 @@ func BenchmarkDecodeTransaction_10x1KB(b *testing.B) {
 }
 
 func BenchmarkEncodeTransactionSnappy_10x1KB(b *testing.B) {
-	t := benchTxn(10, 1024)
+	t := benchTxn()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -144,7 +146,7 @@ func BenchmarkEncodeTransactionSnappy_10x1KB(b *testing.B) {
 }
 
 func BenchmarkDecodeTransactionSnappy_10x1KB(b *testing.B) {
-	t := benchTxn(10, 1024)
+	t := benchTxn()
 	buf, err := EncodeTransactionSnappy(t)
 	if err != nil {
 		b.Fatal(err)

@@ -183,7 +183,7 @@ func TestShouldReturnErrorWhenProducerFailsWithSequenceMismatchWhenSaveEvents(t 
 	fc := &fakeClient{}
 	// Override Produce to return error after consuming records
 	fc.ProduceFunc = func(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*client.Record]) enumerators.Enumerator[*client.SegmentStatus] {
-		enumerators.Consume(entries)
+		_ = enumerators.Consume(entries)
 		return enumerators.Error[*client.SegmentStatus](sequenceMismatchErr)
 	}
 
@@ -225,7 +225,7 @@ func TestShouldReturnErrorWhenNoStatusUpdatesReceivedWhenSaveEvents(t *testing.T
 	fc := &fakeClient{}
 	// Override Produce to return empty enumerator (no status updates)
 	fc.ProduceFunc = func(ctx context.Context, storeID uuid.UUID, space, segment string, entries enumerators.Enumerator[*client.Record]) enumerators.Enumerator[*client.SegmentStatus] {
-		enumerators.Consume(entries)
+		_ = enumerators.Consume(entries)
 		return enumerators.Empty[*client.SegmentStatus]()
 	}
 

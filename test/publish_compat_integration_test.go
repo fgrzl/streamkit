@@ -22,7 +22,7 @@ func TestShouldPersistPayloadAndMetadataGivenPublishWhenConsumed(t *testing.T) {
 			payload := []byte("published-payload")
 			metadata := map[string]string{"origin": "publish", "type": "edge"}
 
-			err := harness.Client.Publish(ctx, storeID, space, segment, payload, metadata)
+			err := harness.Publish(ctx, storeID, space, segment, payload, metadata)
 			require.NoError(t, err)
 
 			entries, err := enumerators.ToSlice(harness.Client.ConsumeSegment(ctx, storeID, &client.ConsumeSegment{

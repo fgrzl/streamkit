@@ -119,7 +119,7 @@ func (s *streamStore) SaveEvents(ctx context.Context, entity es.Entity, events [
 
 	// Track status updates to ensure all records are acknowledged
 	statusCount := 0
-	err := enumerators.ForEach(results, func(status *client.SegmentStatus) error {
+	err := enumerators.ForEach(results, func(_ *client.SegmentStatus) error {
 		statusCount++
 		return nil
 	})

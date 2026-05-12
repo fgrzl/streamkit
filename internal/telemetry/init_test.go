@@ -62,7 +62,7 @@ func TestShouldExportSpansWhenNewInMemoryTracerProvider(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, tp)
 	require.NotNil(t, exporter)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	_, span := tp.Tracer("test").Start(context.Background(), "in-memory-span")
 	span.End()

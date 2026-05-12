@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/fgrzl/enumerators"
-	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/json/polymorphic"
+	"github.com/fgrzl/lexkey"
 	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/bus"
@@ -1336,7 +1336,7 @@ func TestShouldEndConsumeSegmentSpanBeforeStreamingCompletes(t *testing.T) {
 		sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporter)),
 	)
 	otel.SetTracerProvider(tp)
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	release := make(chan struct{})
 	store := &blockingConsumeStore{release: release}

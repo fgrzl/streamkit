@@ -23,7 +23,7 @@ func (e *BidiStreamEnumerator[T]) MoveNext() bool {
 	var current T
 
 	err := e.stream.Decode(&current)
-	if err == io.EOF || errors.Is(err, e.stream.EndOfStreamError()) {
+	if errors.Is(err, io.EOF) || errors.Is(err, e.stream.EndOfStreamError()) {
 		e.current = nil
 		return false
 	}

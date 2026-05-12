@@ -49,7 +49,6 @@ func TestShouldHighVolumeReadWriteStream(t *testing.T) {
 			errCh := make(chan error, len(segments))
 
 			for _, segment := range segments {
-				segment := segment
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -61,7 +60,10 @@ func TestShouldHighVolumeReadWriteStream(t *testing.T) {
 						}
 
 						records := enumerators.Range(start, count, func(i int) *client.Record {
-							sequence := uint64(i + 1)
+							if i < 0 {
+								panic("enumerator index negative")
+							}
+							sequence := uint64(uint(i)) + 1
 							return &client.Record{
 								Sequence: sequence,
 								Payload:  []byte(fmt.Sprintf("high-volume-%s-%s-%d", space, segment, sequence)),
@@ -88,7 +90,7 @@ func TestShouldHighVolumeReadWriteStream(t *testing.T) {
 			}
 
 			totalExpected := len(segments) * recordsPerSegment
-			entries, err := enumerators.ToSlice(harness.Client.Consume(ctx, storeID, &client.Consume{
+			entries, err := enumerators.ToSlice(harness.Consume(ctx, storeID, &client.Consume{
 				Offsets: map[string]lexkey.LexKey{space: {}},
 			}))
 			require.NoError(t, err)
@@ -118,7 +120,7 @@ func TestShouldHighVolumeReadWriteStream(t *testing.T) {
 
 				peek, err := harness.Client.Peek(ctx, storeID, space, segment)
 				require.NoError(t, err)
-				assert.Equal(t, uint64(recordsPerSegment), peek.Sequence)
+				assert.EqualValues(t, recordsPerSegment, peek.Sequence)
 			}
 		})
 	}

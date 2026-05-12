@@ -18,14 +18,14 @@ func TestShouldReturnSameMutexForSameSegment(t *testing.T) {
 
 func TestShouldNotGrowSegLocksBeyondCap(t *testing.T) {
 	store := newTestPebbleStore(t)
-	cap := 16
-	store.maxSegLocks = cap
-	n := cap + cap/2
+	segCap := 16
+	store.maxSegLocks = segCap
+	n := segCap + segCap/2
 	for i := range n {
 		_ = store.getSegmentLock("sp", fmt.Sprintf("seg%d", i))
 	}
 	// May slightly exceed cap only if every mutex were held during eviction (not the case here).
-	assert.LessOrEqual(t, store.SegLocksSize(), cap+cap/10+2)
+	assert.LessOrEqual(t, store.SegLocksSize(), segCap+segCap/10+2)
 }
 
 func TestShouldNotEvictHeldSegLock(t *testing.T) {
