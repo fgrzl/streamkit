@@ -20,6 +20,7 @@ import (
 // fakeDomainEvent implements the minimal es.DomainEvent used by the store.
 type fakeDomainEvent struct {
 	es.DomainEventBase
+
 	seq uint64
 }
 

@@ -43,6 +43,7 @@ type localNodeSoakStoreFactory struct {
 
 type localNodeSoakStore struct {
 	mockStore
+
 	closed *atomic.Int64
 }
 

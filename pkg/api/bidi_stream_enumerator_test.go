@@ -193,6 +193,7 @@ func TestShouldPassErrToStreamCloseWhenDisposeCalledAfterDecodeError(t *testing.
 // fakeBidiStreamWithEOS extends fakeBidiStream with a custom EndOfStreamError for testing.
 type fakeBidiStreamWithEOS struct {
 	*fakeBidiStream
+
 	eos error
 }
 

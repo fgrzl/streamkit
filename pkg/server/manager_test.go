@@ -43,6 +43,7 @@ func (f *scriptedStoreFactory) NewStore(ctx context.Context, storeID uuid.UUID) 
 
 type closeCountingStore struct {
 	mockStore
+
 	closeCalls int32
 }
 

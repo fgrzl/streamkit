@@ -230,6 +230,7 @@ func (m *mockBidi) Closed() <-chan struct{} { return m.closed }
 
 type blockingEncodeBidi struct {
 	*mockBidi
+
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
@@ -1095,6 +1096,7 @@ func (s *spaceSnapshotStore) Close() {}
 
 type blockingSpaceSnapshotStore struct {
 	*spaceSnapshotStore
+
 	blockSegment string
 	blockStarted chan struct{}
 	releaseBlock chan struct{}
@@ -1175,6 +1177,7 @@ func (b *badStore) Close() {}
 // badBidi returns an error on Decode
 type badBidi struct {
 	*mockBidi
+
 	decErr error
 }
 
@@ -1233,6 +1236,7 @@ func (c *closableStore) Close() {
 // bidi that fails on Encode
 type bidiEncodeFail struct {
 	*mockBidi
+
 	fail error
 }
 
