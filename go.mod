@@ -4,11 +4,11 @@ go 1.25.6
 
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.5
-	github.com/fgrzl/azkit v0.1.1
+	github.com/fgrzl/azkit v0.1.2
 	github.com/fgrzl/claims v0.1.0
 	github.com/fgrzl/enumerators v1.0.1
 	github.com/fgrzl/es v1.0.1
-	github.com/fgrzl/json v1.0.0
+	github.com/fgrzl/json v1.0.1
 	github.com/fgrzl/lexkey v0.1.1
 	github.com/fgrzl/mux v0.1.1
 	github.com/fgrzl/timestamp v1.0.0
@@ -70,7 +70,7 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260511170946-3700d4141b60 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260511170946-3700d4141b60 // indirect
-	google.golang.org/grpc v1.81.0 // indirect
+	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
