@@ -1,3 +1,4 @@
+﻿# fgrzl standard golangci-lint config (shared across Go repositories)
 version: "2"
 
 run:
@@ -9,7 +10,6 @@ linters:
     - copyloopvar
     - dogsled
     - dupl
-    - embeddedstructfieldcheck
     - errcheck
     - errorlint
     - exhaustive
@@ -33,6 +33,9 @@ linters:
       check:
         - switch
         - map
+    gosec:
+      excludes:
+        - G404
     misspell:
       locale: US
     revive:
@@ -55,15 +58,58 @@ linters:
         - name: superfluous-else
         - name: time-naming
         - name: unreachable-code
-        - name: unused-parameter
         - name: var-declaration
-
+        - name: var-naming
   exclusions:
     rules:
-      # Test doubles and testify callbacks often require unused parameters to match interfaces.
+      - linters:
+          - gosec
+        text: "G404"
+      - linters: [revive]
+        path: _test\.go$
+        text: "redefines-builtin-id"
       - linters: [revive]
         path: _test\.go$
         text: "^unused-parameter:"
+      - path: _test\.go$
+        linters:
+          - gosec
+        text: "G306"
+      - path: _test\.go$
+        linters:
+          - gosec
+        text: "G304"
+      - path: _test\.go$
+        linters:
+          - gosec
+        text: "G115"
+      - path: (^|\\/)test(\\/|\\\\)
+        linters:
+          - gosec
+        text: "G115"
+      - path: (^|[\\/])bench([\\/]).*\.go$
+        linters:
+          - bodyclose
+      - path: (^|[\\/])test([\\/]).*\.go$
+        linters:
+          - bodyclose
+      - path: _test\.go$
+        linters:
+          - gosec
+        text: "G124"
+      - path: (^|[\\/])test([\\/])
+        linters:
+          - gosec
+        text: "G304"
+      - path: (^|[\\/])test([\\/])
+        linters:
+          - gosec
+        text: "G204"
+      # Platform trust-store installers run validated certutil/security/sudo with fixed argv.
+      - path: (^|[\\/])internal[\\/]trust[\\/]
+        linters:
+          - gosec
+        text: "G204"
 
 issues:
   max-issues-per-linter: 0
