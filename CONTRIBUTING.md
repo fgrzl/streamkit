@@ -254,11 +254,13 @@ go build ./...
 
 ### Run Examples
 
-Streamkit is currently in **alpha** and doesn't have public binaries yet. Use it as a library in your Go applications.
+Streamkit is a **production library** (no standalone binary). Import packages from the module:
 
 ```go
-import "github.com/fgrzl/streamkit"
+import "github.com/fgrzl/streamkit/pkg/client"
 ```
+
+See [docs/production.md](docs/production.md) for deployment patterns.
 
 ## Reporting Issues
 
@@ -333,15 +335,16 @@ go test -bench=. -benchmem ./internal/codec/...
 
 Benchmarks should be in `*_bench_test.go` files.
 
-## Alpha Testing and Known Limitations
+## Production contracts
 
-Streamkit is currently **alpha**. Contributors should be aware of:
+Streamkit runs in production. When changing client or protocol behavior, preserve documented contracts in [docs/limitations.md](docs/limitations.md):
 
-1. **Lock Map Growth** — Per-segment produce locks persist. Not an issue for <10K segments.
-2. **Deduplication** — Implement sequence-based deduplication for exactly-once semantics.
-3. **Subscription Failures** — Monitor subscription health before failures occur.
+1. **Lock map** — Per-segment produce locks persist; document impact for high-churn segment keys.
+2. **At-least-once delivery** — Consumers must dedupe on sequence; do not imply exactly-once without app logic.
+3. **Subscriptions** — Reconnect delivers snapshot then live updates; no durable missed-update replay.
+4. **Consume on disconnect** — Cursors are application-owned; do not break resume semantics without a major version.
 
-See [CHANGELOG.md](CHANGELOG.md) for detailed limitations and planned mitigations.
+See [docs/production.md](docs/production.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Becoming a Maintainer
 
@@ -354,9 +357,10 @@ Active contributors with a track record of quality contributions may be invited 
 
 ## Questions?
 
-- Check [README.md](README.md) for architecture overview
+- Check [README.md](README.md) and [docs/README.md](docs/README.md) for documentation index
+- Read [docs/production.md](docs/production.md) for operational guidance
 - Read [docs/test_guidelines.md](docs/test_guidelines.md) for testing details
-- Review [CHANGELOG.md](CHANGELOG.md) for recent changes and known issues
+- Review [CHANGELOG.md](CHANGELOG.md) for release notes
 - Open a discussion or issue on GitHub
 
 Thank you for helping make Streamkit better! 🚀

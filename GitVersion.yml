@@ -7,7 +7,7 @@ branches:
     regex: ^(?<BranchName>master|main)$
   develop:
     regex: ^(?<BranchName>dev(elop)?(ment)?)$
-    label: "alpha"
+    label: ""
   feature:
     regex: ^features?[/-](?<BranchName>.+)
     label: "{BranchName}"

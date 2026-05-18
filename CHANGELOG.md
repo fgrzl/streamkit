@@ -16,49 +16,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Consume` now updates offset map with last seen sequence per space/segment pair
   - Added debug logging for offset updates
 
-### Known Limitations
+### Documentation
+- Production documentation: [docs/production.md](docs/production.md), hardened operational contracts in [docs/limitations.md](docs/limitations.md)
+
+### Operational contracts
+
+Documented production behavior (see [docs/limitations.md](docs/limitations.md)):
 
 #### Client (pkg/client)
-1. **Lock Map Growth**: Per-segment produce locks accumulate over time without cleanup. 
-   - **Impact**: Not an issue for typical workloads (<10,000 active segments), but high-churn 
-     scenarios (millions of unique segments) may see gradual memory growth.
-   - **Mitigation**: Document as known limitation for alpha. Will consider LRU eviction or 
-     periodic cleanup in beta if needed.
+1. **Lock map growth** — Per-segment produce locks accumulate without automatic eviction.
+   - **Impact:** Not an issue for typical workloads (&lt;10,000 active segments); high-churn scenarios (millions of unique segment keys) may see gradual memory growth.
+   - **Mitigation:** Monitor segment cardinality; recycle long-lived client processes if needed. LRU eviction is on the roadmap.
 
-2. **Consumption Deduplication**: While resilience enumerators now resume from last consumed 
-   position, consumers should still implement deduplication based on sequence numbers as a 
-   best practice for exactly-once semantics.
-   - **Impact**: In rare edge cases (concurrent producers, clock skew), duplicate entries 
-     may still occur.
-   - **Mitigation**: Applications should track sequence numbers and deduplicate at application 
-     level for critical workflows.
+2. **Consumption deduplication** — Delivery is at-least-once; resilience enumerators resume from last consumed position when possible.
+   - **Impact:** Rare duplicates under concurrent producers or clock skew.
+   - **Mitigation:** Dedupe on `Entry.Sequence` at the application layer for exactly-once business semantics.
 
-3. **Subscription Lifecycle**: Retryable subscription failures stay in the reconnect loop, while
-   permanent errors stop the subscription and remove it from the client registry.
-   - **Impact**: Applications should treat permanent subscription errors as terminal unless they
-     explicitly resubscribe.
-   - **Best Practice**: Surface subscription lifecycle through application logs and metrics, and
-     treat reconnect deliveries as `latest snapshot -> live updates`. Durable replay/cursors
-     remain out of scope for the current subscription API contract.
+3. **Subscription lifecycle** — Retryable failures stay in the reconnect loop; permanent errors stop the subscription and remove it from the client registry.
+   - **Impact:** Applications must resubscribe after permanent errors.
+   - **Contract:** Reconnect delivers `latest snapshot → live updates`. Durable replay/cursors are not part of the subscription API.
 
 ---
 
-## Future Releases
+## Roadmap
 
-### Planned for Beta
 - Lock map cleanup/LRU eviction for high-churn segment scenarios
 - Subscription failure callback: `OnSubscriptionFailed(id string, err error)`
 - Enhanced observability: Prometheus metrics for client operations
-- Batch API for high-throughput produces (Issue 10)
-
-### Planned for RC
-- Expand live reconnect coverage for consume paths and operational guidance
-- Performance benchmarks and optimization
-- Production deployment guide
-- Example applications and patterns
+- Batch API for high-throughput produces
+- Expanded consume reconnect guidance and benchmarks
 
 ---
 
 ## Version History
 
-_No releases yet. Initial alpha release coming soon._
+See [GitHub Releases](https://github.com/fgrzl/streamkit/releases) for tagged versions published to the Go module proxy.

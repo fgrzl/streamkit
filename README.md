@@ -1,80 +1,62 @@
 [![CI](https://github.com/fgrzl/streamkit/actions/workflows/ci.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/ci.yml)
-[![CI](https://github.com/fgrzl/streamkit/actions/workflows/publish.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/publish.yml)
+[![Publish](https://github.com/fgrzl/streamkit/actions/workflows/publish.yml/badge.svg)](https://github.com/fgrzl/streamkit/actions/workflows/publish.yml)
 
 # Streamkit
 
-> **Streamkit** is a high-throughput, hierarchical event streaming platform designed for scalable, organized, and reliable data flows.
+High-throughput, hierarchical event streaming for Go. Organize data in **stores**, **spaces**, and **segments**; consume with strict per-segment ordering or timestamp-merged space views; plug in PebbleDB or Azure Table Storage and in-process or WebSocket transport.
 
-## 🧩 Core Concepts
+**Production-ready** — used in live services. See [docs/production.md](docs/production.md) for deployment guidance and [docs/limitations.md](docs/limitations.md) for operational contracts (delivery semantics, cursors, subscriptions).
 
-A **Store** provides physical separation at the storage level, acting as the root for all spaces and segments.
+## Documentation
 
-A **Space** is a top-level logical container for related streams.
+Full documentation: **[docs/](docs/README.md)**
 
-- Group streams by application, data type, or service
-- Enable broad categorization and easier management
-- Consumers can subscribe to an entire Space to receive interleaved events from all Segments
+| Topic | Guide |
+|-------|--------|
+| **Production** | [docs/production.md](docs/production.md) |
+| Concepts (store / space / segment) | [docs/concepts.md](docs/concepts.md) |
+| Architecture and packages | [docs/architecture.md](docs/architecture.md) |
+| Getting started | [docs/getting-started.md](docs/getting-started.md) |
+| Client SDK | [docs/client-guide.md](docs/client-guide.md) |
+| Server embedding | [docs/server-guide.md](docs/server-guide.md) |
+| Storage backends | [docs/storage.md](docs/storage.md) |
+| Transport (in-proc / WebSocket) | [docs/transport.md](docs/transport.md) |
+| Event sourcing (`eskit`) | [docs/event-sourcing.md](docs/event-sourcing.md) |
+| Operations | [docs/operations.md](docs/operations.md) |
 
-**Segments** are independent, ordered sub-streams within a Space.
-
-- Maintain strict event order
-- Support parallel consumption for scalability
-- Are uniquely identified within their Space
-
-## ⚙️ How It Works
-
-- **Producing:** Data is written to specific Segments in a Space within a Store
-- **Consuming:**
-  - Subscribe to a Space for all Segments (interleaved)
-  - Subscribe to a Segment for strict ordering
-- **Peeking:** Read the latest entry in a Segment without consuming it
-- **Offsets & Transactions:**
-  - Offsets track consumer progress
-  - Transactions ensure consistent writes
-
-## 🚦 Getting Started
+## Quick example
 
 ```go
 import (
     "context"
-    "github.com/fgrzl/streamkit"
-    "github.com/fgrzl/streamkit/pkg/transport/prockit"
+    "github.com/fgrzl/enumerators"
+    "github.com/fgrzl/streamkit/pkg/client"
+    "github.com/fgrzl/streamkit/pkg/server"
+    "github.com/fgrzl/streamkit/pkg/storage/pebblekit"
+    "github.com/fgrzl/streamkit/pkg/transport/inprockit"
     "github.com/google/uuid"
 )
 
 func main() {
-    provider := prockit.NewBidiStreamProvider()
-    client := streamkit.NewClient(provider)
     ctx := context.Background()
-    storeID := uuid.New() // Replace with your store UUID
+    factory, _ := pebblekit.NewStoreFactory(&pebblekit.PebbleStoreOptions{Path: "./data"})
+    nm := server.NewNodeManager(server.WithStoreFactory(factory))
+    provider := inprockit.NewInProcBidiStreamProvider(ctx, nm)
+    c := client.NewClient(provider)
+    defer c.Close()
 
-    // Example: List spaces
-    spaces := client.GetSpaces(ctx, storeID)
-    for spaces.MoveNext() {
-        space, _ := spaces.Current()
-        println("Space:", space)
-    }
+    storeID := uuid.New()
+    records := enumerators.Slice([]*client.Record{{Sequence: 1, Payload: []byte("hello")}})
+    _, _ = enumerators.ToSlice(c.Produce(ctx, storeID, "demo", "events", records))
 }
 ```
 
-## 📋 Known Limitations (Alpha)
+See [Getting started](docs/getting-started.md) for a complete produce/consume walkthrough. For WebSocket + JWT production wiring, see [Transport](docs/transport.md).
 
-### Client Resilience
+## Contributing
 
-The client includes production-grade resilience features but has documented limitations:
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/test_guidelines.md](docs/test_guidelines.md). Changelog: [CHANGELOG.md](CHANGELOG.md).
 
-1. **Lock Management**: Per-segment produce locks accumulate over time. Not an issue for typical workloads (<10K segments) but may impact scenarios with millions of unique segments over time.
+## License
 
-2. **Consumer Recovery**: Consume streams are not resumed after a WebSocket disconnect. Applications should persist their own last known offsets or sequences and recreate consumers explicitly when the transport drops.
-
-3. **Subscription Lifecycle**: Subscriptions are tied to a single logical stream. If that stream ends because the WebSocket disconnects, an explicit subscription heartbeat expires, or the server closes it, the subscription stops and is removed from the client registry. Callers must create a new subscription explicitly; durable missed-update replay/cursors are not part of the current contract.
-
-**Recommendations for Alpha Testing:**
-
-- ✅ Persist consumer offsets in application code and recreate consumers from the last known position after disconnects
-- ✅ Resubscribe explicitly after subscription stream failures
-- ✅ Implement application-level deduplication using `Entry.Sequence` numbers
-- ✅ Monitor segment churn if creating more than 10K unique segments
-- ✅ Handle subscription stream failures explicitly in application code and logs
-
-For detailed changes and future roadmap, see [CHANGELOG.md](CHANGELOG.md).
+See [LICENSE](LICENSE).
