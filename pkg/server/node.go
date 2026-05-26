@@ -29,11 +29,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const (
-	minSubscriptionHeartbeatIntervalSeconds = 1
-	maxSubscriptionHeartbeatIntervalSeconds = 300
-)
-
 // isBenignInitialEnvelopeDecodeErr reports teardown before the first request
 // envelope (e.g. client closed the logical stream, overload tombstone, ctx cancel).
 // These should not spam WARN like malformed JSON would.
@@ -84,6 +79,9 @@ type defaultNode struct {
 	subscriptionRoutersMu sync.Mutex
 	subscriptionRouters   map[string]*spaceSubscriptionRouter
 
+	workerPresenceRouterMu sync.Mutex
+	workerPresenceRouter   *workerPresenceRouter
+
 	notifyMu                sync.Mutex
 	notifyFailureCount      int
 	notifyCircuitOpenUntil  time.Time
@@ -124,6 +122,15 @@ func (n *defaultNode) Close() {
 	for _, router := range routers {
 		router.close()
 	}
+
+	n.workerPresenceRouterMu.Lock()
+	workerRouter := n.workerPresenceRouter
+	n.workerPresenceRouter = nil
+	n.workerPresenceRouterMu.Unlock()
+	if workerRouter != nil {
+		workerRouter.close()
+	}
+
 	if n.leaseStore != nil {
 		n.leaseStore.Close()
 	}
@@ -187,6 +194,9 @@ func (n *defaultNode) Handle(ctx context.Context, bidi api.BidiStream) {
 		spanName = "streamkit.server.subscribe"
 		baseAttrs = append(baseAttrs, trace.WithAttributes(telemetry.WithSpace(args.Space), telemetry.WithSegment(args.Segment)))
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleSubscribe(ctx, args, b) }
+	case *api.SubscribeWorkers:
+		spanName = "streamkit.server.subscribe_workers"
+		handler = func(ctx context.Context, b api.BidiStream) { n.handleSubscribeWorkers(ctx, args, b) }
 	case *api.LeaseAcquire:
 		spanName = "streamkit.server.lease_acquire"
 		handler = func(ctx context.Context, b api.BidiStream) { n.handleLeaseAcquire(ctx, args, b) }
@@ -587,16 +597,7 @@ func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeTo
 }
 
 func clampSubscriptionHeartbeatIntervalSeconds(seconds int64) int64 {
-	if seconds <= 0 {
-		return 0
-	}
-	if seconds < minSubscriptionHeartbeatIntervalSeconds {
-		return minSubscriptionHeartbeatIntervalSeconds
-	}
-	if seconds > maxSubscriptionHeartbeatIntervalSeconds {
-		return maxSubscriptionHeartbeatIntervalSeconds
-	}
-	return seconds
+	return api.ClampWorkerPresenceHeartbeatIntervalSeconds(seconds)
 }
 
 func (n *defaultNode) streamSubscriptionHeartbeats(ctx context.Context, space, segment string, heartbeatSeconds int64, bidi api.BidiStream) {

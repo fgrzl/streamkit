@@ -104,7 +104,13 @@ type mockMessageBus struct {
 
 func (b *mockMessageBus) Notify(msg bus.Message) error {
 	b.notifyCalls.Add(1)
-	return b.notifyErr
+	if b.notifyErr != nil {
+		return b.notifyErr
+	}
+	if b.handler != nil {
+		return b.handler(context.Background(), msg)
+	}
+	return nil
 }
 
 func (b *mockMessageBus) NotifyWithContext(ctx context.Context, msg bus.Message) error {
@@ -138,6 +144,7 @@ func (f *mockMessageBusFactory) Get(ctx context.Context) (bus.MessageBus, error)
 type mockBidi struct {
 	// decodeEnvelope will be returned on the first Decode call
 	decodeEnvelope *polymorphic.Envelope
+	decodeQueue    []*polymorphic.Envelope
 	encoded        []any
 	encodedCh      chan any
 	encodeErr      error
@@ -147,10 +154,25 @@ type mockBidi struct {
 	closeLocalMu   sync.Mutex
 	closeLocalErr  error
 	closeLocalCall int
+	closeCall      int
 }
 
 func newMockBidi(env *polymorphic.Envelope) *mockBidi {
 	return &mockBidi{decodeEnvelope: env, closed: make(chan struct{})}
+}
+
+func (m *mockBidi) nextDecodeEnvelope() (*polymorphic.Envelope, bool) {
+	if m.decodeEnvelope != nil {
+		next := m.decodeEnvelope
+		m.decodeEnvelope = nil
+		return next, true
+	}
+	if len(m.decodeQueue) == 0 {
+		return nil, false
+	}
+	next := m.decodeQueue[0]
+	m.decodeQueue = m.decodeQueue[1:]
+	return next, true
 }
 
 func waitForClosed(t *testing.T, bidi api.BidiStream) {
@@ -178,13 +200,15 @@ func (m *mockBidi) Encode(msg any) error {
 func (m *mockBidi) Decode(v any) error {
 	switch v := v.(type) {
 	case *polymorphic.Envelope:
-		if m.decodeEnvelope == nil {
+		next, ok := m.nextDecodeEnvelope()
+		if !ok {
 			return io.EOF
 		}
-		*v = *m.decodeEnvelope
-		// make subsequent decodes return EOF
-		m.decodeEnvelope = nil
+		*v = *next
 		return nil
+	case *api.Presence:
+		<-m.closed
+		return io.EOF
 	default:
 		return errors.New("unsupported decode target")
 	}
@@ -199,6 +223,7 @@ func (m *mockBidi) CloseSend(err error) error {
 	return nil
 }
 func (m *mockBidi) Close(err error) {
+	m.closeCall++
 	m.closeErr = err
 	select {
 	case <-m.closed:
@@ -1053,7 +1078,7 @@ func TestShouldSubscribeRoutesNotificationsToWildcardAndExactSubscribers(t *test
 func TestShouldClampSubscriptionHeartbeatIntervalSeconds(t *testing.T) {
 	assert.Equal(t, int64(0), clampSubscriptionHeartbeatIntervalSeconds(0))
 	assert.Equal(t, int64(1), clampSubscriptionHeartbeatIntervalSeconds(1))
-	assert.Equal(t, int64(maxSubscriptionHeartbeatIntervalSeconds), clampSubscriptionHeartbeatIntervalSeconds(3600))
+	assert.Equal(t, int64(api.MaxWorkerPresenceHeartbeatIntervalSeconds), clampSubscriptionHeartbeatIntervalSeconds(3600))
 }
 
 // (removed failingBusFactory - not used)

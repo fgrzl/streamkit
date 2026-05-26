@@ -249,6 +249,8 @@ func routeableStreamDetails(msg api.Routeable) (operation, space, segment string
 		return operation, typed.Space, typed.Segment
 	case *api.SubscribeToSegmentStatus:
 		return operation, typed.Space, typed.Segment
+	case *api.SubscribeWorkers:
+		return operation, "", typed.WorkerID.String()
 	case *api.GetSegments:
 		return operation, typed.Space, ""
 	default:

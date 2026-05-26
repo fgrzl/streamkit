@@ -30,6 +30,9 @@ type (
 	Entry         = api.Entry
 	Record        = api.Record
 	SegmentStatus = api.SegmentStatus
+	Presence        = api.Presence
+	WorkerInfo      = api.WorkerInfo
+	WorkerInventory = api.WorkerInventory
 
 	// Requests
 	Consume        = api.Consume
@@ -93,6 +96,10 @@ type Client interface {
 
 	// SubscribeToSegment subscribes to status updates for a specific segment.
 	SubscribeToSegment(ctx context.Context, storeID uuid.UUID, space, segment string, handler func(*SegmentStatus)) (api.Subscription, error)
+
+	// SubscribeWorkers receives the full worker inventory on connect and on changes.
+	// Use WithWorkerID to register this process in the store worker map.
+	SubscribeWorkers(ctx context.Context, storeID uuid.UUID, handler func(*WorkerInventory), opts ...SubscribeWorkersOption) (api.Subscription, error)
 
 	// GetSubscriptionStatus returns the current health status of a subscription (Issue 4 & 7).
 	// Returns nil if subscription not found. Includes failure count, last sequence, handler timeouts/panics.
@@ -198,14 +205,16 @@ type subscriptionHandlerTask struct {
 const subscriptionRegistryShardCount = 32
 
 type subscriptionRegistryShard struct {
-	mu            sync.RWMutex
-	subscriptions map[string]*activeSubscription
+	mu                           sync.RWMutex
+	subscriptions                map[string]*activeSubscription
+	workerInventorySubscriptions map[string]*activeWorkerInventorySubscription
 }
 
 func newSubscriptionRegistryShards() []subscriptionRegistryShard {
 	shards := make([]subscriptionRegistryShard, subscriptionRegistryShardCount)
 	for i := range shards {
 		shards[i].subscriptions = make(map[string]*activeSubscription)
+		shards[i].workerInventorySubscriptions = make(map[string]*activeWorkerInventorySubscription)
 	}
 	return shards
 }
@@ -241,12 +250,34 @@ func (c *client) getSubscription(id string) (*activeSubscription, bool) {
 	return sub, exists
 }
 
+func (c *client) getWorkerInventorySubscription(id string) (*activeWorkerInventorySubscription, bool) {
+	shard := c.subscriptionShard(id)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	sub, exists := shard.workerInventorySubscriptions[id]
+	return sub, exists
+}
+
 func (c *client) snapshotSubscriptions() []*activeSubscription {
 	subs := make([]*activeSubscription, 0)
 	for i := range c.subscriptionShards {
 		shard := &c.subscriptionShards[i]
 		shard.mu.RLock()
 		for _, sub := range shard.subscriptions {
+			subs = append(subs, sub)
+		}
+		shard.mu.RUnlock()
+	}
+	return subs
+}
+
+func (c *client) snapshotWorkerInventorySubscriptions() []*activeWorkerInventorySubscription {
+	subs := make([]*activeWorkerInventorySubscription, 0)
+	for i := range c.subscriptionShards {
+		shard := &c.subscriptionShards[i]
+		shard.mu.RLock()
+		for _, sub := range shard.workerInventorySubscriptions {
 			subs = append(subs, sub)
 		}
 		shard.mu.RUnlock()
@@ -1527,15 +1558,22 @@ func (c *client) Close() error {
 	c.shutdownOnce.Do(func() {
 		for {
 			subs := c.snapshotSubscriptions()
+			workerSubs := c.snapshotWorkerInventorySubscriptions()
 
-			if len(subs) == 0 {
+			if len(subs) == 0 && len(workerSubs) == 0 {
 				break
 			}
 
 			for _, sub := range subs {
 				sub.cancel()
 			}
+			for _, sub := range workerSubs {
+				sub.cancel()
+			}
 			for _, sub := range subs {
+				<-sub.stopped
+			}
+			for _, sub := range workerSubs {
 				<-sub.stopped
 			}
 		}
@@ -1609,8 +1647,26 @@ type SubscriptionStatus struct {
 // it from the registry. Returns nil if the subscription id is not found or the
 // subscription has already terminated.
 func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
-	sub, exists := c.getSubscription(id)
+	if sub, exists := c.getSubscription(id); exists {
+		status := "active"
+		if s, ok := sub.status.Load().(string); ok {
+			status = s
+		}
 
+		return &SubscriptionStatus{
+			ID:               sub.id,
+			Status:           status,
+			FailureCount:     sub.failureCount.Load(),
+			LastError:        sub.loadLastError(),
+			LastSequence:     sub.lastDelivered.Load(),
+			HandlerTimeouts:  sub.handlerTimeouts.Load(),
+			HandlerPanics:    sub.handlerPanics.Load(),
+			CoalescedUpdates: sub.coalescedUpdates.Load(),
+			PendingStatuses:  sub.pendingStatusCount(),
+		}
+	}
+
+	sub, exists := c.getWorkerInventorySubscription(id)
 	if !exists {
 		return nil
 	}
@@ -1625,11 +1681,10 @@ func (c *client) GetSubscriptionStatus(id string) *SubscriptionStatus {
 		Status:           status,
 		FailureCount:     sub.failureCount.Load(),
 		LastError:        sub.loadLastError(),
-		LastSequence:     sub.lastDelivered.Load(),
 		HandlerTimeouts:  sub.handlerTimeouts.Load(),
 		HandlerPanics:    sub.handlerPanics.Load(),
 		CoalescedUpdates: sub.coalescedUpdates.Load(),
-		PendingStatuses:  sub.pendingStatusCount(),
+		PendingStatuses:  sub.pendingInventoryCount(),
 	}
 }
 

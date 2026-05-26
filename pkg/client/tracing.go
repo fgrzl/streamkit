@@ -294,6 +294,25 @@ func (c *tracingClient) SubscribeToSpace(ctx context.Context, storeID uuid.UUID,
 	return &tracedSubscription{inner: sub, cancel: cancel}, nil
 }
 
+// SubscribeWorkers subscribes to worker presence updates with tracing (setup span only).
+func (c *tracingClient) SubscribeWorkers(ctx context.Context, storeID uuid.UUID, handler func(*WorkerInventory), opts ...SubscribeWorkersOption) (api.Subscription, error) {
+	requestID := generateOrGetRequestID(ctx)
+	opCtx, span, cancel := c.operationContext(ctx, "streamkit.client.subscribe_workers",
+		trace.WithAttributes(
+			telemetry.WithStoreID(storeID),
+			telemetry.WithRequestID(requestID),
+		))
+	sub, err := c.client.SubscribeWorkers(opCtx, storeID, handler, opts...)
+	if err != nil {
+		telemetry.RecordError(span, err)
+		cancel()
+		span.End()
+		return nil, err
+	}
+	span.End()
+	return &tracedSubscription{inner: sub, cancel: cancel}, nil
+}
+
 // GetSubscriptionStatus returns subscription status.
 func (c *tracingClient) GetSubscriptionStatus(id string) *SubscriptionStatus {
 	return c.client.GetSubscriptionStatus(id)

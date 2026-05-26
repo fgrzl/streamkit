@@ -38,10 +38,23 @@ The first encoded message is the routeable request; subsequent messages depend o
 | `SubscribeToSegmentStatus` | `streamkit://api/v1/subscribe_to_segment_status` | Live status stream |
 | `SegmentStatus` | `streamkit://api/v1/segment_status` | Status payload |
 | `SegmentNotification` | `streamkit://api/v1/segment_notification` | Bus notification |
+| `SubscribeWorkers` | `streamkit://api/v1/subscribe_workers` | Live worker inventory stream |
+| `WorkerInventory` | `streamkit://api/v1/worker_inventory` | Full worker inventory payload |
+| `Presence` | `streamkit://api/v1/presence` | Stream keepalive (not inventory) |
+| `WorkerInventoryNotification` | `streamkit://api/v1/worker_inventory_notification` | Reserved wire type (not used; inventory is node-local) |
 | `LeaseAcquire` / `LeaseRenew` / `LeaseRelease` | `streamkit://api/v1/lease_*` | Distributed leases |
 | `LeaseResult` | `streamkit://api/v1/lease_result` | Lease operation result |
 
 Registration: types are registered in `pkg/api/registry.go` via `init` → `EnsureRegistered()`. You do not need to call `EnsureRegistered()` in application code unless you import `api` without going through packages that already trigger `init`.
+
+## Worker presence (single server node, many clients)
+
+Each store is served by **one** streamkit server node that holds the worker map in memory. **Many clients** open `SubscribeWorkers` streams to that node:
+
+- **Observer** (no `worker_id`): receives `WorkerInventory` on connect and after every join/leave.
+- **Worker** (`worker_id` UUID set): registers in the map until the stream closes; receives the same inventory fan-out as observers plus `Presence` heartbeats on its own stream only.
+
+The server builds one immutable inventory snapshot per change and fans it out to all connected subscribers. This path does not use the segment notification bus.
 
 ## Routeable and Consumable
 

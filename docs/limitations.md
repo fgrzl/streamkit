@@ -35,6 +35,24 @@ Subscriptions deliver **segment status** (head sequence, timestamps)—not a dur
 
 **Contract:** Treat subscriptions as **live inventory signals**. Persist business state from consume, not from subscription callbacks alone.
 
+## Worker presence
+
+Worker presence is **authoritative on a single server node** per store (in-memory map). **Many clients** connect to that node: some register as workers (`WithWorkerID`), others observe inventory only. The server fans out the full inventory to every connected observer on connect and on each change.
+
+| Behavior | Contract |
+|----------|----------|
+| Deployment | One streamkit server node per store; not replicated across API instances |
+| Clients | Many subscribers and many workers per store on the same node |
+| Subscribe stream open | Initial inventory snapshot, then updates on changes |
+| Worker stream close | Worker removed from inventory; all subscribers receive updated inventory |
+| Stale worker | Evicted when client renewals stop (~3× renewal interval, minimum 30s) |
+| Duplicate `worker_id` | New registration replaces the prior stream for that ID |
+| Subscribe reconnect | Latest inventory snapshot at reconnect |
+| Missed updates while offline | Not replayed beyond snapshot at reconnect |
+| Work rebalancing | Application responsibility |
+
+**Contract:** Use `SubscribeWorkers` with optional `WithWorkerID(uuid.UUID)` as ephemeral capacity signals. Maintain local state from inventory payloads on each client.
+
 ## Produce and sequencing
 
 - Each record carries an explicit `Sequence`; the server rejects non-contiguous appends.

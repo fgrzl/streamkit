@@ -30,4 +30,8 @@ func registerAll() {
 	polymorphic.RegisterType[LeaseRenew]()
 	polymorphic.RegisterType[LeaseRelease]()
 	polymorphic.RegisterType[LeaseResult]()
+	polymorphic.RegisterType[SubscribeWorkers]()
+	polymorphic.RegisterType[WorkerInventory]()
+	polymorphic.RegisterType[Presence]()
+	polymorphic.RegisterType[WorkerInventoryNotification]()
 }

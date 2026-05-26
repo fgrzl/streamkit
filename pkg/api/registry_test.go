@@ -19,5 +19,9 @@ func TestShouldRegisterPolymorphicTypes(t *testing.T) {
 		"streamkit://api/v1/segment_notification":        &SegmentNotification{},
 		"streamkit://api/v1/segment_status":              &SegmentStatus{},
 		"streamkit://api/v1/subscribe_to_segment_status": &SubscribeToSegmentStatus{},
+		"streamkit://api/v1/subscribe_workers":                &SubscribeWorkers{},
+		"streamkit://api/v1/worker_inventory":                 &WorkerInventory{},
+		"streamkit://api/v1/presence":                         &Presence{},
+		"streamkit://api/v1/worker_inventory_notification":    &WorkerInventoryNotification{},
 	})
 }
