@@ -2,7 +2,9 @@ package wskit
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -492,7 +494,21 @@ func closeCurrentConn(t *testing.T, p *WebSocketBidiStreamProvider) {
 		return true
 	}, time.Second, 10*time.Millisecond)
 
-	require.NoError(t, conn.Close())
+	if err := conn.Close(); err != nil && !isBenignConnCloseErr(err) {
+		require.NoError(t, err)
+	}
+}
+
+func isBenignConnCloseErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "connection reset by peer")
 }
 
 func requireEventuallyPeekSequence(t *testing.T, c client.Client, storeID uuid.UUID, space, segment string, expected uint64) {
