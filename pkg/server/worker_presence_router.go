@@ -38,11 +38,11 @@ func (n *defaultNode) getOrCreateWorkerPresenceRouter() *workerPresenceRouter {
 }
 
 type workerEntry struct {
-	workerID                 uuid.UUID
-	metadata                 map[string]string
-	subscriberID             string
-	lastSeenAt               int64
-	presenceIntervalSeconds  int64
+	workerID                uuid.UUID
+	metadata                map[string]string
+	subscriberID            string
+	lastSeenAt              int64
+	presenceIntervalSeconds int64
 }
 
 type workerPresenceRouter struct {

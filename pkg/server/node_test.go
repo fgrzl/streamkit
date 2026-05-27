@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/fgrzl/streamkit/internal/lease"
 	"github.com/fgrzl/streamkit/pkg/api"
 	"github.com/fgrzl/streamkit/pkg/bus"
+	"github.com/fgrzl/timestamp"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,17 +54,27 @@ func (s *sliceEnumerator[T]) Err() error { return nil }
 
 // mockStore implements storage.Store for tests.
 type mockStore struct {
-	spaces    []string
-	segments  []string
-	entries   []*api.Entry
-	peekEntry *api.Entry
-	statuses  []*api.SegmentStatus
+	spaces   []string
+	segments []string
+	entries  []*api.Entry
+	statuses []*api.SegmentStatus
+
+	mu                 sync.Mutex
+	consumeSpaceArgs   []*api.ConsumeSpace
+	consumeSegmentArgs []*api.ConsumeSegment
+	peekEntry          *api.Entry
 }
 
 func (m *mockStore) GetSpaces(ctx context.Context) enumerators.Enumerator[string] {
 	return &sliceEnumerator[string]{items: m.spaces}
 }
 func (m *mockStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
+	if args != nil {
+		cloned := *args
+		m.mu.Lock()
+		m.consumeSpaceArgs = append(m.consumeSpaceArgs, &cloned)
+		m.mu.Unlock()
+	}
 	return &sliceEnumerator[*api.Entry]{items: m.entries}
 }
 func (m *mockStore) GetSegments(ctx context.Context, space string) enumerators.Enumerator[string] {
@@ -72,6 +84,12 @@ func (m *mockStore) GetSegments(ctx context.Context, space string) enumerators.E
 	return &sliceEnumerator[string]{items: m.spaces}
 }
 func (m *mockStore) ConsumeSegment(ctx context.Context, args *api.ConsumeSegment) enumerators.Enumerator[*api.Entry] {
+	if args != nil {
+		cloned := *args
+		m.mu.Lock()
+		m.consumeSegmentArgs = append(m.consumeSegmentArgs, &cloned)
+		m.mu.Unlock()
+	}
 	return &sliceEnumerator[*api.Entry]{items: m.entries}
 }
 func (m *mockStore) Peek(ctx context.Context, space, segment string) (*api.Entry, error) {
@@ -81,6 +99,28 @@ func (m *mockStore) Produce(ctx context.Context, args *api.Produce, entries enum
 	return &sliceEnumerator[*api.SegmentStatus]{items: m.statuses}
 }
 func (m *mockStore) Close() {}
+
+func (m *mockStore) capturedConsumeSpaceArgs() []*api.ConsumeSpace {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*api.ConsumeSpace, len(m.consumeSpaceArgs))
+	copy(out, m.consumeSpaceArgs)
+	return out
+}
+
+func (m *mockStore) capturedConsumeSegmentArgs() []*api.ConsumeSegment {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*api.ConsumeSegment, len(m.consumeSegmentArgs))
+	copy(out, m.consumeSegmentArgs)
+	return out
+}
+
+func activeWatermarkFence(w *spaceWatermarks, token spaceWatermarkToken) int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.active[token.space][token.id].fenceTimestamp()
+}
 
 type mockBusSubscription struct {
 	unsubscribed atomic.Bool
@@ -401,6 +441,301 @@ func TestShouldProduceOpensNotificationCircuitAfterRepeatedBusFailures(t *testin
 	require.Equal(t, 0, node.notifyFailureCount)
 }
 
+type blockingStatusEnumerator struct {
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+	done    bool
+	status  *api.SegmentStatus
+}
+
+func (e *blockingStatusEnumerator) MoveNext() bool {
+	if e.done {
+		return false
+	}
+	e.done = true
+	e.once.Do(func() {
+		close(e.started)
+	})
+	<-e.release
+	return true
+}
+
+func (e *blockingStatusEnumerator) Current() (*api.SegmentStatus, error) {
+	return e.status, nil
+}
+
+func (e *blockingStatusEnumerator) Dispose() {}
+func (e *blockingStatusEnumerator) Err() error {
+	return nil
+}
+
+type blockingProduceStore struct {
+	mockStore
+	started chan struct{}
+	release chan struct{}
+	status  *api.SegmentStatus
+}
+
+func (s *blockingProduceStore) Produce(context.Context, *api.Produce, enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
+	return &blockingStatusEnumerator{
+		started: s.started,
+		release: s.release,
+		status:  s.status,
+	}
+}
+
+type switchingProduceStore struct {
+	mockStore
+	blockSegment string
+	started      chan struct{}
+	release      chan struct{}
+	statuses     map[string]*api.SegmentStatus
+}
+
+func (s *switchingProduceStore) Produce(ctx context.Context, args *api.Produce, records enumerators.Enumerator[*api.Record]) enumerators.Enumerator[*api.SegmentStatus] {
+	status := s.statuses[args.Segment]
+	if args.Segment == s.blockSegment {
+		return &blockingStatusEnumerator{
+			started: s.started,
+			release: s.release,
+			status:  status,
+		}
+	}
+	return &sliceEnumerator[*api.SegmentStatus]{items: []*api.SegmentStatus{status}}
+}
+
+type offsetFilteringStore struct {
+	mockStore
+	entries []*api.Entry
+}
+
+func (s *offsetFilteringStore) ConsumeSpace(ctx context.Context, args *api.ConsumeSpace) enumerators.Enumerator[*api.Entry] {
+	s.mockStore.ConsumeSpace(ctx, args)
+	filtered := make([]*api.Entry, 0, len(s.entries))
+	for _, entry := range s.entries {
+		if entry.Space != args.Space {
+			continue
+		}
+		if args.MaxTimestamp > 0 && entry.Timestamp > args.MaxTimestamp {
+			continue
+		}
+		if len(args.Offset) > 0 && string(entry.GetSpaceOffset()) <= string(args.Offset) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	slices.SortFunc(filtered, func(a, b *api.Entry) int {
+		return slices.Compare(a.GetSpaceOffset(), b.GetSpaceOffset())
+	})
+	return &sliceEnumerator[*api.Entry]{items: filtered}
+}
+
+func TestShouldClampConsumeSpaceToActiveWriteWatermark(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore()).(*defaultNode)
+	token := node.watermarks.Begin("s")
+	defer node.watermarks.End(token)
+
+	env := &polymorphic.Envelope{Content: &api.ConsumeSpace{Space: "s"}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+
+	args := store.capturedConsumeSpaceArgs()
+	require.Len(t, args, 1)
+	require.LessOrEqual(t, args[0].MaxTimestamp, activeWatermarkFence(node.watermarks, token)-1)
+}
+
+func TestShouldPreserveConsumeSpaceBoundBelowWatermark(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore()).(*defaultNode)
+	token := node.watermarks.Begin("s")
+	defer node.watermarks.End(token)
+
+	requestedMax := activeWatermarkFence(node.watermarks, token) - 10
+	env := &polymorphic.Envelope{Content: &api.ConsumeSpace{Space: "s", MaxTimestamp: requestedMax}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+
+	args := store.capturedConsumeSpaceArgs()
+	require.Len(t, args, 1)
+	require.Equal(t, requestedMax, args[0].MaxTimestamp)
+}
+
+func TestShouldClampMultiSpaceConsumeToEachSpaceWatermark(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore()).(*defaultNode)
+	tokenA := node.watermarks.Begin("a")
+	defer node.watermarks.End(tokenA)
+
+	env := &polymorphic.Envelope{Content: &api.Consume{
+		Offsets: map[string]lexkey.LexKey{"a": {}, "b": {}},
+	}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+
+	args := store.capturedConsumeSpaceArgs()
+	require.Len(t, args, 2)
+	bySpace := map[string]*api.ConsumeSpace{}
+	for _, arg := range args {
+		bySpace[arg.Space] = arg
+	}
+	require.LessOrEqual(t, bySpace["a"].MaxTimestamp, activeWatermarkFence(node.watermarks, tokenA)-1)
+	require.GreaterOrEqual(t, bySpace["b"].MaxTimestamp, activeWatermarkFence(node.watermarks, tokenA))
+}
+
+func TestShouldClampConsumeSegmentToActiveWriteWatermark(t *testing.T) {
+	store := &mockStore{}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore()).(*defaultNode)
+	token := node.watermarks.Begin("s")
+	defer node.watermarks.End(token)
+
+	env := &polymorphic.Envelope{Content: &api.ConsumeSegment{Space: "s", Segment: "seg"}}
+	bidi := newMockBidi(env)
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+
+	args := store.capturedConsumeSegmentArgs()
+	require.Len(t, args, 1)
+	require.LessOrEqual(t, args[0].MaxTimestamp, activeWatermarkFence(node.watermarks, token)-1)
+}
+
+func TestShouldPeekReturnEmptyWhenHeadBeyondWatermark(t *testing.T) {
+	store := &mockStore{
+		peekEntry: &api.Entry{Space: "s", Segment: "seg", Sequence: 3},
+	}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore()).(*defaultNode)
+	token := node.watermarks.Begin("s")
+	defer node.watermarks.End(token)
+	store.peekEntry.Timestamp = activeWatermarkFence(node.watermarks, token) + 10
+
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.Peek{Space: "s", Segment: "seg"}})
+	node.Handle(context.Background(), bidi)
+	waitForClosed(t, bidi)
+
+	require.Len(t, bidi.encoded, 1)
+	entry := bidi.encoded[0].(*api.Entry)
+	require.Equal(t, uint64(0), entry.Sequence)
+	require.False(t, node.watermarks.IsTimestampVisible("s", store.peekEntry.Timestamp))
+}
+
+func TestShouldHoldWatermarkWhileProduceMoveNextIsBlocked(t *testing.T) {
+	store := &blockingProduceStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		status:  &api.SegmentStatus{Space: "s", Segment: "seg", LastSequence: 1, LastTimestamp: timestamp.GetTimestamp()},
+	}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore()).(*defaultNode)
+
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.Produce{Space: "s", Segment: "seg"}})
+	go node.Handle(context.Background(), bidi)
+
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for produce enumerator to block")
+	}
+
+	safeMax := node.watermarks.SafeMaxTimestamp("s")
+	require.Less(t, safeMax, timestamp.GetTimestamp(), "expected active produce to hold the space watermark behind the current tail")
+
+	close(store.release)
+	waitForClosed(t, bidi)
+}
+
+func TestShouldDelayNotificationUntilStatusReachesWatermark(t *testing.T) {
+	earlierStarted := make(chan struct{})
+	earlierRelease := make(chan struct{})
+	earlierStatus := &api.SegmentStatus{Space: "s", Segment: "seg-a", LastSequence: 1, LastTimestamp: timestamp.GetTimestamp()}
+	messageBus := &mockMessageBus{}
+	store := &switchingProduceStore{
+		blockSegment: "seg-a",
+		started:      earlierStarted,
+		release:      earlierRelease,
+		statuses: map[string]*api.SegmentStatus{
+			"seg-a": earlierStatus,
+		},
+	}
+	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore()).(*defaultNode)
+
+	earlier := newMockBidi(&polymorphic.Envelope{Content: &api.Produce{Space: "s", Segment: "seg-a"}})
+	go node.Handle(context.Background(), earlier)
+	select {
+	case <-earlierStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for earlier produce to block")
+	}
+
+	laterStatus := &api.SegmentStatus{
+		Space:         "s",
+		Segment:       "seg-b",
+		LastSequence:  1,
+		LastTimestamp: timestamp.GetTimestamp(),
+	}
+	store.statuses["seg-b"] = laterStatus
+	later := newMockBidi(&polymorphic.Envelope{Content: &api.Produce{Space: "s", Segment: "seg-b"}})
+	later.encodedCh = make(chan any, 1)
+	go node.Handle(context.Background(), later)
+
+	select {
+	case <-later.encodedCh:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for later produce acknowledgement")
+	}
+	require.Len(t, later.encoded, 1, "produce response should acknowledge after commit")
+	require.Equal(t, int32(0), messageBus.notifyCalls.Load(), "notification must wait behind the active earlier write")
+
+	close(earlierRelease)
+	waitForClosed(t, earlier)
+	waitForClosed(t, later)
+	require.Eventually(t, func() bool {
+		return messageBus.notifyCalls.Load() >= 2
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestShouldNotAdvanceSpaceOffsetPastActiveEarlierWrite(t *testing.T) {
+	store := &offsetFilteringStore{
+		entries: []*api.Entry{
+			{Space: "s", Segment: "seg-a", Sequence: 1, Timestamp: 100},
+			{Space: "s", Segment: "seg-b", Sequence: 1, Timestamp: 200},
+		},
+	}
+	node := NewNode(uuid.New(), store, nil, lease.NewStore()).(*defaultNode)
+	node.watermarks.mu.Lock()
+	node.watermarks.active["s"] = map[uint64]activeSpaceWrite{
+		1: {begin: 150, committedAt: 150},
+	}
+	node.watermarks.mu.Unlock()
+	defer func() {
+		node.watermarks.mu.Lock()
+		delete(node.watermarks.active, "s")
+		node.watermarks.mu.Unlock()
+	}()
+
+	first := newMockBidi(&polymorphic.Envelope{Content: &api.ConsumeSpace{Space: "s"}})
+	node.Handle(context.Background(), first)
+	waitForClosed(t, first)
+	require.Len(t, first.encoded, 1)
+	firstEntry := first.encoded[0].(*api.Entry)
+	require.Equal(t, "seg-a", firstEntry.Segment)
+
+	node.watermarks.mu.Lock()
+	delete(node.watermarks.active, "s")
+	node.watermarks.mu.Unlock()
+
+	second := newMockBidi(&polymorphic.Envelope{Content: &api.ConsumeSpace{
+		Space:  "s",
+		Offset: firstEntry.GetSpaceOffset(),
+	}})
+	node.Handle(context.Background(), second)
+	waitForClosed(t, second)
+	require.Len(t, second.encoded, 1)
+	require.Equal(t, "seg-b", second.encoded[0].(*api.Entry).Segment)
+}
+
 func TestShouldHandleInvalidMsgType(t *testing.T) {
 	store := &mockStore{}
 	node := NewNode(uuid.New(), store, nil, lease.NewStore())
@@ -596,6 +931,47 @@ func TestShouldSubscribeEmitsHeartbeats(t *testing.T) {
 	require.NotNil(t, messageBus.subscription)
 	require.True(t, messageBus.subscription.unsubscribed.Load())
 	require.Equal(t, int32(1), messageBus.subscription.unsubCalls.Load())
+}
+
+func TestShouldDelaySubscriptionSnapshotUntilWatermark(t *testing.T) {
+	store := &mockStore{
+		peekEntry: &api.Entry{Space: "s", Segment: "seg", Sequence: 3, Timestamp: timestamp.GetTimestamp()},
+	}
+	messageBus := &mockMessageBus{}
+	node := NewNode(uuid.New(), store, &mockMessageBusFactory{bus: messageBus}, lease.NewStore()).(*defaultNode)
+	token := node.watermarks.Begin("s")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bidi := newMockBidi(&polymorphic.Envelope{Content: &api.SubscribeToSegmentStatus{
+		Space:   "s",
+		Segment: "seg",
+	}})
+	bidi.encodedCh = make(chan any, 2)
+	go node.Handle(ctx, bidi)
+
+	select {
+	case <-bidi.encodedCh:
+		t.Fatal("subscription snapshot should wait behind active produce watermark")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	node.watermarks.End(token)
+
+	select {
+	case msg := <-bidi.encodedCh:
+		status, ok := msg.(*api.SegmentStatus)
+		require.True(t, ok)
+		require.False(t, status.Heartbeat)
+		require.Equal(t, "seg", status.Segment)
+		require.Equal(t, uint64(3), status.LastSequence)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for gated subscription snapshot")
+	}
+
+	cancel()
+	waitForClosed(t, bidi)
 }
 
 func TestShouldSubscribeSendsInitialSegmentSnapshot(t *testing.T) {

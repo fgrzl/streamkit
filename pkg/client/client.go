@@ -27,9 +27,9 @@ import (
 
 type (
 	// Models
-	Entry         = api.Entry
-	Record        = api.Record
-	SegmentStatus = api.SegmentStatus
+	Entry           = api.Entry
+	Record          = api.Record
+	SegmentStatus   = api.SegmentStatus
 	Presence        = api.Presence
 	WorkerInfo      = api.WorkerInfo
 	WorkerInventory = api.WorkerInventory

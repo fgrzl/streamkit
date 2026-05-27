@@ -64,6 +64,7 @@ func NewNode(storeID uuid.UUID, store storage.Store, busFactory bus.MessageBusFa
 		store:                   store,
 		busFactory:              busFactory,
 		leaseStore:              leaseStore,
+		watermarks:              newSpaceWatermarks(),
 		subscriptionRouters:     make(map[string]*spaceSubscriptionRouter),
 		notifyFailureThreshold:  defaultNotifyFailureThreshold,
 		notifyCircuitOpenWindow: defaultNotifyCircuitOpenWindow,
@@ -75,6 +76,7 @@ type defaultNode struct {
 	store      storage.Store
 	busFactory bus.MessageBusFactory
 	leaseStore *lease.Store
+	watermarks *spaceWatermarks
 
 	subscriptionRoutersMu sync.Mutex
 	subscriptionRouters   map[string]*spaceSubscriptionRouter
@@ -227,7 +229,8 @@ func (n *defaultNode) handleGetSpaces(ctx context.Context, _ *api.GetSpaces, bid
 }
 
 func (n *defaultNode) handleConsumeSpace(ctx context.Context, args *api.ConsumeSpace, bidi api.BidiStream) {
-	enumerator := limitConsumeEntries(n.store.ConsumeSpace(ctx, args), args.Limit)
+	consumeArgs := n.clampConsumeSpaceArgs(args)
+	enumerator := limitConsumeEntries(n.store.ConsumeSpace(ctx, consumeArgs), args.Limit)
 	fields := logContextFields(ctx, n.storeID, slog.String("space", args.Space))
 	runAsyncStream(ctx, bidi, fields, func() {
 		streamEntries(ctx, "consume space", enumerator, bidi, fields...)
@@ -243,7 +246,8 @@ func (n *defaultNode) handleGetSegments(ctx context.Context, args *api.GetSegmen
 }
 
 func (n *defaultNode) handleConsumeSegment(ctx context.Context, args *api.ConsumeSegment, bidi api.BidiStream) {
-	enumerator := limitConsumeEntries(n.store.ConsumeSegment(ctx, args), args.Limit)
+	consumeArgs := n.clampConsumeSegmentArgs(args)
+	enumerator := limitConsumeEntries(n.store.ConsumeSegment(ctx, consumeArgs), args.Limit)
 	fields := logContextFields(ctx, n.storeID,
 		slog.String("space", args.Space),
 		slog.String("segment", args.Segment))
@@ -269,6 +273,11 @@ func (n *defaultNode) handlePeek(ctx context.Context, args *api.Peek, bidi api.B
 	}
 
 	if entry == nil {
+		entry = &api.Entry{
+			Space:   args.Space,
+			Segment: args.Segment,
+		}
+	} else if entry.Sequence != 0 && !n.spaceWatermarks().IsTimestampVisible(args.Space, entry.Timestamp) {
 		entry = &api.Entry{
 			Space:   args.Space,
 			Segment: args.Segment,
@@ -376,23 +385,64 @@ func (n *defaultNode) handleProduce(ctx context.Context, args *api.Produce, bidi
 
 	runAsyncStream(ctx, bidi, fields, func() {
 		count := 0
-		err := enumerators.ForEach(results, func(result *api.SegmentStatus) error {
+		defer results.Dispose()
+		watermarks := n.spaceWatermarks()
+		for {
+			token := watermarks.Begin(args.Space)
+			hasNext := results.MoveNext()
+			if !hasNext {
+				watermarks.End(token)
+				break
+			}
+
+			result, err := results.Current()
+			if err != nil {
+				watermarks.End(token)
+				slog.ErrorContext(ctx, "server: produce failed",
+					appendLogFields(fields,
+						slog.Int("status_count", count),
+						"err", err)...)
+				closeSendAndRelease(bidi, err)
+				return
+			}
+			watermarks.NoteCommitted(token, result.LastTimestamp)
 			count++
 			if err := bidi.Encode(result); err != nil {
-				return err
+				watermarks.End(token)
+				slog.ErrorContext(ctx, "server: produce failed",
+					appendLogFields(fields,
+						slog.Int("status_count", count),
+						"err", err)...)
+				closeSendAndRelease(bidi, err)
+				return
 			}
 			if bus != nil {
 				notification := &api.SegmentNotification{
 					StoreID:       n.storeID,
 					SegmentStatus: result,
 				}
+				if err := watermarks.WaitUntilVisibleForPeers(ctx, result.Space, result.LastTimestamp, token); err != nil {
+					watermarks.End(token)
+					slog.ErrorContext(ctx, "server: produce failed",
+						appendLogFields(fields,
+							slog.Int("status_count", count),
+							"err", err)...)
+					closeSendAndRelease(bidi, err)
+					return
+				}
 				if err := n.publishSegmentNotification(ctx, bus, notification); err != nil {
-					return err
+					watermarks.End(token)
+					slog.ErrorContext(ctx, "server: produce failed",
+						appendLogFields(fields,
+							slog.Int("status_count", count),
+							"err", err)...)
+					closeSendAndRelease(bidi, err)
+					return
 				}
 			}
-			return nil
-		})
-		if err != nil {
+			watermarks.End(token)
+		}
+		if err := results.Err(); err != nil {
 			slog.ErrorContext(ctx, "server: produce failed",
 				appendLogFields(fields,
 					slog.Int("status_count", count),
@@ -496,12 +546,13 @@ func (n *defaultNode) recordNotifySuccess() bool {
 func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi api.BidiStream) {
 	spaces := make([]enumerators.Enumerator[*api.Entry], 0, len(args.Offsets))
 	for space, offset := range args.Offsets {
-		spaces = append(spaces, n.store.ConsumeSpace(ctx, &api.ConsumeSpace{
+		consumeArgs := n.clampConsumeSpaceArgs(&api.ConsumeSpace{
 			Space:        space,
 			MinTimestamp: args.MinTimestamp,
 			MaxTimestamp: args.MaxTimestamp,
 			Offset:       offset,
-		}))
+		})
+		spaces = append(spaces, n.store.ConsumeSpace(ctx, consumeArgs))
 	}
 	enumerator := enumerators.Interleave(spaces, func(e *api.Entry) int64 { return e.Timestamp })
 	enumerator = limitConsumeEntries(enumerator, args.Limit)
@@ -509,6 +560,37 @@ func (n *defaultNode) handleConsume(ctx context.Context, args *api.Consume, bidi
 	runAsyncStream(ctx, bidi, fields, func() {
 		streamEntries(ctx, "consume", enumerator, bidi, fields...)
 	})
+}
+
+func (n *defaultNode) clampConsumeSpaceArgs(args *api.ConsumeSpace) *api.ConsumeSpace {
+	if args == nil {
+		return args
+	}
+	cloned := *args
+	safeMax := n.spaceWatermarks().SafeMaxTimestamp(args.Space)
+	if cloned.MaxTimestamp == 0 || cloned.MaxTimestamp > safeMax {
+		cloned.MaxTimestamp = safeMax
+	}
+	return &cloned
+}
+
+func (n *defaultNode) clampConsumeSegmentArgs(args *api.ConsumeSegment) *api.ConsumeSegment {
+	if args == nil {
+		return args
+	}
+	cloned := *args
+	safeMax := n.spaceWatermarks().SafeMaxTimestamp(args.Space)
+	if cloned.MaxTimestamp == 0 || cloned.MaxTimestamp > safeMax {
+		cloned.MaxTimestamp = safeMax
+	}
+	return &cloned
+}
+
+func (n *defaultNode) spaceWatermarks() *spaceWatermarks {
+	if n.watermarks == nil {
+		n.watermarks = newSpaceWatermarks()
+	}
+	return n.watermarks
 }
 
 func (n *defaultNode) handleSubscribe(ctx context.Context, args *api.SubscribeToSegmentStatus, bidi api.BidiStream) {
@@ -669,34 +751,43 @@ func (n *defaultNode) collectSubscriptionSnapshots(ctx context.Context, args *ap
 }
 
 func (n *defaultNode) segmentSnapshot(ctx context.Context, space, segment string) (*api.SegmentStatus, error) {
+	var status *api.SegmentStatus
+	var err error
 	if statusStore, ok := n.store.(storage.SegmentStatusStore); ok {
-		return statusStore.GetSegmentStatus(ctx, space, segment)
-	}
+		status, err = statusStore.GetSegmentStatus(ctx, space, segment)
+	} else {
+		lastEntry, peekErr := n.store.Peek(ctx, space, segment)
+		if peekErr != nil {
+			return nil, peekErr
+		}
+		if lastEntry == nil || lastEntry.Sequence == 0 {
+			return nil, nil
+		}
 
-	lastEntry, err := n.store.Peek(ctx, space, segment)
-	if err != nil {
+		firstEntry, firstErr := firstSegmentEntry(ctx, n.store, space, segment)
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		if firstEntry == nil {
+			firstEntry = lastEntry
+		}
+
+		status = &api.SegmentStatus{
+			Space:          space,
+			Segment:        segment,
+			FirstSequence:  firstEntry.Sequence,
+			FirstTimestamp: firstEntry.Timestamp,
+			LastSequence:   lastEntry.Sequence,
+			LastTimestamp:  lastEntry.Timestamp,
+		}
+	}
+	if err != nil || status == nil {
+		return status, err
+	}
+	if err := n.spaceWatermarks().WaitUntilVisible(ctx, status.Space, status.LastTimestamp); err != nil {
 		return nil, err
 	}
-	if lastEntry == nil || lastEntry.Sequence == 0 {
-		return nil, nil
-	}
-
-	firstEntry, err := firstSegmentEntry(ctx, n.store, space, segment)
-	if err != nil {
-		return nil, err
-	}
-	if firstEntry == nil {
-		firstEntry = lastEntry
-	}
-
-	return &api.SegmentStatus{
-		Space:          space,
-		Segment:        segment,
-		FirstSequence:  firstEntry.Sequence,
-		FirstTimestamp: firstEntry.Timestamp,
-		LastSequence:   lastEntry.Sequence,
-		LastTimestamp:  lastEntry.Timestamp,
-	}, nil
+	return status, nil
 }
 
 func firstSegmentEntry(ctx context.Context, store storage.Store, space, segment string) (*api.Entry, error) {
