@@ -8,7 +8,7 @@ require (
 	github.com/fgrzl/claims v0.1.0
 	github.com/fgrzl/enumerators v1.0.1
 	github.com/fgrzl/es v1.0.1
-	github.com/fgrzl/json v1.0.1
+	github.com/fgrzl/json v1.0.2
 	github.com/fgrzl/lexkey v0.1.1
 	github.com/fgrzl/mux v0.2.0
 	github.com/fgrzl/timestamp v1.0.0
