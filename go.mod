@@ -3,7 +3,7 @@ module github.com/fgrzl/streamkit
 go 1.25.6
 
 require (
-	github.com/cockroachdb/pebble/v2 v2.1.5
+	github.com/cockroachdb/pebble/v2 v2.1.6
 	github.com/fgrzl/azkit v0.1.2
 	github.com/fgrzl/claims v0.1.0
 	github.com/fgrzl/enumerators v1.0.1
